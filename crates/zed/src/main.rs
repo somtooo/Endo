@@ -776,6 +776,10 @@ fn main() {
         git_ui::init(cx);
         feedback::init(cx);
         markdown_preview::init(cx);
+        markdown_live_preview::init(cx);
+        citations::init(cx);
+        markdown_export::init(cx);
+        markdown_writing::init(cx);
         tabular_data_preview::init(cx);
         svg_preview::init(cx);
         onboarding::init(cx);

@@ -674,6 +674,23 @@
     },
   },
   {
+    "context": "Editor && extension == md",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-b": "markdown::ToggleBold",
+      "cmd-i": "markdown::ToggleItalic",
+      "cmd-alt-c": "citations::InsertCitation",
+      "cmd-alt-o": "citations::OpenSource",
+      "cmd-alt-1": "markdown::ToggleHeading1",
+      "cmd-alt-2": "markdown::ToggleHeading2",
+      "cmd-alt-3": "markdown::ToggleHeading3",
+      "cmd-alt-4": "markdown::ToggleHeading4",
+      "cmd-alt-5": "markdown::ToggleHeading5",
+      "cmd-alt-6": "markdown::ToggleHeading6",
+      "cmd-alt-0": "markdown::ClearHeading",
+    },
+  },
+  {
     "context": "Editor && extension == svg",
     "use_key_equivalents": true,
     "bindings": {
