@@ -23,6 +23,7 @@ mod css;
 mod eslint;
 mod go;
 mod json;
+mod markdown_oxide;
 mod package_json;
 mod python;
 mod rust;
@@ -87,6 +88,7 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
     ));
     let vtsls_adapter = Arc::new(vtsls::VtslsLspAdapter::new(node.clone(), fs.clone()));
     let yaml_lsp_adapter = Arc::new(yaml::YamlLspAdapter::new(node));
+    let markdown_oxide_adapter = Arc::new(markdown_oxide::MarkdownOxideLspAdapter);
 
     let built_in_languages = [
         LanguageInfo {
@@ -154,7 +156,10 @@ pub fn init(languages: Arc<LanguageRegistry>, fs: Arc<dyn Fs>, node: NodeRuntime
         },
         LanguageInfo {
             name: "markdown",
-            adapters: vec![],
+            // Suzuri ships markdown-oxide built in for Obsidian-grade
+            // wikilinks/backlinks; disable per-user with
+            // `"languages": {"Markdown": {"language_servers": ["!markdown-oxide"]}}`.
+            adapters: vec![markdown_oxide_adapter],
             ..Default::default()
         },
         LanguageInfo {
