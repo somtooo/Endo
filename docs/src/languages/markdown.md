@@ -8,7 +8,48 @@ description: "Configure Markdown language support in Zed, including language ser
 Markdown support is available natively in Zed.
 
 - Tree-sitter: [tree-sitter-markdown](https://github.com/tree-sitter-grammars/tree-sitter-markdown)
-- Language Server: N/A
+- Language Server: [markdown-oxide](https://github.com/Feel-ix-343/markdown-oxide)
+
+## Live Preview {#live-preview}
+
+Markdown renders directly in the editor. Move the cursor into formatted text to
+reveal its source; tables, images, and frontmatter have a source button. Use
+{#action markdown::ToggleLivePreview} or the source button beside the preview
+control to switch the current editor to raw Markdown. Set
+`markdown_live_preview.enabled` to `false` to disable live preview globally.
+
+The preview supports editable tables and properties, resizable images, task
+checkboxes, math, Mermaid diagrams, wikilinks, note embeds, callouts, tags,
+highlights, and footnotes. Image and file attachments can be pasted or dropped
+into a saved local note; `markdown_live_preview.attachments_folder` controls
+where copies are stored. Live decorations are not applied to multi-buffer or
+read-only editors, or while a diff hunk is expanded.
+
+Use **Document > Format** to toggle text formatting or headings. A word count
+appears in the status bar for Markdown notes; set
+`markdown_live_preview.word_count` to `false` to hide it.
+
+## Wikilinks and Citations {#wikilinks-and-citations}
+
+The built-in markdown-oxide language server provides wikilink completion,
+references, and diagnostics. A `markdown-oxide` executable on your PATH is
+used when available; otherwise the editor downloads a pinned release on first
+use. Disable it with `languages.Markdown.language_servers: ["!markdown-oxide"]`.
+
+Bibliography files in the project provide citation completion and formatted
+references. Use {#action citations::InsertCitation} to search the project
+bibliography and insert a citation. Set `citations.library` to change the
+project-relative bibliography path used for export; the default is
+`refs/refs.bib`.
+
+## Export {#export}
+
+Use the `markdown_export::ExportToPdf`, `markdown_export::ExportToDocx`,
+`markdown_export::ExportToHtml`, or `markdown_export::ExportToEpub` action to
+export the current note. The editor includes unsaved changes and expands note
+embeds before handing the document to Pandoc. A missing Pandoc or Typst (used
+for PDFs) is offered for download before the first export. An existing tool on
+PATH is preferred. Export currently requires a saved local note.
 
 ## Syntax Highlighting Code Blocks
 
