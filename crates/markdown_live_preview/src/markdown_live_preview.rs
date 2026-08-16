@@ -1,0 +1,8917 @@
+//! Obsidian-style live preview for markdown buffers.
+//!
+//! When enabled, markdown syntax markers (`**`, `*`, `~~`, backticks, link
+//! targets, list bullets) are hidden and rendered inline, and block elements
+//! (headings, tables, images, mermaid diagrams, horizontal rules) are replaced
+//! with rendered widgets. Raw markdown is revealed for editing per token: an
+//! inline construct reveals when the selection touches it, and a block
+//! reveals when the selection reaches its lines, mirroring Obsidian's Live
+//! Preview mode. Tables, images, and frontmatter are the exception: they are
+//! edited through their widgets and only reveal source via their `</>` button.
+
+use std::{
+    any::TypeId,
+    borrow::Cow,
+    collections::BTreeMap,
+    ops::Range,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::Arc,
+};
+
+use collections::{HashMap, HashSet};
+use editor::{
+    Addon, Editor, EditorEvent, FoldPlaceholder, HighlightKey, RowHighlightOptions, RowMotion,
+    display_map::{
+        BlockId, BlockPlacement, BlockProperties, BlockStyle, Concealment, CustomBlockId,
+        RenderBlock, ToDisplayPoint as _,
+    },
+};
+use gpui::{
+    App, AppContext as _, Context, ElementId, Empty, Entity, Focusable as _, FontWeight,
+    HighlightStyle, Hsla, ImageSource, IntoElement, MouseButton, MouseDownEvent, Resource,
+    RetainAllImageCache, SharedString, SharedUri, StrikethroughStyle, Subscription,
+    TextStyleRefinement, UnderlineStyle, WeakEntity, Window, actions, rems, svg,
+};
+use language::LanguageName;
+use markdown::{HeadingLevelStyles, Markdown, MarkdownElement, MarkdownFont, MarkdownStyle};
+use math_render::{MathStyle, MathTheme};
+use multi_buffer::{
+    Anchor, MultiBufferOffset, MultiBufferRow, MultiBufferSnapshot, ToOffset as _, ToPoint as _,
+};
+use project::{PathChange, Project, ProjectPath};
+use settings::{IntoGpui as _, RegisterSetting, Settings, SettingsStore};
+use text::Point;
+use ui::{Checkbox, ContextMenu, ContextMenuEntry, ToggleState, prelude::*};
+use util::ResultExt as _;
+
+actions!(
+    markdown,
+    [
+        /// Toggles Obsidian-style live preview rendering in the current markdown buffer.
+        ToggleLivePreview
+    ]
+);
+
+/// Type tag used to scope this crate's folds so they can be added and removed
+/// without disturbing user folds or other fold consumers.
+struct LivePreviewFoldTag;
+
+const MARKDOWN: &str = "Markdown";
+const MARKDOWN_INLINE: &str = "Markdown-Inline";
+
+pub use citations::{Bibliography, CitationCompletionProvider, CitationSemanticsProvider};
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarkdownHeadingStyle {
+    pub font_size: f32,
+    pub font_weight: FontWeight,
+}
+
+impl MarkdownHeadingStyle {
+    fn with_content(self, content: Option<settings::MarkdownHeadingStyleSettingsContent>) -> Self {
+        let Some(content) = content else {
+            return self;
+        };
+        Self {
+            font_size: content
+                .font_size
+                .filter(|size| size.is_finite() && *size > 0.0)
+                .unwrap_or(self.font_size),
+            font_weight: content
+                .font_weight
+                .map(|weight| weight.into_gpui())
+                .unwrap_or(self.font_weight),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarkdownHeadingStyles {
+    pub h1: MarkdownHeadingStyle,
+    pub h2: MarkdownHeadingStyle,
+    pub h3: MarkdownHeadingStyle,
+    pub h4: MarkdownHeadingStyle,
+    pub h5: MarkdownHeadingStyle,
+    pub h6: MarkdownHeadingStyle,
+}
+
+impl Default for MarkdownHeadingStyles {
+    fn default() -> Self {
+        Self {
+            h1: MarkdownHeadingStyle {
+                font_size: 1.75,
+                font_weight: FontWeight::SEMIBOLD,
+            },
+            h2: MarkdownHeadingStyle {
+                font_size: 1.4,
+                font_weight: FontWeight::SEMIBOLD,
+            },
+            h3: MarkdownHeadingStyle {
+                font_size: 1.2,
+                font_weight: FontWeight::SEMIBOLD,
+            },
+            h4: MarkdownHeadingStyle {
+                font_size: 1.0,
+                font_weight: FontWeight::SEMIBOLD,
+            },
+            h5: MarkdownHeadingStyle {
+                font_size: 0.875,
+                font_weight: FontWeight::SEMIBOLD,
+            },
+            h6: MarkdownHeadingStyle {
+                font_size: 0.85,
+                font_weight: FontWeight::SEMIBOLD,
+            },
+        }
+    }
+}
+
+impl MarkdownHeadingStyles {
+    fn for_level(self, level: u8) -> MarkdownHeadingStyle {
+        match level {
+            1 => self.h1,
+            2 => self.h2,
+            3 => self.h3,
+            4 => self.h4,
+            5 => self.h5,
+            _ => self.h6,
+        }
+    }
+}
+const HEADING_LINE_HEIGHT_MULTIPLIER: f32 = 1.25;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct HeadingMetrics {
+    text: MarkdownHeadingStyle,
+    font_size: gpui::Pixels,
+    content_line_height: gpui::Pixels,
+}
+
+fn heading_metrics(level: Option<u8>, cx: &App) -> HeadingMetrics {
+    let theme = theme_settings::ThemeSettings::get_global(cx);
+    let text = level.map_or(
+        MarkdownHeadingStyle {
+            font_size: 1.0,
+            font_weight: theme.buffer_font.weight,
+        },
+        |level| {
+            MarkdownLivePreviewSettings::get_global(cx)
+                .heading_styles
+                .for_level(level)
+        },
+    );
+    let base_font_size = theme.buffer_font_size(cx);
+    let font_size = base_font_size * text.font_size;
+    let content_line_height = level.map_or_else(
+        || (base_font_size * theme.line_height()).round(),
+        |_| {
+            let text_system = cx.text_system();
+            let mut font = theme.buffer_font.clone();
+            font.weight = text.font_weight;
+            let font_id = text_system.resolve_font(&font);
+            let glyph_height = text_system.ascent(font_id, font_size)
+                + text_system.descent(font_id, font_size).abs();
+            glyph_height * HEADING_LINE_HEIGHT_MULTIPLIER
+        },
+    );
+    HeadingMetrics {
+        text,
+        font_size,
+        content_line_height,
+    }
+}
+
+fn heading_visual_rows(level: Option<u8>, cx: &App) -> f32 {
+    let base = heading_metrics(None, cx).content_line_height;
+    let heading = heading_metrics(level, cx).content_line_height;
+    (heading / base).max(1.0)
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, RegisterSetting)]
+
+pub struct MarkdownLivePreviewSettings {
+    pub enabled: bool,
+    pub heading_styles: MarkdownHeadingStyles,
+    pub block_quote_border_color: settings::MarkdownQuoteBorderColor,
+    pub block_quote_border_width: Option<f32>,
+    pub block_quote_gap: Option<f32>,
+    pub block_quote_paragraph_spacing: Option<f32>,
+}
+
+impl Settings for MarkdownLivePreviewSettings {
+    fn from_settings(content: &settings::SettingsContent) -> Self {
+        let content = content.markdown_live_preview.clone().unwrap_or_default();
+        let heading_content = content.heading_styles.unwrap_or_default();
+        let defaults = MarkdownHeadingStyles::default();
+        Self {
+            enabled: content.enabled.unwrap_or(true),
+            block_quote_border_color: content.block_quote_border_color.unwrap_or_default(),
+            block_quote_border_width: content
+                .block_quote_border_width
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            block_quote_gap: content
+                .block_quote_gap
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            block_quote_paragraph_spacing: content
+                .block_quote_paragraph_spacing
+                .filter(|value| value.is_finite() && *value >= 0.0),
+            heading_styles: MarkdownHeadingStyles {
+                h1: defaults.h1.with_content(heading_content.h1),
+                h2: defaults.h2.with_content(heading_content.h2),
+                h3: defaults.h3.with_content(heading_content.h3),
+                h4: defaults.h4.with_content(heading_content.h4),
+                h5: defaults.h5.with_content(heading_content.h5),
+                h6: defaults.h6.with_content(heading_content.h6),
+            },
+        }
+    }
+}
+
+pub fn init(cx: &mut App) {
+    cx.observe_new(register_editor).detach();
+}
+
+fn register_editor(editor: &mut Editor, window: Option<&mut Window>, cx: &mut Context<Editor>) {
+    let Some(window) = window else {
+        return;
+    };
+    if !editor.mode().is_full() {
+        return;
+    }
+
+    let mut subscriptions = Vec::new();
+    subscriptions.push(
+        cx.subscribe_self(|editor, event: &EditorEvent, cx| match event {
+            EditorEvent::Reparsed(_) => recompute(editor, cx),
+            EditorEvent::SelectionsChanged { .. } => {
+                if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                    let resizing = addon
+                        .last_resize_at
+                        .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500));
+                    if !resizing {
+                        addon.selected_image = None;
+                    }
+                }
+                apply_decorations(editor, cx);
+            }
+            _ => {}
+        }),
+    );
+
+    // The editor does not re-emit hunk expansion as an `EditorEvent`, so the
+    // recompute that hides the preview while a diff is expanded (see
+    // `extract_markers`) needs the multibuffer's own event.
+    let multibuffer = editor.buffer().clone();
+    subscriptions.push(cx.subscribe(
+        &multibuffer,
+        |editor, _, event: &multi_buffer::Event, cx| {
+            if matches!(event, multi_buffer::Event::DiffHunksToggled) {
+                recompute(editor, cx);
+            }
+        },
+    ));
+
+    subscriptions.push(cx.observe_global::<theme::GlobalTheme>(|editor, cx| {
+        let markers = editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.markers.clone());
+        apply_emphasis_highlights(editor, markers.as_deref(), cx);
+        apply_heading_line_styles(editor, markers.as_deref(), cx);
+    }));
+
+    subscriptions.push(cx.observe_global::<SettingsStore>(|editor, cx| {
+        recompute(editor, cx);
+    }));
+
+    // A formula's height is known only once its render finishes, after the
+    // decorations pass that concealed it.
+    subscriptions.push(cx.observe_global::<MathCache>(apply_math_line_styles));
+
+    let weak_editor = cx.weak_entity();
+    subscriptions.push(
+        editor.register_action::<ToggleLivePreview>(move |_, _window, cx| {
+            weak_editor
+                .update(cx, |editor, cx| {
+                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        let enabled = addon
+                            .enabled_override
+                            .unwrap_or_else(|| MarkdownLivePreviewSettings::get_global(cx).enabled);
+                        addon.enabled_override = Some(!enabled);
+                    }
+                    recompute(editor, cx);
+                })
+                .log_err();
+        }),
+    );
+
+    // Pasting an image saves it into the attachments folder and inserts an
+    // embed link (Obsidian-style); text pastes pass through untouched.
+    let weak_editor = cx.weak_entity();
+    subscriptions.push(
+        editor.register_action::<editor::actions::Paste>(move |_, _window, cx| {
+            let handled = weak_editor
+                .update(cx, |editor, cx| {
+                    editor::items::paste_clipboard_image(editor, cx)
+                })
+                .unwrap_or(false);
+            if !handled {
+                cx.propagate();
+            }
+        }),
+    );
+
+    // Backspace/Delete removes a selected table row/column (Obsidian-style)
+    // instead of editing text; without a selection they pass through.
+    let weak_editor = cx.weak_entity();
+    subscriptions.push(editor.register_action::<editor::actions::Backspace>(
+        move |_, _window, cx| {
+            if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_citation(&weak_editor, false, cx)
+                && !delete_adjacent_to_block(&weak_editor, false, cx)
+            {
+                cx.propagate();
+            }
+        },
+    ));
+    let weak_editor = cx.weak_entity();
+    subscriptions.push(
+        editor.register_action::<editor::actions::Delete>(move |_, _window, cx| {
+            if !delete_selected_table_unit(&weak_editor, cx)
+                && !delete_adjacent_citation(&weak_editor, true, cx)
+                && !delete_adjacent_to_block(&weak_editor, true, cx)
+            {
+                cx.propagate();
+            }
+        }),
+    );
+
+    // A vertical motion into a rendered quote must resolve against its source
+    // rows, so the quote is revealed before the editor's own handler runs. These
+    // listeners run ahead of the built-in ones and always pass the action on.
+    // Intercepting here rather than inside `Editor::move_up` and friends keeps
+    // `navigation.rs` identical to upstream.
+    use editor::actions::{
+        MoveDownByLines, MoveUpByLines, SelectDown, SelectDownByLines, SelectUp, SelectUpByLines,
+    };
+    use zed_actions::editor::{MoveDown, MoveUp};
+    for row_delta in [-1, 1] {
+        let weak_editor = cx.weak_entity();
+        let reveal = move |cx: &mut App| {
+            weak_editor
+                .update(cx, |editor, cx| {
+                    editor.prepare_vertical_navigation(row_delta, true, false, cx);
+                })
+                .log_err();
+            cx.propagate();
+        };
+        if row_delta < 0 {
+            let on_move = reveal.clone();
+            subscriptions.push(editor.register_action::<MoveUp>(move |_, _, cx| on_move(cx)));
+            subscriptions.push(editor.register_action::<SelectUp>(move |_, _, cx| reveal(cx)));
+        } else {
+            let on_move = reveal.clone();
+            subscriptions.push(editor.register_action::<MoveDown>(move |_, _, cx| on_move(cx)));
+            subscriptions.push(editor.register_action::<SelectDown>(move |_, _, cx| reveal(cx)));
+        }
+    }
+    // The by-lines motions keep their line count private to the editor crate, so
+    // the distance is unknown here: reveal every editable quote in the direction
+    // of travel. They are bound in no default keymap, and the blocks a motion
+    // does not land in are restored by the recompute its selection change triggers.
+    for upward in [true, false] {
+        let weak_editor = cx.weak_entity();
+        let reveal = move |cx: &mut App| {
+            weak_editor
+                .update(cx, |editor, cx| {
+                    reveal_editable_blocks_toward(editor, upward, cx);
+                })
+                .log_err();
+            cx.propagate();
+        };
+        if upward {
+            let on_move = reveal.clone();
+            subscriptions
+                .push(editor.register_action::<MoveUpByLines>(move |_, _, cx| on_move(cx)));
+            subscriptions
+                .push(editor.register_action::<SelectUpByLines>(move |_, _, cx| reveal(cx)));
+        } else {
+            let on_move = reveal.clone();
+            subscriptions
+                .push(editor.register_action::<MoveDownByLines>(move |_, _, cx| on_move(cx)));
+            subscriptions
+                .push(editor.register_action::<SelectDownByLines>(move |_, _, cx| reveal(cx)));
+        }
+    }
+
+    // Local images are cached by path, so overwriting a file in place (say,
+    // re-cropping a screenshot) would otherwise keep serving the bitmap
+    // decoded on first render for the life of the process: gpui's app-level
+    // asset cache is never evicted, and outlives the document. Owning the
+    // cache lets a change on disk drop just that entry, and lets closing the
+    // editor release every image it decoded.
+    let image_cache = RetainAllImageCache::new(cx);
+    if let Some(project) = editor.project().cloned() {
+        let bibliography = Bibliography::global(cx);
+        Bibliography::ensure_project(&bibliography, &project, cx);
+        // Recompute when a `.bib` finishes parsing, so keys resolve (or stop
+        // resolving) and the reference list re-renders without waiting for
+        // the next edit.
+        subscriptions.push(cx.observe(&bibliography, |editor, _, cx| {
+            recompute(editor, cx);
+        }));
+        // A `.csl` file a note points at loads asynchronously; rendering
+        // switches from APA to it the moment it arrives.
+        let style_files = citations::StyleFiles::global(cx);
+        subscriptions.push(cx.observe(&style_files, |editor, _, cx| {
+            recompute(editor, cx);
+        }));
+        editor.set_completion_provider(Some(Rc::new(CitationCompletionProvider::new(
+            project.clone(),
+            cx,
+        ))));
+        // Hovering a resolved cite key shows the reference card; wrapping
+        // (rather than replacing) keeps LSP hovers and the rest of the
+        // semantics surface working.
+        if let Some(semantics) = editor.semantics_provider() {
+            editor.set_semantics_provider(Some(Rc::new(CitationSemanticsProvider::new(
+                semantics, cx,
+            ))));
+        }
+        subscriptions.push(cx.subscribe_in(&project, window, {
+            let image_cache = image_cache.clone();
+            let bibliography = bibliography.clone();
+            move |editor, project, event, window, cx| {
+                let project::Event::WorktreeUpdatedEntries(worktree_id, changes) = event else {
+                    return;
+                };
+                let Some(worktree) = project.read(cx).worktree_for_id(*worktree_id, cx) else {
+                    return;
+                };
+                let (
+                    changed_images,
+                    changed_notes,
+                    note_created,
+                    changed_bibs,
+                    removed_bibs,
+                    changed_styles,
+                ) = {
+                    let worktree = worktree.read(cx);
+                    let mut images = Vec::new();
+                    let mut notes = Vec::new();
+                    let mut created = false;
+                    let mut bibs = Vec::new();
+                    let mut removed_bibs = Vec::new();
+                    let mut styles = Vec::new();
+                    for (path, _, change) in changes.iter() {
+                        // A style file edited or dropped in is read again
+                        // on the next render.
+                        if path.extension().is_some_and(|extension| extension == "csl")
+                            && *change != PathChange::Loaded
+                        {
+                            styles.push(worktree.absolutize(path));
+                            continue;
+                        }
+                        // Unlike images and notes below, `.bib` files do want
+                        // the initial scan's `Loaded`: a worktree that
+                        // finishes scanning after the editor opened is how its
+                        // bibliography gets discovered at all, and reparsing
+                        // one already indexed is idempotent.
+                        if path.extension().is_some_and(|extension| extension == "bib") {
+                            let absolute = worktree.absolutize(path);
+                            if *change == PathChange::Removed {
+                                removed_bibs.push(absolute);
+                            } else {
+                                bibs.push(absolute);
+                            }
+                            continue;
+                        }
+                        // `Loaded` is the initial scan reporting what was
+                        // already there, not a change; acting on it would
+                        // re-decode every image in the project on open.
+                        if *change == PathChange::Loaded {
+                            continue;
+                        }
+                        let Some(extension) = path.extension() else {
+                            continue;
+                        };
+                        let absolute = worktree.absolutize(path);
+                        if is_image_extension(extension) {
+                            // Matches how `resolve_image_source` keys the
+                            // cache. A just-deleted file cannot be
+                            // canonicalized; fall back to the literal path so
+                            // an exactly-spelled reference still evicts.
+                            images.push(std::fs::canonicalize(&absolute).unwrap_or(absolute));
+                        } else if extension == "md" {
+                            created |=
+                                matches!(change, PathChange::Added | PathChange::AddedOrUpdated);
+                            notes.push(absolute);
+                        }
+                    }
+                    (images, notes, created, bibs, removed_bibs, styles)
+                };
+
+                if !changed_bibs.is_empty() {
+                    Bibliography::reload_paths(&bibliography, project, changed_bibs, cx);
+                }
+                if !changed_styles.is_empty() {
+                    let style_files = citations::StyleFiles::global(cx);
+                    for path in changed_styles {
+                        citations::StyleFiles::forget(&style_files, &path, cx);
+                    }
+                }
+                for path in removed_bibs {
+                    Bibliography::remove_path(&bibliography, &path, cx);
+                }
+
+                if !changed_images.is_empty() {
+                    image_cache.update(cx, |image_cache, cx| {
+                        for path in changed_images {
+                            image_cache.remove(
+                                &Resource::Path(Arc::from(path.as_path())),
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                    // The widgets keep their blocks; they just need to redraw
+                    // so the evicted images are fetched again.
+                    cx.notify();
+                }
+
+                // A transclusion's content is baked into its block when the
+                // block is inserted, so unlike an image it needs a recompute
+                // rather than a repaint to pick a changed note up.
+                if !changed_notes.is_empty() && evict_embeds(&changed_notes, note_created, cx) {
+                    recompute(editor, cx);
+                }
+            }
+        }));
+    }
+
+    editor.register_addon(LivePreviewAddon {
+        enabled_override: None,
+        image_cache,
+        markers: None,
+        applied_blocks: Vec::new(),
+        markdown_blocks: HashMap::default(),
+        selected_image: None,
+        active_cell: None,
+        active_property: None,
+        selected_table_unit: None,
+        drag_source: None,
+        drop_boundary: None,
+        handle_press: None,
+        source_revealed: None,
+        last_resize_at: None,
+        image_move: None,
+        callout_collapse: Vec::new(),
+        concealed_math: Vec::new(),
+        math_line_styles: BTreeMap::new(),
+        _subscriptions: subscriptions,
+    });
+
+    // The buffer may already be parsed by the time this editor is created, in
+    // which case no `Reparsed` event will arrive; compute an initial pass.
+    let weak_editor = cx.weak_entity();
+    window.defer(cx, move |_window, cx| {
+        weak_editor
+            .update(cx, |editor, cx| recompute(editor, cx))
+            .ok();
+    });
+}
+
+struct LivePreviewAddon {
+    /// Per-editor override set by the toggle action; falls back to the setting.
+    enabled_override: Option<bool>,
+    /// Cache backing every local image this editor renders, so a file changed
+    /// on disk can be evicted from it. See `register_editor`.
+    image_cache: Entity<RetainAllImageCache>,
+    markers: Option<Arc<MarkerSet>>,
+    applied_blocks: Vec<AppliedBlock>,
+    markdown_blocks: HashMap<(usize, usize), (String, Entity<Markdown>, Subscription)>,
+    /// The image widget currently selected (Obsidian-style click state),
+    /// identified by its marker range.
+    selected_image: Option<Range<Anchor>>,
+    /// The table cell currently being edited in place.
+    active_cell: Option<ActiveTableCell>,
+    /// The frontmatter property currently being edited in place through the
+    /// Properties card.
+    active_property: Option<ActivePropertyEdit>,
+    selected_table_unit: Option<TableUnitSelection>,
+    /// Unit being dragged (outlined in place, Obsidian-style) and the unit
+    /// the pointer is currently over (gets the insertion line). Rendered
+    /// only while a drag is active.
+    drag_source: Option<TableUnitSelection>,
+    /// Insertion point the pointer currently indicates, with half-cell
+    /// precision: hovering the near half of a unit targets the boundary
+    /// before it, the far half the boundary after it.
+    drop_boundary: Option<(Range<Anchor>, TableBoundary)>,
+    /// Position of the last mouse-down on a table handle. Selection commits
+    /// on mouse-up only if the pointer barely moved; recording this must NOT
+    /// notify — a re-render between press and move would drop gpui's
+    /// per-frame drag-arming listeners and kill the drag gesture.
+    handle_press: Option<gpui::Point<gpui::Pixels>>,
+    /// Block explicitly revealed via its `</>` button. Tables and images
+    /// only show source through this, never from cursor overlap alone.
+    source_revealed: Option<Range<Anchor>>,
+    /// When a resize drag last wrote a width, so selection isn't cleared by
+    /// the selection refresh that buffer edits trigger mid-drag.
+    last_resize_at: Option<std::time::Instant>,
+    /// The image widget currently being dragged to a new position, with the
+    /// row its line will land above (`None` while the pointer is outside the
+    /// text area). Set from `on_drag_move`, consumed on mouse up.
+    image_move: Option<(Range<Anchor>, Option<u32>)>,
+    /// Callouts the reader has expanded or collapsed by clicking their title,
+    /// overriding the `+`/`-` their syntax asks for. Anchored, so the state
+    /// follows the callout as text above it changes.
+    callout_collapse: Vec<(Range<Anchor>, bool)>,
+    /// Inline formulas concealed behind their rendered image this pass,
+    /// whose rows `apply_math_line_styles` grows to fit.
+    concealed_math: Vec<(Range<Anchor>, MathKey)>,
+    /// Line styles `apply_math_line_styles` last applied, by key.
+    math_line_styles: BTreeMap<usize, Vec<Range<Anchor>>>,
+    _subscriptions: Vec<Subscription>,
+}
+
+impl LivePreviewAddon {
+    /// Rendered prose blocks whose source can be edited in place: a motion that
+    /// lands inside one must see its source rows, not the widget's.
+    fn editable_replacement_blocks(&self) -> Vec<(Range<Anchor>, CustomBlockId)> {
+        self.applied_blocks
+            .iter()
+            .filter(|block| matches!(block.kind, BlockRenderKind::Markdown) && !block.below)
+            .map(|block| (block.range.clone(), block.block_id))
+            .collect()
+    }
+}
+
+fn reveal_editable_blocks_toward(editor: &mut Editor, upward: bool, cx: &mut Context<Editor>) {
+    let Some(addon) = editor.addon::<LivePreviewAddon>() else {
+        return;
+    };
+    let candidates = addon.editable_replacement_blocks();
+    if candidates.is_empty() {
+        return;
+    }
+    let snapshot = editor.display_snapshot(cx);
+    let head_rows = editor
+        .selections
+        .all::<Point>(&snapshot)
+        .into_iter()
+        .map(|selection| selection.head().row)
+        .collect::<Vec<_>>();
+    let reveal = candidates
+        .into_iter()
+        .filter_map(|(range, id)| {
+            let start = range.start.to_point(&snapshot).row;
+            let end = range.end.to_point(&snapshot).row;
+            head_rows
+                .iter()
+                .any(|head| if upward { start <= *head } else { end >= *head })
+                .then_some(id)
+        })
+        .collect::<HashSet<_>>();
+    if !reveal.is_empty() {
+        editor.remove_blocks(reveal, None, cx);
+    }
+}
+
+impl Addon for LivePreviewAddon {
+    fn blocks_to_reveal_before(
+        &self,
+        motion: &RowMotion,
+        editor: &Editor,
+        cx: &mut Context<Editor>,
+    ) -> Vec<CustomBlockId> {
+        let candidates = self.editable_replacement_blocks();
+        if candidates.is_empty() {
+            return Vec::new();
+        }
+        let snapshot = editor.display_snapshot(cx);
+        let selections = editor.selections.all::<Point>(&snapshot);
+        match *motion {
+            RowMotion::Vertical {
+                row_delta,
+                display_lines,
+                inclusive_selection,
+            } => {
+                if row_delta == 0 {
+                    return Vec::new();
+                }
+                let fold_row = |point: Point, bias: text::Bias| {
+                    snapshot
+                        .fold_snapshot()
+                        .to_fold_point(snapshot.inlay_snapshot().to_inlay_point(point), bias)
+                        .row()
+                };
+                let targets = selections
+                    .into_iter()
+                    .map(|selection| {
+                        let head = if inclusive_selection
+                            && !selection.reversed
+                            && !selection.is_empty()
+                        {
+                            editor::movement::left(
+                                &snapshot,
+                                selection.end.to_display_point(&snapshot),
+                            )
+                            .to_point(&snapshot)
+                        } else {
+                            selection.head()
+                        };
+                        let (row, max_row) = if display_lines {
+                            (
+                                snapshot
+                                    .point_to_display_point(head, text::Bias::Left)
+                                    .row()
+                                    .0,
+                                snapshot.max_point().row().0,
+                            )
+                        } else {
+                            (
+                                fold_row(head, text::Bias::Left),
+                                snapshot.fold_snapshot().max_point().row(),
+                            )
+                        };
+                        i64::from(row)
+                            .saturating_add(row_delta)
+                            .clamp(0, i64::from(max_row)) as u32
+                    })
+                    .collect::<Vec<_>>();
+                candidates
+                    .into_iter()
+                    .filter_map(|(range, id)| {
+                        let lands_inside = if display_lines {
+                            let row = editor.row_for_block(id, cx)?;
+                            let block = snapshot.block_for_id(BlockId::Custom(id))?;
+                            let end = row.0.saturating_add(block.height());
+                            targets
+                                .iter()
+                                .any(|target| *target >= row.0 && *target < end)
+                        } else {
+                            let start = fold_row(range.start.to_point(&snapshot), text::Bias::Left);
+                            let end = fold_row(range.end.to_point(&snapshot), text::Bias::Right);
+                            targets
+                                .iter()
+                                .any(|target| *target >= start && *target <= end)
+                        };
+                        lands_inside.then_some(id)
+                    })
+                    .collect()
+            }
+            RowMotion::Linewise { rows } => {
+                let ranges = selections
+                    .into_iter()
+                    .map(|selection| {
+                        let end_row = if !selection.is_empty() && selection.end.column == 0 {
+                            selection.end.row.saturating_sub(1)
+                        } else {
+                            selection.end.row
+                        };
+                        selection.start.row..=end_row.saturating_add(rows)
+                    })
+                    .collect::<Vec<_>>();
+                candidates
+                    .into_iter()
+                    .filter_map(|(range, id)| {
+                        let start = range.start.to_point(&snapshot).row;
+                        let end = range.end.to_point(&snapshot).row;
+                        ranges
+                            .iter()
+                            .any(|range| start <= *range.end() && end >= *range.start())
+                            .then_some(id)
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    fn to_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn to_any_mut(&mut self) -> Option<&mut dyn std::any::Any> {
+        Some(self)
+    }
+}
+
+struct MarkerSet {
+    inline: Vec<InlineMarker>,
+    blocks: Vec<BlockMarker>,
+    /// The heading block that names the reference list, when the note has
+    /// one; `attach_references_block` turns it into the rendered list.
+    references_heading: Option<Range<Anchor>>,
+    /// Ranges that get an always-on strikethrough text decoration: themes
+    /// color `~~struck~~` spans but do not apply the actual line-through, and
+    /// with the delimiters hidden there would otherwise be no visual cue.
+    strikethrough: Vec<Range<Anchor>>,
+    /// Emphasis content, restyled preview-like (plain text color, true
+    /// italic/bold) instead of source-mode syntax-highlight colors.
+    italic: Vec<Range<Anchor>>,
+    bold: Vec<Range<Anchor>>,
+    /// Link text, restyled to upright accent color so links read as
+    /// clickable color while italics remain the only slanted text.
+    link_text: Vec<Range<Anchor>>,
+    /// All `[label]: url` reference definitions in the document, appended to
+    /// each widget's mini-document so reference links and images resolve.
+    definitions: String,
+    /// Definition lines are muted: the preview hides them entirely, but
+    /// invisible text is confusing in an editor, so they recede instead.
+    definition_ranges: Vec<Range<Anchor>>,
+    /// Ordered-list markers, restyled to the plain text color for
+    /// consistency with bullet glyphs.
+    ordered_markers: Vec<Range<Anchor>>,
+    /// Pandoc-style citation keys (`@key` including the `@`), styled as
+    /// reference chips once the surrounding brackets are concealed.
+    citations: Vec<Range<Anchor>>,
+    /// Whole bracketed citation groups (`[...]` inclusive). A citation is
+    /// inserted as one token through completion, so backspacing at a group's
+    /// end (or forward-deleting at its start) removes the whole group.
+    citation_groups: Vec<Range<Anchor>>,
+    /// Bare in-text citation keys (`@key` outside any brackets). Pandoc
+    /// treats these as citations exactly like bracketed ones, and so does
+    /// the styling: chip when the key resolves, red flag when it does not.
+    /// The flagging only starts once the vault has a bibliography with
+    /// entries, which is what keeps `@handles` in bib-less prose unflagged.
+    bare_citations: Vec<Range<Anchor>>,
+    /// Bodies of Obsidian `==highlight==` marks, painted with a highlighter
+    /// background once the `==` delimiters are concealed.
+    highlights: Vec<Range<Anchor>>,
+    /// Obsidian tags (`#tag`, `#area/topic`), styled as chips. Unlike the
+    /// other inline constructs a tag has no syntax to hide: the `#` is part
+    /// of the tag's name, so it is styled in place rather than concealed.
+    tags: Vec<Range<Anchor>>,
+    /// Inline code content (between the backticks), styled like the
+    /// preview's pill: plain text color on a faint background.
+    code: Vec<Range<Anchor>>,
+}
+
+#[derive(Clone)]
+struct InlineMarker {
+    range: Range<Anchor>,
+    kind: InlineKind,
+}
+
+#[derive(Clone)]
+enum InlineKind {
+    /// Pure syntax to hide: emphasis delimiters, backticks, link brackets and
+    /// destinations, etc. Reveals when the selection touches the enclosing
+    /// construct (per-token reveal), not the whole line.
+    Hide {
+        /// The whole construct (e.g. `**bold**` including delimiters); the
+        /// marker reveals when the selection touches this span.
+        reveal_span: Range<Anchor>,
+    },
+    /// An unordered list marker, rendered as a bullet glyph.
+    Bullet,
+    /// A task list marker (`- [ ]` / `- [x]`), rendered as a clickable checkbox.
+    Checkbox {
+        checked: bool,
+        /// The range of the `[ ]`/`[x]` marker itself, edited on toggle.
+        marker_range: Range<Anchor>,
+    },
+    /// A footnote reference (`[^label]`), rendered as a raised chip carrying
+    /// the label, the way a preview renders a superscript marker.
+    Footnote { label: SharedString },
+    /// A link rendered as its display text, opening its target on a plain
+    /// click the way Obsidian's live preview does. The whole construct is
+    /// concealed rather than just its syntax so the text can own the click;
+    /// putting the cursor next to it hands back the raw markdown to edit.
+    Link {
+        destination: LinkDestination,
+        label: SharedString,
+    },
+    /// A citation group (`[@key, p. 3; @other]` or a bare `@key`) rendered as
+    /// the note's CSL style's in-text form, `(Vaswani et al., 2017, p. 3)` or
+    /// `[1]`. The whole group is concealed; touching it hands back the
+    /// source with its key chips.
+    Citation { rendered: SharedString },
+    /// A LaTeX formula (`$x$` or `$$x$$`), rendered as a typeset image.
+    ///
+    /// Rendering is asynchronous, so the placeholder reads whatever the shared
+    /// [`MathCache`] holds for `source`; until that resolves it falls back to
+    /// the LaTeX source, which is also what a formula that fails to parse keeps
+    /// showing.
+    Math {
+        source: SharedString,
+        style: MathStyle,
+    },
+}
+
+/// Where a clickable link leads.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum LinkDestination {
+    /// What follows `[[` up to the alias pipe: a note name, with its
+    /// `#heading` part if any, resolved against the whole project.
+    Wikilink(SharedString),
+    /// A markdown link's destination: a URL, or a path relative to the note.
+    Markdown(SharedString),
+}
+
+struct BlockMarker {
+    range: Range<Anchor>,
+    height_estimate: u32,
+    kind: BlockRenderKind,
+    /// Leading-whitespace columns of the first line, so nested widgets (e.g.
+    /// a code block inside a list item) keep their indentation.
+    indent_columns: u32,
+}
+
+/// The warning under a References list, with a link to what fixes it.
+#[derive(Clone, PartialEq)]
+struct ReferencesNote {
+    text: SharedString,
+    link_label: SharedString,
+    url: SharedString,
+}
+
+#[derive(Clone, PartialEq)]
+enum BlockRenderKind {
+    /// Rendered through `MarkdownElement`.
+    Markdown,
+    /// An ATX heading. It stays rendered when selected, showing its raw
+    /// source inside the styled block so keyboard navigation does not collapse
+    /// the heading back to an ordinary editor line.
+    Heading { level: u8 },
+    /// A horizontal rule, rendered as a plain divider: a lone `---` fed to
+    /// the markdown parser would be misread as a frontmatter opener.
+    Rule,
+    /// YAML/TOML frontmatter, rendered as a compact properties card instead
+    /// of the markdown crate's oversized metadata table.
+    Frontmatter,
+    /// A pipe table rendered as an editable grid: clicking a cell mounts a
+    /// single-line editor over it, and structural buttons add rows/columns.
+    Table(TableStructure),
+    /// A standalone image, width-capped and honoring Obsidian's
+    /// `![alt|640](path)` size syntax. When the destination is known the
+    /// widget renders a bare image element (which the selection border hugs
+    /// exactly); reference-style images fall back to the markdown renderer.
+    Image {
+        display_width: Option<f32>,
+        destination: Option<String>,
+        alt: String,
+    },
+    /// An Obsidian note transclusion (`![[Note]]`, `![[Note#Heading]]`),
+    /// rendered as a card holding the target note's markdown. The body is
+    /// loaded asynchronously and reaches the widget through [`EmbedCache`].
+    Embed {
+        target: String,
+        section: Option<String>,
+    },
+    /// An Obsidian callout (`> [!note] Title`), rendered as a tinted card
+    /// with its type's icon and color. `collapse` carries what the `+`/`-`
+    /// suffix asked for: `None` when the callout is not collapsible at all.
+    Callout {
+        kind: CalloutKind,
+        title: String,
+        collapse: Option<bool>,
+    },
+    /// A `References` (or `Bibliography`) heading, rendered together with the
+    /// reference-list entries for every work the note cites, formatted in
+    /// the note's CSL style. Each item is `(key, rendered text)`.
+    References {
+        items: Vec<(SharedString, SharedString)>,
+        /// A line under the list, e.g. that the frontmatter names a style
+        /// that is not bundled and APA is showing instead.
+        note: Option<ReferencesNote>,
+    },
+    /// Display math (`$$...$$` alone on its lines), rendered as a centered
+    /// typeset formula. Unlike other blocks, revealing its source does not
+    /// remove the widget: the rendering stays below the source lines and
+    /// live-updates while the formula is edited, following Obsidian.
+    Math {
+        /// The LaTeX between the delimiters.
+        source: String,
+    },
+}
+
+/// Obsidian's callout types, collapsed onto the handful of visual treatments
+/// they actually have. Its full alias list maps many names onto one look —
+/// `tip`, `hint`, and `important` are the same callout — so this models the
+/// looks and resolves aliases into them.
+///
+/// An unrecognized type deliberately renders as `Note` rather than falling
+/// back to a plain quote: a vault full of `[!recipe]` callouts should still
+/// read as callouts.
+#[derive(Clone, Copy, PartialEq)]
+enum CalloutKind {
+    Note,
+    Abstract,
+    Todo,
+    Tip,
+    Success,
+    Question,
+    Warning,
+    Failure,
+    Danger,
+    Example,
+    Quote,
+}
+
+impl CalloutKind {
+    fn from_name(name: &str) -> Self {
+        match name.to_ascii_lowercase().as_str() {
+            "abstract" | "summary" | "tldr" => Self::Abstract,
+            "todo" => Self::Todo,
+            "tip" | "hint" | "important" => Self::Tip,
+            "success" | "check" | "done" => Self::Success,
+            "question" | "help" | "faq" => Self::Question,
+            "warning" | "caution" | "attention" => Self::Warning,
+            "failure" | "fail" | "missing" | "bug" => Self::Failure,
+            "danger" | "error" => Self::Danger,
+            "example" => Self::Example,
+            "quote" | "cite" => Self::Quote,
+            _ => Self::Note,
+        }
+    }
+
+    fn icon(self) -> IconName {
+        match self {
+            Self::Note => IconName::Info,
+            Self::Abstract => IconName::Notepad,
+            Self::Todo => IconName::ListTodo,
+            Self::Tip => IconName::Flame,
+            Self::Success => IconName::Check,
+            Self::Question => IconName::CircleHelp,
+            Self::Warning => IconName::Warning,
+            Self::Failure => IconName::XCircle,
+            Self::Danger => IconName::BoltFilled,
+            Self::Example => IconName::Book,
+            Self::Quote => IconName::Quote,
+        }
+    }
+
+    /// The callout's accent, taken from the theme's status palette so both
+    /// Suzuri Light and Dark stay legible without pinning hex values.
+    fn accent(self, cx: &App) -> Hsla {
+        let status = cx.theme().status();
+        match self {
+            // Obsidian gives `example` a purple of its own, but the status
+            // palette has no purple: `hint` is blue in Zed's base theme and
+            // grey in Suzuri's, which would make this family collide with
+            // `note` under one theme and with `quote` under the other. It
+            // takes `info` and leans on its book icon to stay distinct.
+            Self::Note | Self::Abstract | Self::Todo | Self::Example => status.info,
+            Self::Tip | Self::Success => status.success,
+            Self::Question | Self::Warning => status.warning,
+            Self::Failure | Self::Danger => status.error,
+            Self::Quote => cx.theme().colors().text_muted,
+        }
+    }
+
+    /// What Obsidian titles an untitled callout: the type's own name.
+    fn default_title(self) -> &'static str {
+        match self {
+            Self::Note => "Note",
+            Self::Abstract => "Abstract",
+            Self::Todo => "Todo",
+            Self::Tip => "Tip",
+            Self::Success => "Success",
+            Self::Question => "Question",
+            Self::Warning => "Warning",
+            Self::Failure => "Failure",
+            Self::Danger => "Danger",
+            Self::Example => "Example",
+            Self::Quote => "Quote",
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct TableStructure {
+    header: Vec<Range<Anchor>>,
+    alignments: Vec<CellAlignment>,
+    rows: Vec<Vec<Range<Anchor>>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum CellAlignment {
+    None,
+    Left,
+    Center,
+    Right,
+}
+
+impl TableStructure {
+    /// All cell ranges in reading order, for Tab navigation.
+    fn cells_in_order(&self) -> Vec<Range<Anchor>> {
+        self.header
+            .iter()
+            .chain(self.rows.iter().flatten())
+            .cloned()
+            .collect()
+    }
+}
+
+/// Payload for dragging a row handle to reorder rows within one table.
+/// Table identity is an anchor resolved at drop time: the payload and the
+/// drop target are captured on different frames, so raw offsets diverge as
+/// soon as anything edits the buffer.
+struct TableRowDrag {
+    table_start: Anchor,
+    row: usize,
+}
+
+/// Payload for dragging a column handle to reorder columns within one table.
+struct TableColumnDrag {
+    table_start: Anchor,
+    column: usize,
+}
+
+/// An insertion point between rows or columns: `Row(i)`/`Column(i)` means
+/// "insert before index i", with i == count meaning after the last.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TableBoundary {
+    Row(usize),
+    Column(usize),
+}
+
+/// A whole row or column selected via its hover handle, Obsidian-style.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum TableUnit {
+    /// Data row index (the header is not selectable).
+    Row(usize),
+    Column(usize),
+}
+
+struct TableUnitSelection {
+    table_range: Range<Anchor>,
+    unit: TableUnit,
+}
+
+/// The single-line editor mounted over a table cell.
+struct ActiveTableCell {
+    cell_range: Range<Anchor>,
+    editor: Entity<Editor>,
+    _subscriptions: Vec<Subscription>,
+}
+
+struct ActivePropertyEdit {
+    frontmatter_range: Range<Anchor>,
+    target: PropertyEditTarget,
+    editor: Entity<Editor>,
+    _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone, PartialEq)]
+enum PropertyEditTarget {
+    /// Rewrites the value of the existing property line whose key this is.
+    Value { key: String },
+    /// The "Add property" key editor; committing inserts a `<key>: ` line
+    /// before the closing delimiter.
+    NewKey,
+}
+
+/// One `key: value` entry parsed from frontmatter for the Properties card.
+struct FrontmatterProperty {
+    key: String,
+    /// Byte range of the raw value within the frontmatter source, starting
+    /// right after the `:`/`=` separator so a rewrite replaces the padding
+    /// too (mirroring how table cells rewrite between their pipes).
+    value_span: Range<usize>,
+    value: FrontmatterValue,
+}
+
+enum FrontmatterValue {
+    /// Display text with surrounding quotes stripped.
+    Scalar(String),
+    /// A YAML block list or inline `[a, b]` array, rendered as pills.
+    List(Vec<String>),
+}
+
+struct AppliedBlock {
+    range: Range<Anchor>,
+    source: String,
+    kind: BlockRenderKind,
+    height_estimate: u32,
+    indent_columns: u32,
+    /// True when the widget is placed below its source lines instead of
+    /// replacing them — display math while its source is revealed.
+    below: bool,
+    /// A collapsed callout draws different content over identical source, so
+    /// this has to take part in the reuse check or toggling one redraws
+    /// nothing. Always false for every other block kind.
+    collapsed: bool,
+    block_id: CustomBlockId,
+}
+
+/// Whether live preview is currently rendering in this editor, considering
+/// both the setting and the per-editor `ToggleLivePreview` override. The
+/// quick action bar's source-mode button reflects and flips this.
+pub fn is_live_preview_enabled(editor: &Editor, cx: &App) -> bool {
+    editor
+        .addon::<LivePreviewAddon>()
+        .is_some_and(|addon| is_enabled(addon, cx))
+}
+
+fn is_enabled(addon: &LivePreviewAddon, cx: &App) -> bool {
+    addon
+        .enabled_override
+        .unwrap_or_else(|| MarkdownLivePreviewSettings::get_global(cx).enabled)
+}
+
+fn recompute(editor: &mut Editor, cx: &mut Context<Editor>) {
+    let Some(addon) = editor.addon::<LivePreviewAddon>() else {
+        return;
+    };
+    let enabled = is_enabled(addon, cx);
+
+    let markers = if enabled && !editor.read_only(cx) {
+        extract_markers(editor, cx).map(|mut markers| {
+            attach_citation_rendering(&mut markers, editor, cx);
+            Arc::new(markers)
+        })
+    } else {
+        None
+    };
+
+    let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
+        return;
+    };
+    addon.markers = markers.clone();
+    apply_emphasis_highlights(editor, markers.as_deref(), cx);
+    apply_heading_line_styles(editor, markers.as_deref(), cx);
+    apply_decorations(editor, cx);
+}
+
+/// Namespaces within `HighlightKey::MarkdownLivePreview`, one per decoration
+/// kind so each can be written and cleared independently of the others.
+const STRIKE: usize = 0;
+const ITALIC: usize = 1;
+const BOLD: usize = 2;
+const LINK: usize = 3;
+const DEFINITION: usize = 4;
+const ORDERED_MARKER: usize = 5;
+const CITATION: usize = 6;
+const HIGHLIGHT: usize = 7;
+const TAG: usize = 8;
+const CITATION_UNKNOWN: usize = 9;
+const CODE: usize = 10;
+const HEADING_STYLE_BASE: usize = 100;
+
+/// Emphasis spans get preview-like typography: the plain text color with true
+/// bold/italic styling, overriding the theme's source-mode markup colors
+/// (e.g. blue non-slanted italics, orange bold), plus a real line-through for
+/// strikethrough, which themes color but never strike.
+fn apply_emphasis_highlights(
+    editor: &mut Editor,
+    markers: Option<&MarkerSet>,
+    cx: &mut Context<Editor>,
+) {
+    let text_color = cx.theme().colors().text;
+    let accent_color = cx.theme().colors().text_accent;
+    let muted_color = cx.theme().colors().text_muted;
+    let citation_background = cx
+        .theme()
+        .colors()
+        .editor_document_highlight_read_background;
+    // A highlighter mark reads as a wash of color behind the text rather than
+    // a chip, so it is the one decoration that wants a warm, saturated
+    // background; deriving it from the theme's warning hue keeps it legible
+    // in both Suzuri Light and Dark instead of pinning a yellow that only
+    // works in one.
+    let highlight_background = cx.theme().status().warning.opacity(0.28);
+    let tag_background = cx.theme().status().info_background;
+    // Same pill the markdown preview draws for inline code.
+    let code_background = cx.theme().colors().editor_foreground.opacity(0.08);
+    let error_color = cx.theme().status().error;
+
+    // A cite key that resolves to no `.bib` entry is the kind of silent error
+    // a submitted paper pays for, so it gets diagnostic styling. Only once
+    // the project has a bibliography with entries, though: someone writing
+    // `[@handle]` in a vault with no `.bib` is not citing anything.
+    let bibliography = Bibliography::global(cx);
+    let mut resolved_citations = markers.map(|markers| markers.citations.clone());
+    let mut unknown_citations = markers.map(|_| Vec::new());
+    if let Some(markers) = markers
+        && (!markers.citations.is_empty() || !markers.bare_citations.is_empty())
+        && bibliography.read(cx).has_entries()
+    {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let bibliography = bibliography.read(cx);
+        let resolves = |range: &Range<Anchor>| {
+            let text: String = snapshot.text_for_range(range.clone()).collect();
+            let key = text.strip_prefix('@').unwrap_or(&text);
+            bibliography.contains_key(key)
+        };
+        let mut known = Vec::with_capacity(markers.citations.len());
+        let mut unknown = Vec::new();
+        for range in &markers.citations {
+            if resolves(range) {
+                known.push(range.clone());
+            } else {
+                unknown.push(range.clone());
+            }
+        }
+        for range in &markers.bare_citations {
+            if resolves(range) {
+                known.push(range.clone());
+            } else {
+                unknown.push(range.clone());
+            }
+        }
+        resolved_citations = Some(known);
+        unknown_citations = Some(unknown);
+    }
+
+    let sets = [
+        (
+            STRIKE,
+            markers.map(|markers| markers.strikethrough.clone()),
+            HighlightStyle {
+                strikethrough: Some(StrikethroughStyle {
+                    thickness: gpui::px(1.),
+                    color: None,
+                }),
+                ..Default::default()
+            },
+        ),
+        (
+            ITALIC,
+            markers.map(|markers| markers.italic.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                font_style: Some(gpui::FontStyle::Italic),
+                ..Default::default()
+            },
+        ),
+        (
+            BOLD,
+            markers.map(|markers| markers.bold.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                font_weight: Some(FontWeight::BOLD),
+                ..Default::default()
+            },
+        ),
+        (
+            LINK,
+            markers.map(|markers| markers.link_text.clone()),
+            HighlightStyle {
+                color: Some(accent_color),
+                font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
+        (
+            DEFINITION,
+            markers.map(|markers| markers.definition_ranges.clone()),
+            HighlightStyle {
+                color: Some(muted_color),
+                font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
+        (
+            ORDERED_MARKER,
+            markers.map(|markers| markers.ordered_markers.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                ..Default::default()
+            },
+        ),
+        (
+            CITATION,
+            resolved_citations,
+            HighlightStyle {
+                color: Some(accent_color),
+                background_color: Some(citation_background),
+                font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
+        (
+            CITATION_UNKNOWN,
+            unknown_citations,
+            HighlightStyle {
+                color: Some(error_color),
+                background_color: Some(citation_background),
+                font_style: Some(gpui::FontStyle::Normal),
+                underline: Some(UnderlineStyle {
+                    thickness: gpui::px(1.),
+                    color: Some(error_color),
+                    wavy: true,
+                }),
+                ..Default::default()
+            },
+        ),
+        (
+            HIGHLIGHT,
+            markers.map(|markers| markers.highlights.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                background_color: Some(highlight_background),
+                ..Default::default()
+            },
+        ),
+        (
+            TAG,
+            markers.map(|markers| markers.tags.clone()),
+            HighlightStyle {
+                color: Some(accent_color),
+                background_color: Some(tag_background),
+                font_style: Some(gpui::FontStyle::Normal),
+                ..Default::default()
+            },
+        ),
+        (
+            CODE,
+            markers.map(|markers| markers.code.clone()),
+            HighlightStyle {
+                color: Some(text_color),
+                background_color: Some(code_background),
+                ..Default::default()
+            },
+        ),
+    ];
+    for (key, ranges, style) in sets {
+        match ranges {
+            Some(ranges) if !ranges.is_empty() => {
+                editor.highlight_text(HighlightKey::MarkdownLivePreview(key), ranges, style, cx);
+            }
+            _ => editor.clear_highlights(HighlightKey::MarkdownLivePreview(key), cx),
+        }
+    }
+}
+
+fn apply_heading_line_styles(
+    editor: &mut Editor,
+    markers: Option<&MarkerSet>,
+    cx: &mut Context<Editor>,
+) {
+    for level in 1..=6 {
+        let key = HighlightKey::MarkdownLivePreview(HEADING_STYLE_BASE + level as usize);
+        let ranges = markers
+            .map(|markers| {
+                markers
+                    .blocks
+                    .iter()
+                    .filter_map(|marker| {
+                        matches!(marker.kind, BlockRenderKind::Heading { level: marker_level }
+                            if marker_level == level)
+                        .then(|| marker.range.clone())
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if ranges.is_empty() {
+            editor.clear_highlights(key, cx);
+            continue;
+        }
+        let heading_style = MarkdownLivePreviewSettings::get_global(cx)
+            .heading_styles
+            .for_level(level);
+        editor.highlight_text(
+            key,
+            ranges.clone(),
+            HighlightStyle {
+                color: Some(if level == 6 {
+                    cx.theme().colors().text_muted
+                } else {
+                    cx.theme().colors().text
+                }),
+                font_weight: Some(heading_style.font_weight),
+                ..Default::default()
+            },
+            cx,
+        );
+        editor.style_lines(
+            key,
+            ranges,
+            editor::display_map::LineStyle {
+                font_scale: heading_style.font_size,
+                line_height: heading_visual_rows(Some(level), cx),
+            },
+            cx,
+        );
+    }
+}
+
+/// Key range for the line styles of rows holding tall inline math, one key per
+/// row height. `LineStyleMap` gives a row shared by several keys the style of
+/// the lowest, so the key counts down from the end of the range as the height
+/// grows: the tallest formula on a row decides its height. The range sits
+/// above the heading keys, so a heading keeps its own line style.
+const MATH_LINE_STYLE_START: usize = 200;
+const MATH_LINE_STYLE_END: usize = 1000;
+const MATH_LINE_MAX_STEPS: usize = MATH_LINE_STYLE_END - MATH_LINE_STYLE_START;
+/// Row heights are rounded up to this fraction of a row, which bounds the
+/// number of keys and keeps a formula from touching the rows around it.
+const MATH_LINE_STEPS_PER_ROW: f32 = 8.0;
+
+/// Grows each row holding a concealed inline formula taller than the line,
+/// such as a matrix, so the formula does not paint over the rows around it.
+fn apply_math_line_styles(editor: &mut Editor, cx: &mut Context<Editor>) {
+    let Some(addon) = editor.addon::<LivePreviewAddon>() else {
+        return;
+    };
+    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+    // Every term of the ratio scales with the font size, so the settings'
+    // size serves the minimap too, which shares this display map.
+    let font_size = theme_settings.buffer_font_size(cx);
+    let line_height = font_size * theme_settings.line_height();
+    let mut desired: BTreeMap<usize, Vec<Range<Anchor>>> = BTreeMap::new();
+    if let Some(cache) = cx.try_global::<MathCache>() {
+        for (range, key) in &addon.concealed_math {
+            let Some(MathEntry::Ready {
+                baseline_fraction,
+                width_em,
+                height_em,
+                ..
+            }) = cache.entries.get(key)
+            else {
+                continue;
+            };
+            let layout =
+                InlineMathLayout::new(*baseline_fraction, *width_em, *height_em, font_size, cx);
+            let rows = layout.element_height() / line_height;
+            if !rows.is_finite() || rows <= 1.0 {
+                continue;
+            }
+            let steps = ((rows * MATH_LINE_STEPS_PER_ROW).ceil() as usize).min(MATH_LINE_MAX_STEPS);
+            desired
+                .entry(MATH_LINE_STYLE_END - steps)
+                .or_default()
+                .push(range.clone());
+        }
+    }
+    if desired == addon.math_line_styles {
+        return;
+    }
+    let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
+        return;
+    };
+    let previous = std::mem::replace(&mut addon.math_line_styles, desired.clone());
+    for key in previous.keys() {
+        if !desired.contains_key(key) {
+            editor.clear_highlights(HighlightKey::MarkdownLivePreview(*key), cx);
+        }
+    }
+    for (key, ranges) in desired {
+        let steps = MATH_LINE_STYLE_END - key;
+        editor.style_lines(
+            HighlightKey::MarkdownLivePreview(key),
+            ranges,
+            editor::display_map::LineStyle {
+                font_scale: 1.0,
+                line_height: steps as f32 / MATH_LINE_STEPS_PER_ROW,
+            },
+            cx,
+        );
+    }
+}
+
+/// A block widget `apply_decorations` wants on screen this pass, paired with
+/// everything the reuse check compares against the block already applied
+/// there.
+struct DesiredBlock<'a> {
+    marker: &'a BlockMarker,
+    source: String,
+    below: bool,
+    collapsed: bool,
+    /// What the cache held for an embed this pass. Not on `AppliedBlock`,
+    /// because `source` already stands in for it in the reuse check.
+    embed: Option<EmbedState>,
+}
+
+fn apply_decorations(editor: &mut Editor, cx: &mut Context<Editor>) {
+    let Some(addon) = editor.addon_mut::<LivePreviewAddon>() else {
+        return;
+    };
+    let markers = addon.markers.clone();
+    let image_cache = addon.image_cache.clone();
+    let callout_collapse = addon.callout_collapse.clone();
+    let applied_blocks = std::mem::take(&mut addon.applied_blocks);
+    let mut markdown_blocks = std::mem::take(&mut addon.markdown_blocks);
+
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let Some(markers) = markers else {
+        clear_decorations(editor, applied_blocks, cx);
+        return;
+    };
+
+    let markdown_ranges = markers
+        .blocks
+        .iter()
+        .filter_map(|marker| {
+            matches!(marker.kind, BlockRenderKind::Markdown).then(|| {
+                (
+                    marker.range.start.to_offset(&snapshot).0,
+                    marker.range.end.to_offset(&snapshot).0,
+                )
+            })
+        })
+        .collect::<HashSet<_>>();
+    markdown_blocks.retain(|range, _| markdown_ranges.contains(range));
+
+    // Session restore can resurrect concealments saved as folds by older
+    // builds as plain `⋯` folds this addon does not own; heal them whenever
+    // decorations refresh.
+    remove_stale_restored_folds(editor, cx);
+
+    let selection_rows = selection_row_ranges(editor, &snapshot);
+    let source_revealed = editor
+        .addon::<LivePreviewAddon>()
+        .and_then(|addon| addon.source_revealed.clone())
+        .filter(|revealed| {
+            let start = revealed.start.to_point(&snapshot).row;
+            let end = revealed.end.to_point(&snapshot).row;
+            rows_intersect(&selection_rows, start, end)
+        });
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.source_revealed = source_revealed.clone();
+    }
+    let selection_offsets = selection_offset_ranges(editor, &snapshot);
+    let base_directory = buffer_base_directory(editor, cx);
+    let project = editor.project().cloned();
+
+    // --- Inline concealments ---
+
+    let weak_editor = cx.weak_entity();
+    let mut concealments = Vec::new();
+    let mut concealed_math = Vec::new();
+    for marker in &markers.inline {
+        let start = marker.range.start.to_point(&snapshot);
+        let end = marker.range.end.to_point(&snapshot);
+        if start >= end {
+            continue;
+        }
+        // Per-token: reveal only when the selection touches the marker's
+        // enclosing construct (for list markers, the marker itself), leaving
+        // the rest of the line rendered.
+        let reveal_span = match &marker.kind {
+            InlineKind::Hide { reveal_span } => reveal_span,
+            // Math reveals when the selection touches the formula, so putting
+            // the cursor in it hands back the LaTeX to edit.
+            InlineKind::Bullet
+            | InlineKind::Checkbox { .. }
+            | InlineKind::Footnote { .. }
+            | InlineKind::Link { .. }
+            | InlineKind::Citation { .. }
+            | InlineKind::Math { .. } => &marker.range,
+        };
+        let span = reveal_span.start.to_offset(&snapshot).0..reveal_span.end.to_offset(&snapshot).0;
+        let revealed = selection_offsets
+            .iter()
+            .any(|selection| selection.start <= span.end && span.start <= selection.end);
+        if revealed {
+            continue;
+        }
+        // Start the render here rather than in the placeholder closure, which
+        // runs every frame; by the time it draws, the cache holds at least a
+        // pending entry.
+        if let InlineKind::Math { source, style } = &marker.kind {
+            let key = MathKey {
+                source: source.clone(),
+                style: *style,
+            };
+            request_math_render(key.clone(), cx);
+            concealed_math.push((marker.range.clone(), key));
+        }
+        concealments.push(Concealment {
+            range: marker.range.clone(),
+            placeholder: fold_placeholder(marker, weak_editor.clone()),
+            content_key: marker_content_key(&marker.kind),
+        });
+    }
+    for block in &markers.blocks {
+        let BlockRenderKind::Heading { level } = block.kind else {
+            continue;
+        };
+        let start = block.range.start.to_offset(&snapshot).0;
+        let end = block.range.end.to_offset(&snapshot).0;
+        let source: String = snapshot
+            .text_for_range(MultiBufferOffset(start)..MultiBufferOffset(end))
+            .collect();
+        let (_, content_start) = atx_heading_marker_offsets(&source, level);
+        if content_start == 0 {
+            continue;
+        }
+        let revealed = !editor.selection_is_from_search()
+            && selection_offsets
+                .iter()
+                .any(|selection| selection.start <= end && start <= selection.end);
+        if revealed {
+            continue;
+        }
+        let marker_range = snapshot.anchor_before(MultiBufferOffset(start))
+            ..snapshot.anchor_after(MultiBufferOffset(start + content_start));
+        let marker = InlineMarker {
+            range: marker_range,
+            kind: InlineKind::Hide {
+                reveal_span: block.range.clone(),
+            },
+        };
+        concealments.push(Concealment {
+            range: marker.range.clone(),
+            placeholder: fold_placeholder(&marker, weak_editor.clone()),
+            content_key: 0,
+        });
+    }
+    editor.set_concealments(TypeId::of::<LivePreviewFoldTag>(), concealments, cx);
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.concealed_math = concealed_math;
+    }
+    apply_math_line_styles(editor, cx);
+
+    // --- Block widgets ---
+
+    let mut desired_blocks: HashMap<(usize, usize), DesiredBlock<'_>> = HashMap::default();
+    for marker in &markers.blocks {
+        if matches!(marker.kind, BlockRenderKind::Heading { .. }) {
+            continue;
+        }
+        let start = marker.range.start.to_point(&snapshot);
+        let end = marker.range.end.to_point(&snapshot);
+        if start > end {
+            continue;
+        }
+        let mut below = false;
+        if rows_intersect(&selection_rows, start.row, end.row) {
+            // Interactive widgets reveal source only through their explicit controls.
+            let keeps_widget_when_selected = matches!(
+                marker.kind,
+                BlockRenderKind::Table(_)
+                    | BlockRenderKind::Image { .. }
+                    | BlockRenderKind::Frontmatter
+            );
+            let explicitly_revealed = source_revealed.as_ref().is_some_and(|revealed| {
+                let revealed_start = revealed.start.to_point(&snapshot).row;
+                let revealed_end = revealed.end.to_point(&snapshot).row;
+                revealed_start <= end.row && start.row <= revealed_end
+            });
+            if matches!(marker.kind, BlockRenderKind::Math { .. }) {
+                // Editing display math keeps the rendering on screen: the
+                // widget moves below the revealed source and live-updates
+                // as the formula is typed, following Obsidian.
+                below = true;
+            } else if !keeps_widget_when_selected || explicitly_revealed {
+                continue;
+            }
+        }
+        let start_offset = marker.range.start.to_offset(&snapshot);
+        let end_offset = marker.range.end.to_offset(&snapshot);
+        let mut source: String = snapshot.text_for_range(start_offset..end_offset).collect();
+        if source.trim().is_empty() {
+            continue;
+        }
+        // Reference links/images inside a widget resolve against the whole
+        // document's definitions, which live outside the widget's slice.
+        if matches!(
+            marker.kind,
+            BlockRenderKind::Markdown
+                | BlockRenderKind::Image { .. }
+                | BlockRenderKind::Callout { .. }
+        ) && !markers.definitions.is_empty()
+        {
+            source.push_str("\n\n");
+            source.push_str(&markers.definitions);
+        }
+        // The reuse check below compares sources, so the rendered entries
+        // ride along: a newly cited work or a style change re-renders.
+        if let BlockRenderKind::References { items, note } = &marker.kind {
+            for (_, text) in items {
+                source.push('\n');
+                source.push_str(text);
+            }
+            if let Some(note) = note {
+                source.push('\n');
+                source.push_str(&note.text);
+                source.push('\n');
+                source.push_str(&note.url);
+            }
+        }
+        let embed = match &marker.kind {
+            BlockRenderKind::Embed { target, section } => {
+                let state = embed_state(
+                    EmbedKey {
+                        source_directory: base_directory.clone(),
+                        target: target.clone(),
+                        section: section.clone(),
+                    },
+                    project.clone(),
+                    weak_editor.clone(),
+                    cx,
+                );
+                source = state.reuse_key();
+                Some(state)
+            }
+            _ => None,
+        };
+        // What the reader last asked for wins over what the `+`/`-` in the
+        // syntax asked for.
+        let collapsed = match &marker.kind {
+            BlockRenderKind::Callout { collapse, .. } => callout_collapse
+                .iter()
+                .find(|(range, _)| range.start.to_offset(&snapshot) == start_offset)
+                .map_or(collapse.unwrap_or(false), |(_, collapsed)| *collapsed),
+            _ => false,
+        };
+        desired_blocks.insert(
+            (start_offset.0, end_offset.0),
+            DesiredBlock {
+                marker,
+                source,
+                below,
+                collapsed,
+                embed,
+            },
+        );
+    }
+    let mut block_autoscroll = None;
+
+    let mounted_block_ids = applied_blocks
+        .iter()
+        .filter_map(|block| {
+            editor
+                .row_for_block(block.block_id, cx)
+                .is_some()
+                .then_some(block.block_id)
+        })
+        .collect::<HashSet<_>>();
+    let mut new_applied_blocks = Vec::new();
+    let mut block_ids_to_remove = HashSet::default();
+    for applied in applied_blocks {
+        let start = applied.range.start.to_offset(&snapshot).0;
+        let end = applied.range.end.to_offset(&snapshot).0;
+        let key = (start, end);
+        let keep = mounted_block_ids.contains(&applied.block_id)
+            && desired_blocks.get(&key).is_some_and(|desired| {
+                desired.source == applied.source
+                    && desired.below == applied.below
+                    && desired.collapsed == applied.collapsed
+                    && desired.marker.kind == applied.kind
+                    && desired.marker.height_estimate == applied.height_estimate
+                    && desired.marker.indent_columns == applied.indent_columns
+            });
+        if keep {
+            desired_blocks.remove(&key);
+            new_applied_blocks.push(applied);
+            continue;
+        }
+
+        block_ids_to_remove.insert(applied.block_id);
+    }
+
+    let mut blocks_to_insert = Vec::new();
+    let mut pending_applied = Vec::new();
+    // The language registry lets rendered code blocks (and code spans in
+    // tables/quotes) get syntax highlighting.
+    let language_registry = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .and_then(|buffer| buffer.read(cx).language_registry());
+    for DesiredBlock {
+        marker,
+        source,
+        below,
+        collapsed,
+        embed,
+    } in desired_blocks.into_values()
+    {
+        let render = match &marker.kind {
+            BlockRenderKind::Heading { .. } => {
+                debug_assert!(false, "headings use native line typography");
+                continue;
+            }
+            BlockRenderKind::Markdown => {
+                let key = (
+                    marker.range.start.to_offset(&snapshot).0,
+                    marker.range.end.to_offset(&snapshot).0,
+                );
+                if !markdown_blocks
+                    .get(&key)
+                    .is_some_and(|(cached_source, _, _)| cached_source == &source)
+                {
+                    let markdown = cx.new(|cx| {
+                        Markdown::new_with_options(
+                            SharedString::from(source.clone()),
+                            language_registry.clone(),
+                            None,
+                            markdown::MarkdownOptions {
+                                parse_html: true,
+                                render_mermaid_diagrams: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    });
+                    let subscription = cx.observe(&markdown, |editor, _, cx| {
+                        apply_decorations(editor, cx);
+                    });
+                    markdown_blocks.insert(key, (source.clone(), markdown, subscription));
+                }
+                let Some((_, markdown, _)) = markdown_blocks.get(&key) else {
+                    continue;
+                };
+                // A fresh Markdown entity is empty until its background parse
+                // finishes. Keep source visible rather than collapsing the block
+                // for a frame, and retain parsed content while editing its source.
+                if markdown.read(cx).is_parsing() {
+                    continue;
+                }
+                let markdown = markdown.clone();
+                render_markdown_block(
+                    markdown,
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    base_directory.clone(),
+                    marker.indent_columns,
+                    image_cache.clone(),
+                )
+            }
+            BlockRenderKind::Table(structure) => {
+                let cell_markdown = |text: &str, cx: &mut Context<Editor>| {
+                    cx.new(|cx| {
+                        // A pipe table row cannot contain a newline, so `<br>`
+                        // is the only way to break a line inside a cell; that
+                        // needs the HTML parser other blocks already enable.
+                        Markdown::new_with_options(
+                            SharedString::from(text.to_string()),
+                            language_registry.clone(),
+                            None,
+                            markdown::MarkdownOptions {
+                                parse_html: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    })
+                };
+                let cell_pieces = |range: &Range<Anchor>, cx: &mut Context<Editor>| {
+                    let start = range.start.to_offset(&snapshot);
+                    let end = range.end.to_offset(&snapshot);
+                    let text: String = snapshot.text_for_range(start..end).collect();
+                    let text = wikilink_display_text(text.trim()).into_owned();
+                    split_cell_math(&text)
+                        .into_iter()
+                        .map(|piece| match piece {
+                            CellSegment::Text {
+                                text,
+                                space_before,
+                                space_after,
+                            } => CellPiece::Text {
+                                markdown: cell_markdown(text, cx),
+                                space_before,
+                                space_after,
+                            },
+                            CellSegment::Math(source) => {
+                                let key = MathKey {
+                                    source: SharedString::from(source.to_string()),
+                                    style: MathStyle::Inline,
+                                };
+                                request_math_render(key.clone(), cx);
+                                CellPiece::Math(key)
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                };
+                let header_markdown: Vec<Vec<CellPiece>> = structure
+                    .header
+                    .iter()
+                    .map(|range| cell_pieces(range, cx))
+                    .collect();
+                let rows_markdown: Vec<Vec<Vec<CellPiece>>> = structure
+                    .rows
+                    .iter()
+                    .map(|row| row.iter().map(|range| cell_pieces(range, cx)).collect())
+                    .collect();
+                let column_weights = table_column_weights(structure, &snapshot);
+                render_table_block(
+                    structure.clone(),
+                    header_markdown,
+                    rows_markdown,
+                    column_weights,
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    marker.indent_columns,
+                )
+            }
+            BlockRenderKind::Image {
+                display_width,
+                destination,
+                alt,
+            } => {
+                let markdown = cx.new(|cx| {
+                    Markdown::new_with_options(
+                        SharedString::from(source.clone()),
+                        language_registry.clone(),
+                        None,
+                        markdown::MarkdownOptions {
+                            parse_html: true,
+                            render_mermaid_diagrams: true,
+                            ..Default::default()
+                        },
+                        cx,
+                    )
+                });
+                render_image_block(
+                    markdown,
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    base_directory.clone(),
+                    marker.indent_columns,
+                    *display_width,
+                    destination.clone(),
+                    SharedString::from(alt.clone()),
+                    image_cache.clone(),
+                )
+            }
+            BlockRenderKind::Rule => render_rule_block(
+                weak_editor.clone(),
+                marker.range.clone(),
+                marker.indent_columns,
+            ),
+            BlockRenderKind::References { items, note } => render_references_block(
+                weak_editor.clone(),
+                marker.range.clone(),
+                plain_heading_text(source.lines().next().unwrap_or_default()),
+                items.clone(),
+                note.clone(),
+                marker.indent_columns,
+            ),
+            BlockRenderKind::Frontmatter => {
+                render_frontmatter_block(weak_editor.clone(), marker.range.clone(), source.clone())
+            }
+            BlockRenderKind::Embed { target, section } => {
+                let state = embed.clone().unwrap_or(EmbedState::Missing);
+                let body = match &state {
+                    EmbedState::Ready { body, .. } => Some(cx.new(|cx| {
+                        Markdown::new_with_options(
+                            SharedString::from(wikilink_display_text(body).into_owned()),
+                            language_registry.clone(),
+                            None,
+                            markdown::MarkdownOptions {
+                                parse_html: true,
+                                render_mermaid_diagrams: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    })),
+                    EmbedState::Loading | EmbedState::Missing => None,
+                };
+                let label = match section {
+                    Some(section) => format!("{target} › {section}"),
+                    None => target.clone(),
+                };
+                render_embed_block(
+                    state,
+                    SharedString::from(label),
+                    body,
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    base_directory.clone(),
+                    marker.indent_columns,
+                    image_cache.clone(),
+                )
+            }
+            BlockRenderKind::Callout {
+                kind,
+                title,
+                collapse,
+            } => {
+                // Like a table cell, the body renders through the markdown
+                // crate, which has no wikilink syntax — so `[[Note]]` would
+                // otherwise reach the screen with its brackets on.
+                let body_source = callout_body(&source);
+                let body_source = wikilink_display_text(&body_source).into_owned();
+                let body = (!collapsed && !body_source.trim().is_empty()).then(|| {
+                    cx.new(|cx| {
+                        Markdown::new_with_options(
+                            SharedString::from(body_source),
+                            language_registry.clone(),
+                            None,
+                            markdown::MarkdownOptions {
+                                parse_html: true,
+                                render_mermaid_diagrams: true,
+                                ..Default::default()
+                            },
+                            cx,
+                        )
+                    })
+                });
+                render_callout_block(
+                    *kind,
+                    SharedString::from(title.clone()),
+                    body,
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    base_directory.clone(),
+                    marker.indent_columns,
+                    image_cache.clone(),
+                    collapse.is_some(),
+                    collapsed,
+                )
+            }
+            BlockRenderKind::Math { source } => {
+                request_math_render(
+                    MathKey {
+                        source: SharedString::from(source.clone()),
+                        style: MathStyle::Display,
+                    },
+                    cx,
+                );
+                render_math_block(
+                    weak_editor.clone(),
+                    marker.range.clone(),
+                    SharedString::from(source.clone()),
+                    below,
+                    marker.indent_columns,
+                )
+            }
+        };
+        let placement = if below {
+            BlockPlacement::Below(marker.range.end)
+        } else {
+            BlockPlacement::Replace(marker.range.start..=marker.range.end)
+        };
+        blocks_to_insert.push(BlockProperties {
+            placement,
+            height: Some(marker.height_estimate),
+            style: BlockStyle::Flex,
+            render,
+            priority: 0,
+        });
+        pending_applied.push((
+            marker.range.clone(),
+            source,
+            below,
+            collapsed,
+            marker.kind.clone(),
+            marker.height_estimate,
+            marker.indent_columns,
+        ));
+    }
+
+    if !block_ids_to_remove.is_empty() {
+        let autoscroll = if blocks_to_insert.is_empty() {
+            block_autoscroll.take()
+        } else {
+            None
+        };
+        editor.remove_blocks(block_ids_to_remove, autoscroll, cx);
+    }
+    if !blocks_to_insert.is_empty() {
+        let block_ids = editor.insert_blocks(blocks_to_insert, block_autoscroll.take(), cx);
+        for ((range, source, below, collapsed, kind, height_estimate, indent_columns), block_id) in
+            pending_applied.into_iter().zip(block_ids)
+        {
+            new_applied_blocks.push(AppliedBlock {
+                range,
+                source,
+                kind,
+                height_estimate,
+                indent_columns,
+                below,
+                collapsed,
+                block_id,
+            });
+        }
+    }
+
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.applied_blocks = new_applied_blocks;
+        addon.markdown_blocks = markdown_blocks;
+    }
+}
+
+/// Sessions saved before concealment folds were excluded from persistence
+/// restore them as plain `⋯` folds this addon does not own; remove any
+/// untagged fold that sits exactly on a marker range.
+fn remove_stale_restored_folds(editor: &mut Editor, cx: &mut Context<Editor>) {
+    let Some(markers) = editor
+        .addon::<LivePreviewAddon>()
+        .and_then(|addon| addon.markers.clone())
+    else {
+        return;
+    };
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let marker_offsets: HashSet<(usize, usize)> = markers
+        .inline
+        .iter()
+        .map(|marker| {
+            (
+                marker.range.start.to_offset(&snapshot).0,
+                marker.range.end.to_offset(&snapshot).0,
+            )
+        })
+        .collect();
+
+    let display_snapshot = editor.display_snapshot(cx);
+    let stale: Vec<Range<MultiBufferOffset>> = display_snapshot
+        .folds_in_range(MultiBufferOffset(0)..snapshot.len())
+        .filter(|fold| fold.placeholder.type_tag.is_none())
+        .filter_map(|fold| {
+            let start = fold.range.start.to_offset(&snapshot);
+            let end = fold.range.end.to_offset(&snapshot);
+            marker_offsets
+                .contains(&(start.0, end.0))
+                .then_some(start..end)
+        })
+        .collect();
+    if !stale.is_empty() {
+        editor.unfold_ranges(&stale, false, false, cx);
+    }
+}
+
+fn clear_decorations(
+    editor: &mut Editor,
+    applied_blocks: Vec<AppliedBlock>,
+    cx: &mut Context<Editor>,
+) {
+    editor.set_concealments(TypeId::of::<LivePreviewFoldTag>(), Vec::new(), cx);
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.concealed_math.clear();
+    }
+    apply_math_line_styles(editor, cx);
+    if !applied_blocks.is_empty() {
+        let block_ids = applied_blocks
+            .into_iter()
+            .map(|block| block.block_id)
+            .collect();
+        editor.remove_blocks(block_ids, None, cx);
+    }
+}
+
+/// Inclusive row ranges covered by the current selections.
+fn selection_row_ranges(editor: &Editor, snapshot: &MultiBufferSnapshot) -> Vec<Range<u32>> {
+    let mut rows = Vec::new();
+    for selection in editor.selections.disjoint_anchors().iter() {
+        let range = selection.range();
+        rows.push(range.start.to_point(snapshot).row..range.end.to_point(snapshot).row);
+    }
+    if let Some(pending) = editor.selections.pending_anchor() {
+        let range = pending.range();
+        rows.push(range.start.to_point(snapshot).row..range.end.to_point(snapshot).row);
+    }
+    rows
+}
+
+/// Selection ranges as offsets, including the pending mouse selection.
+fn selection_offset_ranges(editor: &Editor, snapshot: &MultiBufferSnapshot) -> Vec<Range<usize>> {
+    let mut offsets = Vec::new();
+    for selection in editor.selections.disjoint_anchors().iter() {
+        let range = selection.range();
+        offsets.push(range.start.to_offset(snapshot).0..range.end.to_offset(snapshot).0);
+    }
+    if let Some(pending) = editor.selections.pending_anchor() {
+        let range = pending.range();
+        offsets.push(range.start.to_offset(snapshot).0..range.end.to_offset(snapshot).0);
+    }
+    offsets
+}
+
+fn rows_intersect(selection_rows: &[Range<u32>], start_row: u32, end_row: u32) -> bool {
+    selection_rows
+        .iter()
+        .any(|rows| rows.start <= end_row && start_row <= rows.end)
+}
+
+/// Identity of a rendered formula. Two formulas that agree on every field
+/// rasterize identically, so the cache is shared across editors: the same
+/// equation in two panes is typeset once.
+/// Drops the cached transclusions a set of changed notes invalidates, and
+/// reports whether anything was dropped. Creating a note also drops every
+/// `Missing` entry: that creation may be exactly what an unresolved target
+/// was waiting for.
+fn evict_embeds(changed: &[PathBuf], note_created: bool, cx: &mut App) -> bool {
+    let cache = cx.default_global::<EmbedCache>();
+    let before = cache.entries.len();
+    cache.entries.retain(|_, entry| match entry {
+        EmbedEntry::Ready { absolute, .. } => !changed.contains(absolute),
+        EmbedEntry::Missing => !note_created,
+        EmbedEntry::Pending => true,
+    });
+    cache.entries.len() != before
+}
+
+/// Identifies one note transclusion's content. The embedding note's folder
+/// takes part in the key so that two vaults open at once, each with their own
+/// `Index.md`, do not share an entry.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct EmbedKey {
+    source_directory: Option<PathBuf>,
+    target: String,
+    section: Option<String>,
+}
+
+enum EmbedEntry {
+    Pending,
+    /// The target resolved and loaded. `absolute` is kept so a change on disk
+    /// can evict exactly this entry, and `path` so the card's header can open
+    /// the note it is showing.
+    Ready {
+        body: SharedString,
+        path: ProjectPath,
+        absolute: PathBuf,
+    },
+    /// No note in the project answers to this target.
+    Missing,
+}
+
+/// Loaded transclusions, shared across editors: the same note embedded from
+/// two places is read once. Entries are evicted when their file changes on
+/// disk, and every `Missing` entry is dropped whenever a markdown file is
+/// created, since that creation may be what the target was waiting for.
+#[derive(Default)]
+struct EmbedCache {
+    entries: HashMap<EmbedKey, EmbedEntry>,
+}
+
+impl gpui::Global for EmbedCache {}
+
+/// What `apply_decorations` found in the cache for one embed, carried to the
+/// render closure. Distinct from [`EmbedEntry`] because the widget needs an
+/// owned snapshot, not a borrow of the global.
+#[derive(Clone, PartialEq)]
+enum EmbedState {
+    Loading,
+    Missing,
+    Ready {
+        body: SharedString,
+        path: ProjectPath,
+    },
+}
+
+impl EmbedState {
+    /// A string standing in for the block's source in the reuse check. An
+    /// embed draws the note it points at, not the `![[..]]` that points
+    /// there, so a load finishing after the block was inserted has to change
+    /// this or the new content never reaches the screen.
+    fn reuse_key(&self) -> String {
+        match self {
+            Self::Loading => "\u{0}loading".to_string(),
+            Self::Missing => "\u{0}missing".to_string(),
+            Self::Ready { body, .. } => format!("\u{0}ready\n{body}"),
+        }
+    }
+}
+
+/// Reads an embed's state, starting the load if this is the first time it has
+/// been asked for. The editor is recomputed when the load lands, which is what
+/// gets the loaded body onto the screen.
+fn embed_state(
+    key: EmbedKey,
+    project: Option<Entity<Project>>,
+    editor: WeakEntity<Editor>,
+    cx: &mut App,
+) -> EmbedState {
+    if let Some(entry) = cx.default_global::<EmbedCache>().entries.get(&key) {
+        return match entry {
+            EmbedEntry::Pending => EmbedState::Loading,
+            EmbedEntry::Missing => EmbedState::Missing,
+            EmbedEntry::Ready { body, path, .. } => EmbedState::Ready {
+                body: body.clone(),
+                path: path.clone(),
+            },
+        };
+    }
+    // Without a project there is no vault to resolve a note name against.
+    let Some(project) = project else {
+        return EmbedState::Missing;
+    };
+
+    let resolved = resolve_embed_target(&project, key.source_directory.as_deref(), &key.target, cx);
+    let Some((path, absolute)) = resolved else {
+        cx.default_global::<EmbedCache>()
+            .entries
+            .insert(key, EmbedEntry::Missing);
+        return EmbedState::Missing;
+    };
+
+    cx.global_mut::<EmbedCache>()
+        .entries
+        .insert(key.clone(), EmbedEntry::Pending);
+    let fs = project.read(cx).fs().clone();
+    cx.spawn(async move |cx| {
+        let loaded = cx
+            .background_spawn({
+                let absolute = absolute.clone();
+                async move { fs.load(&absolute).await }
+            })
+            .await;
+        cx.update(|cx| {
+            let entry = match loaded {
+                Ok(text) => {
+                    let body = match &key.section {
+                        Some(section) => embed_section(&text, section),
+                        None => Some(text),
+                    };
+                    match body {
+                        Some(body) => EmbedEntry::Ready {
+                            body: SharedString::from(body),
+                            path,
+                            absolute,
+                        },
+                        // The note exists but has no such heading.
+                        None => EmbedEntry::Missing,
+                    }
+                }
+                Err(_) => EmbedEntry::Missing,
+            };
+            cx.global_mut::<EmbedCache>().entries.insert(key, entry);
+        });
+        editor
+            .update(cx, |editor, cx| recompute(editor, cx))
+            .log_err();
+    })
+    .detach();
+
+    EmbedState::Loading
+}
+
+/// Resolves a wikilink target to a note, the way Obsidian does: a target that
+/// spells out a path is matched against the whole relative path first, and a
+/// bare name is matched by file stem, preferring a note beside the embedding
+/// one and then the shallowest match. The `.md` extension is implied.
+fn resolve_embed_target(
+    project: &Entity<Project>,
+    source_directory: Option<&Path>,
+    target: &str,
+    cx: &App,
+) -> Option<(ProjectPath, PathBuf)> {
+    let target = target.trim().trim_end_matches(".md");
+    if target.is_empty() {
+        return None;
+    }
+    let wanted_path = target.to_lowercase();
+    let wanted_stem = Path::new(target).file_stem()?.to_str()?.to_lowercase();
+
+    let mut best: Option<(u32, usize, ProjectPath, PathBuf)> = None;
+    for worktree in project.read(cx).worktrees(cx) {
+        let worktree_id = worktree.read(cx).id();
+        let worktree = worktree.read(cx);
+        for entry in worktree.entries(false, 0) {
+            if !entry.is_file() || entry.path.extension() != Some("md") {
+                continue;
+            }
+            let relative = entry.path.as_unix_str().to_lowercase();
+            let stem = entry.path.file_stem().map(str::to_lowercase);
+            let rank = if relative.trim_end_matches(".md") == wanted_path {
+                0
+            } else if stem.as_deref() == Some(wanted_stem.as_str()) {
+                let beside = source_directory.is_some_and(|directory| {
+                    worktree.absolutize(&entry.path).parent() == Some(directory)
+                });
+                if beside { 1 } else { 2 }
+            } else {
+                continue;
+            };
+            let depth = entry.path.components().count();
+            let better = best.as_ref().is_none_or(|(best_rank, best_depth, ..)| {
+                (rank, depth) < (*best_rank, *best_depth)
+            });
+            if better {
+                let absolute = worktree.absolutize(&entry.path);
+                let path = ProjectPath {
+                    worktree_id,
+                    path: entry.path.clone(),
+                };
+                best = Some((rank, depth, path, absolute));
+            }
+        }
+    }
+    best.map(|(_, _, path, absolute)| (path, absolute))
+}
+
+/// A lowercase heading title as a GitHub-style anchor slug: punctuation
+/// dropped, whitespace and hyphens collapsed to single hyphens.
+fn heading_slug(title: &str) -> String {
+    let mut slug = String::with_capacity(title.len());
+    let mut pending_hyphen = false;
+    for character in title.chars() {
+        if character.is_alphanumeric() || character == '_' {
+            if pending_hyphen && !slug.is_empty() {
+                slug.push('-');
+            }
+            pending_hyphen = false;
+            slug.push(character);
+        } else if character.is_whitespace() || character == '-' {
+            pending_hyphen = true;
+        }
+    }
+    slug
+}
+
+/// An ATX heading's level and trimmed title, or `None` for any other line.
+fn heading_title(line: &str) -> Option<(usize, &str)> {
+    let hashes = line
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    line.get(hashes..)
+        .map(str::trim)
+        .map(|title| (hashes, title))
+}
+
+/// The slice of a note under one heading: from that heading to the next one at
+/// the same or a higher level. Returns `None` when the note has no such
+/// heading, which the card reports rather than silently embedding everything.
+fn embed_section(text: &str, section: &str) -> Option<String> {
+    let wanted = section.trim().to_lowercase();
+
+    let mut lines = text.lines().enumerate();
+    let (start, level) = lines.find_map(|(index, line)| {
+        let (level, title) = heading_title(line)?;
+        (title.to_lowercase() == wanted).then_some((index, level))
+    })?;
+
+    let end = text
+        .lines()
+        .enumerate()
+        .skip(start + 1)
+        .find(|(_, line)| heading_title(line).is_some_and(|(found, _)| found <= level))
+        .map_or(text.lines().count(), |(index, _)| index);
+    Some(
+        text.lines()
+            .take(end)
+            .skip(start)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct MathKey {
+    source: SharedString,
+    style: MathStyle,
+}
+
+enum MathEntry {
+    /// A background render is in flight; callers show the LaTeX source.
+    Pending,
+    Ready {
+        /// The formula as an SVG document, handed to `svg()` so that gpui
+        /// rasterizes it at the size it is actually drawn.
+        svg: Arc<[u8]>,
+        /// Fraction of the formula's height that sits below the text baseline.
+        baseline_fraction: f32,
+        /// Width of the formula in ems, used to size the element so it takes
+        /// exactly the space the glyphs occupy.
+        width_em: f32,
+        height_em: f32,
+    },
+    /// The formula does not parse. Callers keep showing the source, which is
+    /// also what the user needs to see in order to fix it, marked with the
+    /// renderer's message.
+    Failed { message: SharedString },
+}
+
+/// Rasterized formulas, keyed by content.
+///
+/// This is a global rather than per-editor state because rendering depends
+/// only on [`MathKey`], and because the placeholder closure that reads it
+/// receives just an `&mut App`.
+#[derive(Default)]
+struct MathCache {
+    entries: HashMap<MathKey, MathEntry>,
+}
+
+impl gpui::Global for MathCache {}
+
+/// Em size, in SVG user units, the formula's outlines are laid out in.
+///
+/// It sets only the coordinate scale of the vector document — `svg()` hands
+/// the outlines to gpui, which rasterizes them at whatever size the element is
+/// drawn — so any value works. It stays well above 1 so the emitted path
+/// coordinates keep their precision.
+const MATH_LAYOUT_EM: f32 = 64.0;
+
+/// Formulas render at this multiple of the buffer font size. The KaTeX fonts
+/// have a visibly smaller x-height than code fonts, so at 1:1 math looks
+/// shrunken next to prose; this is the same ratio KaTeX's own stylesheet
+/// applies (`.katex { font-size: 1.21em }`).
+const MATH_FONT_SCALE: f32 = 1.21;
+
+/// Ensures a render for `key` is in flight or complete, and returns whether
+/// the cache already holds a finished image.
+///
+/// Called from `apply_decorations` rather than from the placeholder closure:
+/// kicking off work during render would spawn a task on every frame.
+fn request_math_render(key: MathKey, cx: &mut App) {
+    // Read without `default_global`, which notifies `MathCache` observers on
+    // every call: a cache hit must not wake every editor's math line styles.
+    if cx
+        .try_global::<MathCache>()
+        .is_some_and(|cache| cache.entries.contains_key(&key))
+    {
+        return;
+    }
+    cx.default_global::<MathCache>()
+        .entries
+        .insert(key.clone(), MathEntry::Pending);
+
+    // `svg()` paints through an alpha mask and takes its color from the
+    // element's style, so the fill baked into the document never shows. That
+    // is why `MathKey` carries no color: one render serves every theme.
+    let theme = MathTheme {
+        text_color: gpui::black(),
+        font_size: MATH_LAYOUT_EM,
+    };
+    cx.spawn(async move |cx| {
+        let rendered = cx
+            .background_spawn({
+                let key = key.clone();
+                async move { math_render::render_to_svg(&key.source, key.style, &theme) }
+            })
+            .await;
+
+        cx.update(|cx| {
+            let entry = match rendered {
+                Ok(rendered) => MathEntry::Ready {
+                    baseline_fraction: rendered.baseline_fraction(),
+                    width_em: rendered.width_em,
+                    height_em: rendered.height_em + rendered.depth_em,
+                    svg: Arc::from(rendered.svg.into_bytes()),
+                },
+                // The context layer only says which stage failed; the parser's
+                // own message is the part that tells the user what to fix.
+                Err(error) => MathEntry::Failed {
+                    message: error.root_cause().to_string().into(),
+                },
+            };
+            cx.global_mut::<MathCache>().entries.insert(key, entry);
+            // The placeholder closures read the cache during render, so every
+            // open editor needs a repaint to pick the new image up.
+            cx.refresh_windows();
+        });
+    })
+    .detach();
+}
+
+/// Builds an inline placeholder at the font size of the editor painting it.
+/// The minimap shares the main editor's display map, and so its
+/// placeholders; a size read from settings draws minimap rows at full buffer
+/// size, overlapping each other. Both editors push their own size as the
+/// inherited text style while laying out and painting lines.
+fn at_editor_font_size(
+    render: impl 'static + FnOnce(Pixels, &mut App) -> AnyElement,
+) -> AtEditorFontSize {
+    AtEditorFontSize {
+        render: Some(Box::new(render)),
+    }
+}
+
+struct AtEditorFontSize {
+    render: Option<Box<dyn FnOnce(Pixels, &mut App) -> AnyElement>>,
+}
+
+impl gpui::Element for AtEditorFontSize {
+    type RequestLayoutState = Option<AnyElement>;
+    type PrepaintState = ();
+
+    fn id(&self) -> Option<ElementId> {
+        None
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (gpui::LayoutId, Self::RequestLayoutState) {
+        let font_size = window.text_style().font_size.to_pixels(window.rem_size());
+        let mut child = match self.render.take() {
+            Some(render) => render(font_size, cx),
+            None => Empty.into_any_element(),
+        };
+        let layout_id = child.request_layout(window, cx);
+        (layout_id, Some(child))
+    }
+
+    fn prepaint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(child) = child {
+            child.prepaint(window, cx);
+        }
+    }
+
+    fn paint(
+        &mut self,
+        _id: Option<&gpui::GlobalElementId>,
+        _inspector_id: Option<&gpui::InspectorElementId>,
+        _bounds: gpui::Bounds<Pixels>,
+        child: &mut Self::RequestLayoutState,
+        _prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        if let Some(child) = child {
+            child.paint(window, cx);
+        }
+    }
+}
+
+impl IntoElement for AtEditorFontSize {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
+}
+
+/// The LaTeX source shown in place of a formula that is still rendering or
+/// that failed to. A failure gets the editor's diagnostic styling and the
+/// renderer's message on hover; left as plain text, it reads as a formula
+/// that silently did not render, with no hint about why.
+fn math_source_fallback(
+    id: impl Into<ElementId>,
+    source: SharedString,
+    entry: Option<&MathEntry>,
+    font_size: Pixels,
+    cx: &App,
+) -> AnyElement {
+    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+    let text = div()
+        .font(theme_settings.buffer_font.clone())
+        .text_size(font_size)
+        .text_color(cx.theme().colors().editor_foreground)
+        .child(source);
+    match entry {
+        Some(MathEntry::Failed { message }) => text
+            .id(id)
+            .text_decoration_1()
+            .text_decoration_wavy()
+            .text_decoration_color(cx.theme().status().error)
+            .tooltip(ui::Tooltip::text(format!("Math error: {message}")))
+            .into_any_element(),
+        _ => text.into_any_element(),
+    }
+}
+
+/// Chunks carry their character positions in a `u128` bitmap, so the tab map
+/// assumes no chunk exceeds 128 bytes. A placeholder is emitted as a single
+/// chunk, so a label longer than that must be cut down (at a character
+/// boundary) before it becomes display text; the rendered element still
+/// shows the full label, and the measured width replaces this text's width
+/// after the first layout.
+fn placeholder_display_text(label: &SharedString) -> SharedString {
+    const MAX_CHUNK_BYTES: usize = 128;
+    if label.len() <= MAX_CHUNK_BYTES {
+        label.clone()
+    } else {
+        label[..label.floor_char_boundary(MAX_CHUNK_BYTES)]
+            .to_string()
+            .into()
+    }
+}
+
+/// Geometry of a rendered inline formula, shared by the placeholder that draws
+/// it and by the line style that makes its row tall enough to hold it.
+struct InlineMathLayout {
+    width: Pixels,
+    height: Pixels,
+    pad_top: Pixels,
+    pad_bottom: Pixels,
+}
+
+impl InlineMathLayout {
+    fn new(
+        baseline_fraction: f32,
+        width_em: f32,
+        height_em: f32,
+        font_size: Pixels,
+        cx: &App,
+    ) -> Self {
+        let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+        let line_height = font_size * theme_settings.line_height();
+        let text_system = cx.text_system();
+        let font_id = text_system.resolve_font(&theme_settings.buffer_font);
+        let ascent = text_system.ascent(font_id, font_size);
+        // `TextSystem::descent` is negative on macOS (a signed offset below
+        // the baseline), while the painted baseline's formula
+        // (`gpui::paint_line`) works in magnitudes — feeding the signed value
+        // into `baseline_offset` lands 2×descent too low, so compute the
+        // baseline from magnitudes directly.
+        let descent = text_system.descent(font_id, font_size).abs();
+        let text_baseline = (line_height - ascent - descent) / 2.0 + ascent;
+
+        let math_em = font_size * MATH_FONT_SCALE;
+        let height = math_em * height_em;
+        let width = math_em * width_em;
+        // The editor centers inline elements in the line (element top lands at
+        // `(line_height - height) / 2`), while text baselines sit at
+        // `baseline_offset`. Shift the image by the difference so the
+        // formula's baseline lands exactly on the text's. Text is centered in
+        // the line too, so the shift does not depend on the line's height and
+        // stays right on a row grown by `apply_math_line_styles`.
+        let formula_ascent = height * (1.0 - baseline_fraction);
+        let shift = text_baseline - (line_height - height) / 2.0 - formula_ascent;
+        // The centering offsets a padded element by half its padding, so
+        // doubling the needed shift as one-sided padding moves the image by
+        // exactly `shift` without relying on inset positioning.
+        let (pad_top, pad_bottom) = if shift >= gpui::px(0.) {
+            (shift * 2.0, gpui::px(0.))
+        } else {
+            (gpui::px(0.), shift * -2.0)
+        };
+        Self {
+            width,
+            height,
+            pad_top,
+            pad_bottom,
+        }
+    }
+
+    fn element_height(&self) -> Pixels {
+        self.height + self.pad_top + self.pad_bottom
+    }
+}
+
+fn fold_placeholder(marker: &InlineMarker, editor: WeakEntity<Editor>) -> FoldPlaceholder {
+    // Pure hides collapse to zero-width text; bullets and checkboxes keep the
+    // default placeholder text, whose visual is replaced by the rendered
+    // element at its measured width.
+    let collapsed_text = match &marker.kind {
+        InlineKind::Hide { .. } => Some(SharedString::new_static("")),
+        // The label stands in for the link in the display text, so soft
+        // wrapping and the cursor's column math see the width that is drawn.
+        InlineKind::Link { label, .. } => Some(placeholder_display_text(label)),
+        InlineKind::Citation { rendered } => Some(placeholder_display_text(rendered)),
+        InlineKind::Bullet
+        | InlineKind::Checkbox { .. }
+        | InlineKind::Footnote { .. }
+        | InlineKind::Math { .. } => None,
+    };
+    let render: Arc<dyn Send + Sync + Fn(_, _, &mut App) -> gpui::AnyElement> = match &marker.kind {
+        InlineKind::Hide { .. } => Arc::new(|_, _, _| Empty.into_any_element()),
+        InlineKind::Bullet => Arc::new(|_, _, _| {
+            at_editor_font_size(|font_size, cx| {
+                let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                div()
+                    .font(theme_settings.buffer_font.clone())
+                    .text_size(font_size)
+                    .text_color(cx.theme().colors().text)
+                    .child("•")
+                    .into_any_element()
+            })
+            .into_any_element()
+        }),
+        InlineKind::Checkbox {
+            checked,
+            marker_range,
+        } => {
+            let checked = *checked;
+            let marker_range = marker_range.clone();
+            Arc::new(move |fold_id, _, _| {
+                let editor = editor.clone();
+                let marker_range = marker_range.clone();
+                // Toggling is the checkbox's job, so it claims the press
+                // instead of letting the editor place the cursor on the
+                // marker: that would reveal the source, drop this element,
+                // and lose the click before it could fire.
+                div()
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                    .child(
+                        Checkbox::new(
+                            fold_id,
+                            if checked {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .on_click(move |_, _, cx| {
+                            toggle_task_marker(&editor, &marker_range, checked, cx);
+                        }),
+                    )
+                    .into_any_element()
+            })
+        }
+        InlineKind::Link { destination, label } => {
+            let destination = destination.clone();
+            let label = label.clone();
+            Arc::new(move |fold_id, _, _| {
+                let editor = editor.clone();
+                let destination = destination.clone();
+                let label = label.clone();
+                at_editor_font_size(move |font_size, cx| {
+                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                    div()
+                        .id(fold_id)
+                        .cursor_pointer()
+                        .font(theme_settings.buffer_font.clone())
+                        .text_size(font_size)
+                        .text_color(cx.theme().colors().text_accent)
+                        .hover(|style| style.underline())
+                        .child(label)
+                        // Opening the note is the link's job, so it claims the
+                        // press instead of letting the editor place the cursor
+                        // (which would reveal the source under the pointer).
+                        .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
+                        .on_click(move |_, window, cx| {
+                            open_link(&editor, &destination, window, cx);
+                        })
+                        .into_any_element()
+                })
+                .into_any_element()
+            })
+        }
+        InlineKind::Citation { rendered } => {
+            let rendered = rendered.clone();
+            Arc::new(move |_, _, _| {
+                let rendered = rendered.clone();
+                at_editor_font_size(move |font_size, cx| {
+                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                    let colors = cx.theme().colors();
+                    // The same chip the key carries in source, so a rendered
+                    // citation and a revealed one read as the same object.
+                    div()
+                        .font(theme_settings.buffer_font.clone())
+                        .text_size(font_size)
+                        .text_color(colors.text)
+                        .bg(colors.editor_document_highlight_read_background)
+                        .rounded_sm()
+                        .child(rendered)
+                        .into_any_element()
+                })
+                .into_any_element()
+            })
+        }
+        InlineKind::Footnote { label } => {
+            let label = label.clone();
+            Arc::new(move |_, _, _| {
+                let label = label.clone();
+                at_editor_font_size(move |font_size, cx| {
+                    let theme_settings = theme_settings::ThemeSettings::get_global(cx);
+                    // The editor centers an inline element in the line, so the
+                    // only way to raise a marker above the baseline is to pad it
+                    // asymmetrically: bottom padding of 2d shifts it up by d.
+                    let raise = font_size * 0.3;
+                    div()
+                        .pb(raise * 2.0)
+                        .font(theme_settings.buffer_font.clone())
+                        .text_size(font_size * 0.75)
+                        .text_color(cx.theme().colors().text_accent)
+                        .child(label)
+                        .into_any_element()
+                })
+                .into_any_element()
+            })
+        }
+        InlineKind::Math { source, style } => {
+            let source = source.clone();
+            let style = *style;
+            Arc::new(move |fold_id, _, _| {
+                let source = source.clone();
+                at_editor_font_size(move |font_size, cx| {
+                    let text_color = cx.theme().colors().editor_foreground;
+                    let key = MathKey {
+                        source: source.clone(),
+                        style,
+                    };
+                    match cx
+                        .try_global::<MathCache>()
+                        .and_then(|cache| cache.entries.get(&key))
+                    {
+                        Some(MathEntry::Ready {
+                            svg: document,
+                            baseline_fraction,
+                            width_em,
+                            height_em,
+                        }) => {
+                            let layout = InlineMathLayout::new(
+                                *baseline_fraction,
+                                *width_em,
+                                *height_em,
+                                font_size,
+                                cx,
+                            );
+                            div()
+                                .h(layout.element_height())
+                                .w(layout.width)
+                                .pt(layout.pad_top)
+                                .pb(layout.pad_bottom)
+                                .child(
+                                    svg()
+                                        .data(document)
+                                        .text_color(text_color)
+                                        .h(layout.height)
+                                        .w(layout.width),
+                                )
+                                .into_any_element()
+                        }
+                        // While a render is in flight — and permanently for a
+                        // formula that does not parse — fall back to the LaTeX
+                        // source, so the text never disappears out from under
+                        // the user.
+                        entry => math_source_fallback(fold_id, source, entry, font_size, cx),
+                    }
+                })
+                .into_any_element()
+            })
+        }
+    };
+    FoldPlaceholder {
+        render,
+        constrain_width: false,
+        merge_adjacent: false,
+        type_tag: Some(TypeId::of::<LivePreviewFoldTag>()),
+        collapsed_text,
+    }
+}
+
+fn marker_content_key(kind: &InlineKind) -> u64 {
+    match kind {
+        InlineKind::Hide { .. } => 0,
+        InlineKind::Bullet => 1,
+        InlineKind::Checkbox { checked, .. } => 2 + u64::from(*checked),
+        // The label is what the placeholder draws, so a `[^1]` edited into
+        // `[^2]` over an unchanged range must not reuse the old concealment.
+        InlineKind::Footnote { label } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            label.hash(&mut hasher);
+            4 + hasher.finish()
+        }
+        // A style change re-renders every group over unchanged ranges.
+        InlineKind::Citation { rendered } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            rendered.hash(&mut hasher);
+            6 + hasher.finish()
+        }
+        // Both take part: the label is what is drawn, the destination is
+        // what a click opens, and either can change over an unchanged range.
+        InlineKind::Link { destination, label } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            destination.hash(&mut hasher);
+            label.hash(&mut hasher);
+            4 + hasher.finish()
+        }
+        // Editing a formula changes what its placeholder must draw even though
+        // its range is unchanged, so the source has to take part in the key or
+        // the concealment is reused with a stale image.
+        InlineKind::Math { source, style } => {
+            use std::hash::{Hash as _, Hasher as _};
+            let mut hasher = collections::FxHasher::default();
+            source.hash(&mut hasher);
+            style.hash(&mut hasher);
+            // Keep clear of the discriminants above. Footnotes hash into the
+            // same space; the differing seed text makes a collision no more
+            // likely than between two formulas.
+            4 + hasher.finish()
+        }
+    }
+}
+
+fn toggle_task_marker(
+    editor: &WeakEntity<Editor>,
+    marker_range: &Range<Anchor>,
+    currently_checked: bool,
+    cx: &mut App,
+) {
+    editor
+        .update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let range =
+                marker_range.start.to_offset(&snapshot)..marker_range.end.to_offset(&snapshot);
+            let existing: String = snapshot.text_for_range(range.clone()).collect();
+            let expected = if currently_checked { "[x]" } else { "[ ]" };
+            if existing.eq_ignore_ascii_case(expected) {
+                let replacement = if currently_checked { "[ ]" } else { "[x]" };
+                editor.edit([(range, replacement)], cx);
+            }
+        })
+        .log_err();
+}
+
+fn buffer_base_directory(editor: &Editor, cx: &App) -> Option<PathBuf> {
+    let buffer = editor.buffer().read(cx).as_singleton()?;
+    let file = buffer.read(cx).file()?;
+    let local = file.as_local()?;
+    let mut path = local.abs_path(cx);
+    path.pop();
+    Some(path)
+}
+
+/// Click-to-reveal for a block widget: puts the cursor at the block's first
+/// offset, which makes `recompute` drop the widget and show the raw markdown.
+///
+/// Clicks that a child button already claimed are skipped. `ButtonLike` calls
+/// `window.prevent_default()` on left mouse down for exactly this reason, and
+/// the editor's own `mouse_left_down` honors it — without the same check here,
+/// pressing a rendered code block's copy button tore the widget down before
+/// the mouse up could complete the click, so it revealed source instead of
+/// copying.
+fn reveal_source_on_mouse_down(
+    editor: WeakEntity<Editor>,
+    start: Anchor,
+) -> impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static {
+    move |_, window, cx| {
+        if window.default_prevented() {
+            return;
+        }
+        editor
+            .update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = start.to_offset(&snapshot);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([offset..offset]);
+                });
+            })
+            .log_err();
+    }
+}
+
+fn render_markdown_block(
+    markdown: Entity<Markdown>,
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    base_directory: Option<PathBuf>,
+    indent_columns: u32,
+    image_cache: Entity<RetainAllImageCache>,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let mut style = block_markdown_style(block_cx.window, block_cx.app);
+        let editor = editor.clone();
+        let start = range.start;
+        let range = range.clone();
+        let base_directory = base_directory.clone();
+        let image_cache = image_cache.clone();
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        // The scroll range can exceed the pane width because of other source
+        // lines. Rendered prose must wrap inside the visible editor instead.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width);
+        let max_width = block_cx
+            .max_width
+            .min((visible_width - block_cx.margins.right).max(gpui::px(1.)));
+        let source_click_editor = editor.clone();
+        let is_quote = markdown
+            .read(block_cx.app)
+            .source()
+            .trim_start()
+            .starts_with('>');
+        if is_quote {
+            // Match the editor's rounded line height without forcing paragraph
+            // gaps onto whole rows.
+            style.base_text_style.line_height = block_cx.line_height.into();
+            style.container_style.text.line_height = Some(block_cx.line_height.into());
+            style.paragraph_line_height = block_cx.line_height.into();
+            if let Some(spacing) =
+                MarkdownLivePreviewSettings::get_global(block_cx.app).block_quote_paragraph_spacing
+            {
+                style.paragraph_spacing = gpui::px(spacing);
+            }
+        }
+        div()
+            .debug_selector(|| "mdlp-prose-block".into())
+            // The editor rounds block heights up to whole rows. Share that
+            // unused space above and below a quote instead of leaving it below.
+            .when(is_quote, |block| {
+                block.flex().flex_col().justify_center().h_full()
+            })
+            .pl(gutter_width)
+            .w(max_width)
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor, start),
+            )
+            .child(
+                MarkdownElement::new(markdown.clone(), style)
+                    .image_resolver(move |destination, _cx| {
+                        resolve_image_source(destination, base_directory.as_deref(), &image_cache)
+                    })
+                    // A click on the widget's own text never reaches the
+                    // wrapper's mouse-down handler: `MarkdownElement` claims
+                    // it for text selection and prevents default, which the
+                    // wrapper honors (it must, for code block copy buttons).
+                    // Claiming the click here instead reveals the source with
+                    // the cursor at the clicked character, Obsidian-style.
+                    .on_source_click(move |source_index, _click_count, window, cx| {
+                        // A prevented default at this point is a button
+                        // consuming the click (e.g. a code block's copy
+                        // button); revealing would tear the button down
+                        // before its mouse-up completes the click.
+                        if window.default_prevented() {
+                            return false;
+                        }
+                        reveal_at_source_index(
+                            &source_click_editor,
+                            &range,
+                            source_index,
+                            window,
+                            cx,
+                        )
+                    }),
+            )
+            .into_any_element()
+    })
+}
+
+/// Reveals a widget's source with the cursor at `source_index`, an index into
+/// the markdown string the widget renders, which starts at the block's start
+/// offset. Returns false when the editor is gone so the widget can fall back
+/// to its own text selection.
+fn reveal_at_source_index(
+    editor: &WeakEntity<Editor>,
+    range: &Range<Anchor>,
+    source_index: usize,
+    window: &mut Window,
+    cx: &mut App,
+) -> bool {
+    editor
+        .update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start = range.start.to_offset(&snapshot).0;
+            let end = range.end.to_offset(&snapshot).0;
+            // The widget's mini-document can carry appended reference
+            // definitions past the block's own text; clamp to the block.
+            let offset = snapshot.clip_offset(
+                MultiBufferOffset((start + source_index).min(end)),
+                text::Bias::Left,
+            );
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_ranges([offset..offset]);
+            });
+        })
+        .is_ok()
+}
+
+fn atx_heading_marker_offsets(source: &str, level: u8) -> (usize, usize) {
+    let trimmed = source.trim_start_matches([' ', '\t']);
+    let indent = source.len().saturating_sub(trimmed.len());
+    let marker_end = (indent + level as usize).min(source.len());
+    let after_marker = source.get(marker_end..).unwrap_or("");
+    let content = after_marker.trim_start_matches([' ', '\t']);
+    let content_start = source.len().saturating_sub(content.len());
+    (marker_end, content_start)
+}
+/// next run of exactly N backticks closes it. An unclosed run opens nothing.
+fn code_span_ranges(text: &str) -> Vec<Range<usize>> {
+    let bytes = text.as_bytes();
+    let mut spans = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'`' {
+            index += 1;
+            continue;
+        }
+        let open_start = index;
+        while index < bytes.len() && bytes[index] == b'`' {
+            index += 1;
+        }
+        let run = index - open_start;
+        let mut search = index;
+        while let Some(next) = text[search..].find('`') {
+            let close_start = search + next;
+            let mut close_end = close_start;
+            while close_end < bytes.len() && bytes[close_end] == b'`' {
+                close_end += 1;
+            }
+            if close_end - close_start == run {
+                spans.push(open_start..close_end);
+                index = close_end;
+                break;
+            }
+            search = close_end;
+        }
+    }
+    spans
+}
+
+/// Wikilinks are concealed on the buffer text by `scan_wikilinks`, but a table
+/// cell is a replace block rendered from extracted text by the markdown crate,
+/// which has no wikilink support — so the raw `[[..]]` would reach the screen.
+/// Rewrite them to the same display text concealment shows. Embeds (`![[..]]`)
+/// and code spans are left raw, matching `scan_wikilinks`.
+fn wikilink_display_text(text: &str) -> Cow<'_, str> {
+    if !text.contains("[[") {
+        return Cow::Borrowed(text);
+    }
+    let code_spans = code_span_ranges(text);
+    let mut out = String::new();
+    let mut copied = 0;
+    let mut search_from = 0;
+    while let Some(open_offset) = text[search_from..].find("[[") {
+        let open = search_from + open_offset;
+        let Some(close_offset) = text[open + 2..].find("]]") else {
+            break;
+        };
+        let close = open + 2 + close_offset;
+        search_from = close + 2;
+
+        let inner = &text[open + 2..close];
+        if inner.is_empty() || inner.contains('\n') || inner.contains("[[") {
+            continue;
+        }
+        if text[..open].ends_with('!') {
+            continue;
+        }
+        if code_spans
+            .iter()
+            .any(|span| span.start < close + 2 && open < span.end)
+        {
+            continue;
+        }
+
+        // `[[target|alias]]` shows the alias; everything else shows the inner
+        // text verbatim, so `[[Note#heading]]` keeps its heading.
+        let display = match inner.find('|') {
+            Some(pipe) => &inner[pipe + 1..],
+            None => inner,
+        };
+        out.push_str(&text[copied..open]);
+        out.push_str(display);
+        copied = close + 2;
+    }
+    if copied == 0 {
+        return Cow::Borrowed(text);
+    }
+    out.push_str(&text[copied..]);
+    Cow::Owned(out)
+}
+
+fn table_column_weights(structure: &TableStructure, snapshot: &MultiBufferSnapshot) -> Vec<f32> {
+    let columns = structure.header.len().max(
+        structure
+            .rows
+            .iter()
+            .map(|row| row.len())
+            .max()
+            .unwrap_or(0),
+    );
+    let mut weights = vec![3.0_f32; columns];
+    let mut measure = |cells: &[Range<Anchor>]| {
+        for (index, range) in cells.iter().enumerate() {
+            let start = range.start.to_offset(snapshot);
+            let end = range.end.to_offset(snapshot);
+            let length: usize = snapshot
+                .text_for_range(start..end)
+                .map(|chunk| chunk.trim().chars().count())
+                .sum();
+            if let Some(weight) = weights.get_mut(index) {
+                *weight = weight.max((length as f32).clamp(3., 60.));
+            }
+        }
+    };
+    measure(&structure.header);
+    for row in &structure.rows {
+        measure(row);
+    }
+    weights
+}
+
+/// Starts editing a table cell: mounts a focused single-line editor over it,
+/// committing on enter/tab/blur and cancelling on escape.
+fn start_cell_edit(
+    weak_editor: WeakEntity<Editor>,
+    cell_range: Range<Anchor>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(main_editor) = weak_editor.upgrade() else {
+        return;
+    };
+    // Commit any cell already being edited.
+    main_editor.update(cx, |editor, cx| commit_active_cell(editor, cx));
+
+    // Re-resolve the clicked cell from live text: the widget's captured
+    // ranges go stale whenever an edit lands before the widget refreshes.
+    let snapshot = main_editor.read(cx).buffer().read(cx).snapshot(cx);
+    let stale_start = cell_range.start.to_offset(&snapshot);
+    let Some((_, structure)) = parse_table_at(&snapshot, stale_start) else {
+        return;
+    };
+    let all_cells = structure.cells_in_order();
+    let Some(cell_range) = all_cells
+        .iter()
+        .find(|candidate| {
+            let start = candidate.start.to_offset(&snapshot);
+            let end = candidate.end.to_offset(&snapshot);
+            start <= stale_start && stale_start <= end
+        })
+        .cloned()
+    else {
+        return;
+    };
+    let start = cell_range.start.to_offset(&snapshot);
+    let end = cell_range.end.to_offset(&snapshot);
+    let text: String = snapshot.text_for_range(start..end).collect();
+
+    let cell_editor = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_text(text.trim(), window, cx);
+        editor
+    });
+
+    let mut subscriptions = Vec::new();
+    main_editor.update(cx, |_, cx| {
+        subscriptions.push(cx.subscribe(
+            &cell_editor,
+            |editor, blurred, event: &EditorEvent, cx| {
+                // Only commit if this editor is still the active cell: when
+                // Tab moves editing to the next cell, the old editor's blur
+                // must not commit (and clear) the new one.
+                if matches!(event, EditorEvent::Blurred)
+                    && editor
+                        .addon::<LivePreviewAddon>()
+                        .and_then(|addon| addon.active_cell.as_ref())
+                        .is_some_and(|cell| cell.editor == blurred)
+                {
+                    commit_active_cell(editor, cx);
+                }
+            },
+        ));
+    });
+
+    let next_cell = all_cells
+        .iter()
+        .position(|candidate| {
+            candidate.start.to_offset(&snapshot) == start
+                && candidate.end.to_offset(&snapshot) == end
+        })
+        .and_then(|index| all_cells.get(index + 1).cloned());
+
+    cell_editor.update(cx, |editor, _| {
+        let weak = weak_editor.clone();
+        subscriptions.push(editor.register_action::<editor::actions::Newline>(
+            move |_, window, cx| {
+                weak.update(cx, |editor, cx| {
+                    commit_active_cell(editor, cx);
+                    refocus_main_editor(editor, window, cx);
+                })
+                .log_err();
+            },
+        ));
+        let weak = weak_editor.clone();
+        subscriptions.push(
+            editor.register_action::<editor::actions::Tab>(move |_, window, cx| {
+                let next = next_cell.clone();
+                weak.update(cx, |editor, cx| {
+                    commit_active_cell(editor, cx);
+                })
+                .log_err();
+                match next {
+                    Some(next) => start_cell_edit(weak.clone(), next, window, cx),
+                    None => {
+                        weak.update(cx, |editor, cx| refocus_main_editor(editor, window, cx))
+                            .log_err();
+                    }
+                }
+            }),
+        );
+        let weak = weak_editor.clone();
+        subscriptions.push(editor.register_action::<editor::actions::Cancel>(
+            move |_, window, cx| {
+                weak.update(cx, |editor, cx| {
+                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        addon.active_cell = None;
+                    }
+                    refocus_main_editor(editor, window, cx);
+                    cx.notify();
+                })
+                .log_err();
+            },
+        ));
+    });
+
+    let focus_handle = cell_editor.read(cx).focus_handle(cx);
+    window.focus(&focus_handle, cx);
+
+    main_editor.update(cx, |editor, cx| {
+        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+            addon.selected_table_unit = None;
+            addon.active_cell = Some(ActiveTableCell {
+                cell_range,
+                editor: cell_editor,
+                _subscriptions: subscriptions,
+            });
+        }
+        cx.notify();
+    });
+}
+
+fn refocus_main_editor(editor: &Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    let focus_handle = editor.focus_handle(cx);
+    window.focus(&focus_handle, cx);
+}
+
+/// Records the insertion boundary the pointer indicates, notifying only on
+/// change.
+fn set_drop_boundary(
+    weak_editor: &WeakEntity<Editor>,
+    table_range: &Range<Anchor>,
+    boundary: TableBoundary,
+    cx: &mut App,
+) {
+    weak_editor
+        .update(cx, |editor, cx| {
+            if let Some(addon) = editor.addon_mut::<LivePreviewAddon>()
+                && addon.drop_boundary.as_ref().map(|(_, current)| *current) != Some(boundary)
+            {
+                addon.drop_boundary = Some((table_range.clone(), boundary));
+                cx.notify();
+            }
+        })
+        .log_err();
+}
+
+/// Marks the unit a handle drag just started from; the widget outlines it
+/// in place while the drag is active.
+fn record_drag_source(
+    weak_editor: &WeakEntity<Editor>,
+    table_range: &Range<Anchor>,
+    unit: TableUnit,
+    cx: &mut App,
+) {
+    weak_editor
+        .update(cx, |editor, cx| {
+            if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                addon.selected_table_unit = None;
+                addon.drag_source = Some(TableUnitSelection {
+                    table_range: table_range.clone(),
+                    unit,
+                });
+                addon.drop_boundary = None;
+            }
+            cx.notify();
+        })
+        .log_err();
+}
+
+/// Deletes a single character in buffer space when the deletion borders a
+/// rendered block widget, bypassing the editor's display-map-based deletion.
+///
+/// The editor's own backspace/delete compute their range with
+/// `movement::left`/`right` on the display map, and those clip *through*
+/// `BlockPlacement::Replace` rows: forward-deleting the empty line above a
+/// rendered heading swallowed the heading's entire replaced range along with
+/// the newline. Returns false when no rendered block borders the deletion,
+/// so the caller can propagate to the editor's normal handling (which is
+/// also what keeps indent-aware backspace and autoclose pairs working
+/// everywhere else).
+fn delete_adjacent_to_block(weak_editor: &WeakEntity<Editor>, forward: bool, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let decorated_ranges: Vec<Range<usize>> = editor
+            .addon::<LivePreviewAddon>()
+            .map(|addon| {
+                let mut ranges = addon
+                    .applied_blocks
+                    .iter()
+                    .map(|block| {
+                        block.range.start.to_offset(&snapshot).0
+                            ..block.range.end.to_offset(&snapshot).0
+                    })
+                    .collect::<Vec<_>>();
+                if let Some(markers) = &addon.markers {
+                    ranges.extend(markers.blocks.iter().filter_map(|marker| {
+                        matches!(marker.kind, BlockRenderKind::Heading { .. }).then(|| {
+                            marker.range.start.to_offset(&snapshot).0
+                                ..marker.range.end.to_offset(&snapshot).0
+                        })
+                    }));
+                }
+                ranges
+            })
+            .unwrap_or_default();
+        if decorated_ranges.is_empty() {
+            return false;
+        }
+        let selections = selection_offset_ranges(editor, &snapshot);
+        if selections.iter().any(|range| range.start != range.end) {
+            return false;
+        }
+        let deletions: Vec<Range<usize>> = selections
+            .iter()
+            .map(|caret| {
+                let head = caret.start;
+                if forward {
+                    head..snapshot
+                        .clip_offset(MultiBufferOffset(head + 1), text::Bias::Right)
+                        .0
+                } else {
+                    snapshot
+                        .clip_offset(MultiBufferOffset(head.saturating_sub(1)), text::Bias::Left)
+                        .0..head
+                }
+            })
+            .filter(|deletion| deletion.start < deletion.end)
+            .collect();
+        let borders_decoration = deletions.iter().any(|deletion| {
+            decorated_ranges
+                .iter()
+                .any(|range| deletion.start <= range.end && range.start <= deletion.end)
+        });
+        if !borders_decoration || deletions.is_empty() {
+            return false;
+        }
+        editor.buffer().update(cx, |multibuffer, cx| {
+            multibuffer.edit(
+                deletions.into_iter().map(|deletion| {
+                    (
+                        MultiBufferOffset(deletion.start)..MultiBufferOffset(deletion.end),
+                        "",
+                    )
+                }),
+                None,
+                cx,
+            );
+        });
+        true
+    })
+}
+
+/// Deletes a whole bracketed citation group when a single caret backspaces
+/// at its end or forward-deletes at its start. A citation arrives as one
+/// token through completion, so it should leave the same way; editing a key
+/// letter by letter stays available by moving the cursor inside the group.
+/// Returns false when no caret borders a group so the caller can propagate.
+fn delete_adjacent_citation(weak_editor: &WeakEntity<Editor>, forward: bool, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    editor.update(cx, |editor, cx| {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let groups: Vec<Range<usize>> = editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.markers.as_ref())
+            .map(|markers| {
+                markers
+                    .citation_groups
+                    .iter()
+                    .map(|range| {
+                        range.start.to_offset(&snapshot).0..range.end.to_offset(&snapshot).0
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if groups.is_empty() {
+            return false;
+        }
+        let selections = selection_offset_ranges(editor, &snapshot);
+        let [caret] = selections.as_slice() else {
+            return false;
+        };
+        if caret.start != caret.end {
+            return false;
+        }
+        let head = caret.start;
+        let Some(group) = groups.iter().find(|group| {
+            if forward {
+                group.start == head
+            } else {
+                group.end == head
+            }
+        }) else {
+            return false;
+        };
+        let deletion = MultiBufferOffset(group.start)..MultiBufferOffset(group.end);
+        editor.buffer().update(cx, |multibuffer, cx| {
+            multibuffer.edit([(deletion, "")], None, cx);
+        });
+        true
+    })
+}
+
+/// Deletes the row/column currently selected via its handle, if any.
+/// Returns false when there is no selection so the caller can propagate.
+fn delete_selected_table_unit(weak_editor: &WeakEntity<Editor>, cx: &mut App) -> bool {
+    let Some(editor) = weak_editor.upgrade() else {
+        return false;
+    };
+    let Some(selection) = editor.read_with(cx, |editor, _| {
+        editor
+            .addon::<LivePreviewAddon>()
+            .and_then(|addon| addon.selected_table_unit.as_ref())
+            .map(|selection| (selection.table_range.clone(), selection.unit))
+    }) else {
+        return false;
+    };
+    let (table_range, unit) = selection;
+    editor.update(cx, |editor, cx| {
+        let change = match unit {
+            TableUnit::Row(row) => TableStructuralChange::DeleteRow(row),
+            TableUnit::Column(column) => TableStructuralChange::DeleteColumn(column),
+        };
+        apply_table_structural_change(editor, &table_range, change, cx);
+        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+            addon.selected_table_unit = None;
+        }
+        cx.notify();
+    });
+    true
+}
+
+/// Writes the active cell editor's text back into the table source.
+fn commit_active_cell(editor: &mut Editor, cx: &mut Context<Editor>) {
+    let Some(active) = editor
+        .addon_mut::<LivePreviewAddon>()
+        .and_then(|addon| addon.active_cell.take())
+    else {
+        return;
+    };
+    let text = active
+        .editor
+        .read(cx)
+        .text(cx)
+        .replace('\n', " ")
+        .replace('|', "\\|");
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let start = active.cell_range.start.to_offset(&snapshot);
+    let end = active.cell_range.end.to_offset(&snapshot);
+    if start > end {
+        return;
+    }
+    let current: String = snapshot.text_for_range(start..end).collect();
+    if current.trim() == text.trim() {
+        cx.notify();
+        return;
+    }
+    let replacement = format!(" {} ", text.trim());
+    editor.buffer().update(cx, |multibuffer, cx| {
+        multibuffer.edit([(start..end, replacement)], None, cx);
+    });
+    cx.notify();
+}
+
+/// Splits one table row line into cell ranges at unescaped pipes (the GFM
+/// rule). Each range spans the full text between two pipes, padding included,
+/// so a cell edit can rewrite it in place. Segments outside the outer pipes
+/// are kept only when non-blank (tables without outer pipes).
+fn split_table_row_text(
+    text: &str,
+    base_offset: usize,
+    snapshot: &MultiBufferSnapshot,
+) -> Vec<Range<Anchor>> {
+    let mut boundaries = Vec::new();
+    let mut escaped = false;
+    for (offset, byte) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if byte == b'\\' {
+            escaped = true;
+        } else if byte == b'|' {
+            boundaries.push(base_offset + offset);
+        }
+    }
+    let mut segments = Vec::new();
+    let mut segment_start = base_offset;
+    for boundary in boundaries {
+        segments.push(segment_start..boundary);
+        segment_start = boundary + 1;
+    }
+    segments.push(segment_start..base_offset + text.len());
+    let is_blank = |range: &Range<usize>| {
+        text.get(range.start - base_offset..range.end - base_offset)
+            .is_none_or(|segment| segment.trim().is_empty())
+    };
+    if segments.len() > 1 && is_blank(&segments[0]) {
+        segments.remove(0);
+    }
+    if segments.len() > 1 && segments.last().is_some_and(is_blank) {
+        segments.pop();
+    }
+    segments
+        .into_iter()
+        .map(|range| {
+            // Outward bias: the range must survive its own rewrite when a
+            // cell edit commits.
+            snapshot.anchor_before(MultiBufferOffset(range.start))
+                ..snapshot.anchor_after(MultiBufferOffset(range.end))
+        })
+        .collect()
+}
+
+fn is_delimiter_row(line: &str) -> bool {
+    let mut cells = line
+        .trim()
+        .trim_start_matches('|')
+        .trim_end_matches('|')
+        .split('|')
+        .peekable();
+    cells.peek().is_some()
+        && cells.all(|cell| {
+            let cell = cell.trim();
+            let dashes = cell.trim_start_matches(':').trim_end_matches(':');
+            !dashes.is_empty() && dashes.bytes().all(|byte| byte == b'-')
+        })
+}
+
+/// Parses the pipe table containing `near` straight from buffer text. Widget
+/// click handlers must use this instead of the syntax tree: reparses are
+/// asynchronous, so right after an edit the tree describes text that no
+/// longer exists.
+fn parse_table_at(
+    snapshot: &MultiBufferSnapshot,
+    near: MultiBufferOffset,
+) -> Option<(Range<MultiBufferOffset>, TableStructure)> {
+    let near = near.min(snapshot.len());
+    let click_row = near.to_point(snapshot).row;
+    let max_row = snapshot.max_point().row;
+    let line_at = |row: u32| -> (String, MultiBufferOffset, MultiBufferOffset) {
+        let start = Point::new(row, 0).to_offset(snapshot);
+        let end = Point::new(row, snapshot.line_len(MultiBufferRow(row))).to_offset(snapshot);
+        (snapshot.text_for_range(start..end).collect(), start, end)
+    };
+    let is_table_line = |row: u32| -> bool {
+        let (text, ..) = line_at(row);
+        !text.trim().is_empty() && text.contains('|')
+    };
+
+    if !is_table_line(click_row) {
+        return None;
+    }
+    let mut first_row = click_row;
+    while first_row > 0 && is_table_line(first_row - 1) {
+        first_row -= 1;
+    }
+    let mut last_row = click_row;
+    while last_row < max_row && is_table_line(last_row + 1) {
+        last_row += 1;
+    }
+    // The block may over-extend into adjacent prose that happens to contain a
+    // pipe; anchor on the delimiter row and take the line above as header.
+    let delimiter_row =
+        (first_row + 1..=last_row).find(|row| is_delimiter_row(&line_at(*row).0))?;
+    let header_row = delimiter_row - 1;
+
+    let split_row = |row: u32| -> Vec<Range<Anchor>> {
+        let (text, start, _) = line_at(row);
+        split_table_row_text(&text, start.0, snapshot)
+    };
+    let header = split_row(header_row);
+    if header.is_empty() {
+        return None;
+    }
+    let alignments = split_row(delimiter_row)
+        .into_iter()
+        .map(|range| {
+            let start = range.start.to_offset(snapshot);
+            let end = range.end.to_offset(snapshot);
+            let text: String = snapshot.text_for_range(start..end).collect();
+            let text = text.trim();
+            match (text.starts_with(':'), text.ends_with(':')) {
+                (true, true) => CellAlignment::Center,
+                (true, false) => CellAlignment::Left,
+                (false, true) => CellAlignment::Right,
+                (false, false) => CellAlignment::None,
+            }
+        })
+        .collect();
+    let mut rows: Vec<Vec<Range<Anchor>>> = (delimiter_row + 1..=last_row).map(split_row).collect();
+
+    let mut header = header;
+    let columns = header
+        .len()
+        .max(rows.iter().map(|row| row.len()).max().unwrap_or(0));
+    let sentinel = || Anchor::Min..Anchor::Min;
+    header.resize_with(columns, sentinel);
+    for row in &mut rows {
+        row.resize_with(columns, sentinel);
+    }
+
+    let table_start = Point::new(header_row, 0).to_offset(snapshot);
+    let table_end =
+        Point::new(last_row, snapshot.line_len(MultiBufferRow(last_row))).to_offset(snapshot);
+    Some((
+        table_start..table_end,
+        TableStructure {
+            header,
+            alignments,
+            rows,
+        },
+    ))
+}
+
+#[derive(Clone, Copy)]
+enum TableStructuralChange {
+    AddColumn,
+    AddRow,
+    MoveRow {
+        from: usize,
+        to: usize,
+    },
+    MoveColumn {
+        from: usize,
+        to: usize,
+    },
+    DeleteRow(usize),
+    DeleteColumn(usize),
+    /// Rewrites the table without structural additions, materializing any
+    /// cells the source omitted.
+    Normalize,
+}
+
+/// Finds the table currently at `table_range` by parsing live buffer text.
+fn fresh_table_at(
+    editor: &Editor,
+    table_range: &Range<Anchor>,
+    cx: &App,
+) -> Option<(Range<MultiBufferOffset>, TableStructure)> {
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    parse_table_at(&snapshot, table_range.start.to_offset(&snapshot))
+        .or_else(|| parse_table_at(&snapshot, table_range.end.to_offset(&snapshot)))
+}
+
+/// Rebuilds the whole table source with an added row or column, normalized.
+/// Resolves the table fresh at call time rather than trusting the caller's
+/// captured structure.
+fn apply_table_structural_change(
+    editor: &mut Editor,
+    stale_table_range: &Range<Anchor>,
+    change: TableStructuralChange,
+    cx: &mut Context<Editor>,
+) {
+    commit_active_cell(editor, cx);
+    let Some((table_offsets, structure)) = fresh_table_at(editor, stale_table_range, cx) else {
+        log::warn!(
+            "markdown live preview: no table found at click position; ignoring structural change"
+        );
+        return;
+    };
+    let structure = &structure;
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let cell_text = |range: &Range<Anchor>| -> String {
+        let start = range.start.to_offset(&snapshot);
+        let end = range.end.to_offset(&snapshot);
+        let text: String = snapshot.text_for_range(start..end).collect();
+        text.trim().to_string()
+    };
+
+    let mut header: Vec<String> = structure.header.iter().map(&cell_text).collect();
+    let mut alignments = structure.alignments.clone();
+    let mut rows: Vec<Vec<String>> = structure
+        .rows
+        .iter()
+        .map(|row| row.iter().map(&cell_text).collect())
+        .collect();
+
+    match change {
+        TableStructuralChange::AddColumn => {
+            header.push(String::new());
+            alignments.push(CellAlignment::None);
+            for row in &mut rows {
+                row.push(String::new());
+            }
+        }
+        TableStructuralChange::AddRow => {
+            rows.push(vec![String::new(); header.len()]);
+        }
+        TableStructuralChange::MoveRow { from, to } => {
+            if from < rows.len() && to < rows.len() {
+                let row = rows.remove(from);
+                rows.insert(to, row);
+            }
+        }
+        TableStructuralChange::MoveColumn { from, to } => {
+            if from < header.len() && to < header.len() {
+                let cell = header.remove(from);
+                header.insert(to, cell);
+                if from < alignments.len() && to < alignments.len() {
+                    let alignment = alignments.remove(from);
+                    alignments.insert(to, alignment);
+                }
+                for row in &mut rows {
+                    if from < row.len() && to < row.len() {
+                        let cell = row.remove(from);
+                        row.insert(to, cell);
+                    }
+                }
+            }
+        }
+        TableStructuralChange::DeleteRow(index) => {
+            if index < rows.len() {
+                rows.remove(index);
+            }
+        }
+        TableStructuralChange::DeleteColumn(index) => {
+            if header.len() > 1 && index < header.len() {
+                header.remove(index);
+                if index < alignments.len() {
+                    alignments.remove(index);
+                }
+                for row in &mut rows {
+                    if index < row.len() {
+                        row.remove(index);
+                    }
+                }
+            }
+        }
+        TableStructuralChange::Normalize => {}
+    }
+
+    let columns = header.len();
+    alignments.resize(columns, CellAlignment::None);
+    for row in &mut rows {
+        row.resize(columns, String::new());
+    }
+
+    let format_row = |cells: &[String]| -> String {
+        let mut line = String::from("|");
+        for cell in cells {
+            line.push(' ');
+            if cell.is_empty() {
+                line.push(' ');
+            } else {
+                line.push_str(cell);
+            }
+            line.push_str(" |");
+        }
+        line
+    };
+    let delimiter: String = {
+        let mut line = String::from("|");
+        for alignment in &alignments {
+            let marker = match alignment {
+                CellAlignment::None => " --- ",
+                CellAlignment::Left => " :-- ",
+                CellAlignment::Center => " :-: ",
+                CellAlignment::Right => " --: ",
+            };
+            line.push_str(marker);
+            line.push('|');
+        }
+        line
+    };
+
+    let mut source = format_row(&header);
+    source.push('\n');
+    source.push_str(&delimiter);
+    for row in &rows {
+        source.push('\n');
+        source.push_str(&format_row(row));
+    }
+
+    editor.buffer().update(cx, |multibuffer, cx| {
+        multibuffer.edit([(table_offsets.start..table_offsets.end, source)], None, cx);
+    });
+}
+
+/// The editable table widget: rendered grid, click-to-edit cells, and
+/// add-row/add-column affordances.
+#[allow(clippy::too_many_arguments)]
+/// A run of a table cell's text: Markdown, or an inline formula, which the
+/// `markdown` crate does not render.
+enum CellSegment<'a> {
+    Text {
+        text: &'a str,
+        space_before: bool,
+        space_after: bool,
+    },
+    Math(&'a str),
+}
+
+/// Splits a cell's text around its `$...$` formulas, with the same tight
+/// delimiter rule as the editor's inline math. pulldown-cmark finds them, so
+/// a `$` inside a code span or escaped as `\$` stays text.
+fn split_cell_math(text: &str) -> Vec<CellSegment<'_>> {
+    let mut formulas = Vec::new();
+    let parser = pulldown_cmark::Parser::new_ext(text, pulldown_cmark::Options::ENABLE_MATH);
+    for (event, range) in parser.into_offset_iter() {
+        // A cell is one line, so `$$...$$` renders inline there, as it does
+        // mid-line in the editor; only single-`$` math needs tight delimiters.
+        let source = match event {
+            pulldown_cmark::Event::InlineMath(source) => {
+                if source.starts_with(char::is_whitespace) || source.ends_with(char::is_whitespace)
+                {
+                    continue;
+                }
+                source
+            }
+            pulldown_cmark::Event::DisplayMath(source) => source,
+            _ => continue,
+        };
+        if source.trim().is_empty() {
+            continue;
+        }
+        let delimiter = text.get(range.clone()).map_or(1, |construct| {
+            construct.len() - construct.trim_start_matches('$').len()
+        });
+        let (Some(source_start), Some(source_end)) = (
+            range.start.checked_add(delimiter),
+            range.end.checked_sub(delimiter),
+        ) else {
+            continue;
+        };
+        if source_start < source_end {
+            formulas.push((range, source_start..source_end));
+        }
+    }
+    if formulas.is_empty() {
+        return vec![CellSegment::Text {
+            text,
+            space_before: false,
+            space_after: false,
+        }];
+    }
+
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    for (construct, source) in formulas {
+        if let Some(between) = text.get(cursor..construct.start) {
+            push_cell_text(&mut segments, between);
+        }
+        if let Some(source) = text.get(source) {
+            segments.push(CellSegment::Math(source));
+        }
+        cursor = construct.end;
+    }
+    if let Some(rest) = text.get(cursor..) {
+        push_cell_text(&mut segments, rest);
+    }
+    segments
+}
+
+fn push_cell_text<'a>(segments: &mut Vec<CellSegment<'a>>, text: &'a str) {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return;
+    }
+    segments.push(CellSegment::Text {
+        text: trimmed,
+        space_before: text.starts_with(char::is_whitespace),
+        space_after: text.ends_with(char::is_whitespace),
+    });
+}
+
+/// What a table cell draws: its Markdown runs and the formulas between them.
+enum CellPiece {
+    Text {
+        markdown: Entity<Markdown>,
+        space_before: bool,
+        space_after: bool,
+    },
+    Math(MathKey),
+}
+
+fn render_cell_pieces(
+    cell_id: SharedString,
+    pieces: &[CellPiece],
+    style: &MarkdownStyle,
+) -> AnyElement {
+    // `min_w_0` is load-bearing: as a flex item the markdown container would
+    // otherwise take its min-content width, which for text measured without a
+    // definite width is the whole unwrapped line. The cell itself still
+    // shrinks to its column share, so long content spills over the border
+    // instead of wrapping.
+    if let [CellPiece::Text { markdown, .. }] = pieces {
+        return div()
+            .min_w_0()
+            .child(MarkdownElement::new(markdown.clone(), style.clone()))
+            .into_any_element();
+    }
+    h_flex()
+        .min_w_0()
+        .flex_wrap()
+        .children(pieces.iter().enumerate().map(|(index, piece)| {
+            match piece {
+                CellPiece::Text {
+                    markdown,
+                    space_before,
+                    space_after,
+                } => div()
+                    .debug_selector({
+                        let cell_id = cell_id.clone();
+                        move || format!("{cell_id}-piece-{index}")
+                    })
+                    .min_w_0()
+                    .when(*space_before && index > 0, |this| this.ml(rems(0.3)))
+                    .when(*space_after && index + 1 < pieces.len(), |this| {
+                        this.mr(rems(0.3))
+                    })
+                    .child(MarkdownElement::new(markdown.clone(), style.clone()))
+                    .into_any_element(),
+                CellPiece::Math(key) => {
+                    let key = key.clone();
+                    let piece_id = SharedString::from(format!("{cell_id}-piece-{index}"));
+                    at_editor_font_size(move |font_size, cx| {
+                        match cx
+                            .try_global::<MathCache>()
+                            .and_then(|cache| cache.entries.get(&key))
+                        {
+                            Some(MathEntry::Ready {
+                                svg: document,
+                                baseline_fraction,
+                                width_em,
+                                height_em,
+                            }) => {
+                                // The row centers its pieces, as the editor
+                                // centers inline elements in a line, so the
+                                // placeholder's padding puts the formula's
+                                // baseline on the text's here too.
+                                let layout = InlineMathLayout::new(
+                                    *baseline_fraction,
+                                    *width_em,
+                                    *height_em,
+                                    font_size,
+                                    cx,
+                                );
+                                div()
+                                    .debug_selector(move || piece_id.to_string())
+                                    .flex_none()
+                                    .h(layout.element_height())
+                                    .w(layout.width)
+                                    .pt(layout.pad_top)
+                                    .pb(layout.pad_bottom)
+                                    .child(
+                                        svg()
+                                            .data(document)
+                                            .text_color(cx.theme().colors().editor_foreground)
+                                            .h(layout.height)
+                                            .w(layout.width),
+                                    )
+                                    .into_any_element()
+                            }
+                            entry => math_source_fallback(
+                                ElementId::Name(piece_id),
+                                format!("${}$", key.source).into(),
+                                entry,
+                                font_size,
+                                cx,
+                            ),
+                        }
+                    })
+                    .into_any_element()
+                }
+            }
+        }))
+        .into_any_element()
+}
+
+fn render_table_block(
+    structure: TableStructure,
+    header_markdown: Vec<Vec<CellPiece>>,
+    rows_markdown: Vec<Vec<Vec<CellPiece>>>,
+    column_weights: Vec<f32>,
+    editor: WeakEntity<Editor>,
+    table_range: Range<Anchor>,
+    indent_columns: u32,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let style = {
+            let mut style = block_markdown_style(block_cx.window, block_cx.app);
+            style.height_is_multiple_of_line_height = true;
+            style
+        };
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        let max_width = block_cx.max_width;
+        // `max_width` includes the editor's horizontal scroll range, so any
+        // long line in the buffer would stretch the table with it. Cap the
+        // grid at the editor's visible width instead and scroll the overflow
+        // inside the block: replace blocks never extend the editor's own
+        // scroll range, so content past the viewport would be unreachable.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(max_width);
+        let grid_max_width =
+            (visible_width - gutter_width - block_cx.margins.right - gpui::px(38.))
+                .max(gpui::px(200.));
+        let colors = block_cx.app.theme().colors().clone();
+
+        let (active_range, active_editor) = editor
+            .upgrade()
+            .and_then(|entity| {
+                let editor_ref = entity.read(block_cx.app);
+                let snapshot = editor_ref
+                    .buffer()
+                    .read(block_cx.app)
+                    .snapshot(block_cx.app);
+                editor_ref
+                    .addon::<LivePreviewAddon>()
+                    .and_then(|addon| addon.active_cell.as_ref())
+                    .map(|cell| {
+                        (
+                            Some(
+                                cell.cell_range.start.to_offset(&snapshot).0
+                                    ..cell.cell_range.end.to_offset(&snapshot).0,
+                            ),
+                            Some(cell.editor.clone()),
+                        )
+                    })
+            })
+            .unwrap_or((None, None));
+        let resolved = editor.upgrade().map(|entity| {
+            entity
+                .read(block_cx.app)
+                .buffer()
+                .read(block_cx.app)
+                .snapshot(block_cx.app)
+        });
+        let (selected_unit, drag_source_unit, drop_boundary) = editor
+            .upgrade()
+            .zip(resolved.as_ref())
+            .and_then(|(entity, snapshot)| {
+                let addon = entity.read(block_cx.app).addon::<LivePreviewAddon>()?;
+                let table_start = table_range.start.to_offset(snapshot);
+                let unit_in_this_table = |selection: &Option<TableUnitSelection>| {
+                    selection
+                        .as_ref()
+                        .filter(|selection| {
+                            selection.table_range.start.to_offset(snapshot) == table_start
+                        })
+                        .map(|selection| selection.unit)
+                };
+                let dragging = block_cx.app.has_active_drag();
+                let boundary = addon
+                    .drop_boundary
+                    .as_ref()
+                    .filter(|(range, _)| range.start.to_offset(snapshot) == table_start)
+                    .map(|(_, boundary)| *boundary)
+                    .filter(|_| dragging);
+                Some((
+                    unit_in_this_table(&addon.selected_table_unit),
+                    unit_in_this_table(&addon.drag_source).filter(|_| dragging),
+                    boundary,
+                ))
+            })
+            .unwrap_or((None, None, None));
+
+        // Fixed per-column widths keep every row's cells aligned without
+        // flex growth: growing distributed leftover space equally, which
+        // ballooned short columns whenever the block was wider than the
+        // table's content.
+        // Cells render in the buffer font, so the per-character budget has to
+        // come from that font's own advance: a fixed estimate wraps every
+        // header as soon as the buffer font is larger than the guess.
+        // `block_cx.em_width` is the ink width of `m`, narrower than the
+        // advance, so it would still wrap.
+        let character_width = {
+            let settings = theme_settings::ThemeSettings::get_global(block_cx.app);
+            let font = settings.buffer_font.clone();
+            let font_size = settings.buffer_font_size(block_cx.app);
+            let text_system = block_cx.window.text_system();
+            let font_id = text_system.resolve_font(&font);
+            text_system
+                .ch_advance(font_id, font_size)
+                .log_err()
+                .unwrap_or(block_cx.em_width)
+        };
+        // `px_2` on both sides, plus the cell border and rounding slack.
+        let cell_padding = block_cx.window.rem_size() + gpui::px(6.);
+        let column_width =
+            move |weight: f32| (character_width * weight + cell_padding).max(gpui::px(48.));
+        let handle_width = gpui::px(14.);
+        // The grid needs its explicit content width: fixed-width cells only
+        // overflow their rows visually, so without it the scroll container
+        // measures no overflow and refuses to scroll.
+        let grid_width = column_weights
+            .iter()
+            .fold(handle_width, |total, weight| total + column_width(*weight));
+
+        let render_cell = |cell_range: &Range<Anchor>,
+                           pieces: &[CellPiece],
+                           column: usize,
+                           data_row: Option<usize>| {
+            let is_header = data_row.is_none();
+            let unit_covers_cell = |unit: Option<TableUnit>| match unit {
+                Some(TableUnit::Row(row)) => data_row == Some(row),
+                Some(TableUnit::Column(unit_column)) => column == unit_column,
+                None => false,
+            };
+            let in_selected_unit = unit_covers_cell(selected_unit);
+            // The dragged unit gets the tint only: recoloring its borders
+            // reads as a second insertion line.
+            let is_drag_source_cell = unit_covers_cell(drag_source_unit);
+            // Full-height line exactly on the insertion boundary. Boundary b
+            // draws on the left edge of column b; the end boundary draws on
+            // the right edge of the last column.
+            let column_insertion = match (drag_source_unit, drop_boundary) {
+                (Some(TableUnit::Column(_)), Some(TableBoundary::Column(boundary))) => {
+                    if boundary == column {
+                        Some(false)
+                    } else if boundary == structure.header.len()
+                        && column + 1 == structure.header.len()
+                    {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let weight = column_weights.get(column).copied().unwrap_or(8.);
+            let is_active = match (&resolved, &active_range) {
+                (Some(snapshot), Some(active)) => {
+                    let start = cell_range.start.to_offset(snapshot).0;
+                    let end = cell_range.end.to_offset(snapshot).0;
+                    *active == (start..end)
+                }
+                _ => false,
+            };
+            let alignment = structure
+                .alignments
+                .get(column)
+                .copied()
+                .unwrap_or(CellAlignment::None);
+
+            let is_sentinel = cell_range.start == Anchor::Min && cell_range.end == Anchor::Min;
+            let mut cell = div()
+                .debug_selector(|| {
+                    format!(
+                        "mdlp-cell-{}-{column}",
+                        data_row
+                            .map(|row| row.to_string())
+                            .unwrap_or_else(|| "h".into())
+                    )
+                })
+                .flex_none()
+                .w(column_width(weight))
+                .px_2()
+                .py_1()
+                .min_h(block_cx.line_height + gpui::px(10.))
+                .border_r_1()
+                .border_b_1()
+                .when(column == 0, |this| this.border_l_1())
+                .when(is_header, |this| this.border_t_1())
+                .border_color(colors.border_variant)
+                .flex()
+                .items_center()
+                .map(|this| match alignment {
+                    CellAlignment::Center => this.justify_center(),
+                    CellAlignment::Right => this.justify_end(),
+                    _ => this,
+                })
+                .when(is_header, |this| {
+                    this.bg(colors.elevated_surface_background)
+                        .font_weight(FontWeight::BOLD)
+                })
+                .when(in_selected_unit, |this| {
+                    this.bg(colors.element_selected)
+                        .border_color(colors.border_focused)
+                })
+                .when(is_drag_source_cell, |this| this.bg(colors.element_selected))
+                .when_some(column_insertion, |this, after| {
+                    // Overlay, not a border: borders recolor the cell's own
+                    // grid lines and shift layout; an absolute bar draws one
+                    // continuous line on the boundary.
+                    let bar = div()
+                        .absolute()
+                        .top_0()
+                        .bottom_0()
+                        .w(gpui::px(3.))
+                        .bg(colors.border_focused);
+                    this.relative().child(if after {
+                        bar.right(gpui::px(-2.))
+                    } else {
+                        bar.left(gpui::px(-2.))
+                    })
+                })
+                .on_drag_move::<TableColumnDrag>({
+                    let weak = editor.clone();
+                    let cell_table_range = table_range.clone();
+                    move |event, _, cx| {
+                        if !event.bounds.contains(&event.event.position) {
+                            return;
+                        }
+                        if event.drag(cx).table_start != cell_table_range.start {
+                            return;
+                        }
+                        // Pointer-side precision: the near half of a column
+                        // targets the boundary before it, the far half after.
+                        let after = event.event.position.x > event.bounds.center().x;
+                        let boundary = TableBoundary::Column(column + usize::from(after));
+                        set_drop_boundary(&weak, &cell_table_range, boundary, cx);
+                    }
+                });
+
+            if is_active && let Some(active_editor) = active_editor.clone() {
+                cell = cell.child(div().w_full().child(active_editor));
+            } else if is_sentinel {
+                // Clicking a cell the source omitted first rewrites the table
+                // in normalized form so the cell exists to edit.
+                let weak = editor.clone();
+                let normalize_range = table_range.clone();
+                cell =
+                    cell.cursor_text()
+                        .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                            cx.stop_propagation();
+                            weak.update(cx, |editor, cx| {
+                                apply_table_structural_change(
+                                    editor,
+                                    &normalize_range,
+                                    TableStructuralChange::Normalize,
+                                    cx,
+                                );
+                            })
+                            .log_err();
+                        });
+            } else {
+                let weak = editor.clone();
+                let cell_range = cell_range.clone();
+                cell = cell
+                    // `min_w_0` is load-bearing: as a flex item the markdown
+                    // container would otherwise take its min-content width,
+                    // which for text measured without a definite width is the
+                    // whole unwrapped line. The cell itself still shrinks to
+                    // its column share, so long content spills over the border
+                    // instead of wrapping.
+                    .child(render_cell_pieces(
+                        format!(
+                            "mdlp-cell-{}-{column}",
+                            data_row
+                                .map(|row| row.to_string())
+                                .unwrap_or_else(|| "h".into())
+                        )
+                        .into(),
+                        pieces,
+                        &style,
+                    ))
+                    .cursor_text()
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        cx.stop_propagation();
+                        start_cell_edit(weak.clone(), cell_range.clone(), window, cx);
+                    });
+            }
+            cell
+        };
+
+        let record_press = {
+            let weak = editor.clone();
+            move |event: &gpui::MouseDownEvent, _: &mut Window, cx: &mut App| {
+                // Record only — no notify. A re-render here would tear down
+                // the per-frame listeners that arm the drag gesture.
+                let position = event.position;
+                weak.update(cx, |editor, _| {
+                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        addon.handle_press = Some(position);
+                    }
+                })
+                .log_err();
+            }
+        };
+        let select_unit = |unit: TableUnit| {
+            let weak = editor.clone();
+            let unit_table_range = table_range.clone();
+            move |event: &gpui::MouseUpEvent, _: &mut Window, cx: &mut App| {
+                weak.update(cx, |editor, cx| {
+                    let Some(press) = editor
+                        .addon_mut::<LivePreviewAddon>()
+                        .and_then(|addon| addon.handle_press.take())
+                    else {
+                        return;
+                    };
+                    // A real drag ends far from where it started; only a
+                    // click (press + release in place) selects.
+                    if (event.position - press).magnitude() > 4. {
+                        return;
+                    }
+                    commit_active_cell(editor, cx);
+                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        let already = addon
+                            .selected_table_unit
+                            .as_ref()
+                            .is_some_and(|selection| selection.unit == unit);
+                        addon.selected_table_unit = (!already).then(|| TableUnitSelection {
+                            table_range: unit_table_range.clone(),
+                            unit,
+                        });
+                    }
+                    cx.notify();
+                })
+                .log_err();
+            }
+        };
+        let handle_pill = |selected: bool| {
+            div()
+                .rounded_sm()
+                .bg(if selected {
+                    colors.border_focused
+                } else {
+                    colors.element_hover
+                })
+                .when(!selected, |this| {
+                    this.opacity(0.)
+                        .group_hover("mdlp-table", |this| this.opacity(1.))
+                })
+        };
+
+        let mut grid = v_flex().flex_none().w(grid_width);
+        // Column handles.
+        grid = grid.child(h_flex().child(div().w(handle_width)).children(
+            structure.header.iter().enumerate().map(|(column, _)| {
+                let weight = column_weights.get(column).copied().unwrap_or(8.);
+                let selected = selected_unit == Some(TableUnit::Column(column));
+                div()
+                    .id(("mdlp-column-handle", column))
+                    .debug_selector(|| format!("mdlp-column-handle-{column}"))
+                    .flex_none()
+                    .w(column_width(weight))
+                    .h(gpui::px(10.))
+                    .px_2()
+                    .cursor_pointer()
+                    .child(
+                        handle_pill(selected)
+                            .w_full()
+                            .h(gpui::px(4.))
+                            .mt(gpui::px(3.)),
+                    )
+                    .on_mouse_down(MouseButton::Left, record_press.clone())
+                    .on_mouse_up(MouseButton::Left, select_unit(TableUnit::Column(column)))
+                    .on_drag_move::<TableColumnDrag>({
+                        let weak = editor.clone();
+                        let strip_table_range = table_range.clone();
+                        move |event, _, cx| {
+                            if !event.bounds.contains(&event.event.position) {
+                                return;
+                            }
+                            if event.drag(cx).table_start != strip_table_range.start {
+                                return;
+                            }
+                            let after = event.event.position.x > event.bounds.center().x;
+                            let boundary = TableBoundary::Column(column + usize::from(after));
+                            set_drop_boundary(&weak, &strip_table_range, boundary, cx);
+                        }
+                    })
+                    .on_drag(
+                        TableColumnDrag {
+                            table_start: table_range.start,
+                            column,
+                        },
+                        {
+                            let weak = editor.clone();
+                            let drag_table_range = table_range.clone();
+                            move |_, _, _, cx| {
+                                record_drag_source(
+                                    &weak,
+                                    &drag_table_range,
+                                    TableUnit::Column(column),
+                                    cx,
+                                );
+                                cx.new(|_| EmptyDragPreview)
+                            }
+                        },
+                    )
+            }),
+        ));
+        let row_handle = |data_row: Option<usize>| {
+            let container = div().w(handle_width).py_1().pr(gpui::px(4.)).flex();
+            match data_row {
+                None => container.into_any_element(),
+                Some(row_index) => {
+                    let selected = selected_unit == Some(TableUnit::Row(row_index));
+                    container
+                        .id(("mdlp-row-handle", row_index))
+                        .debug_selector(|| format!("mdlp-row-handle-{row_index}"))
+                        .cursor_pointer()
+                        .child(handle_pill(selected).w(gpui::px(4.)).h_full())
+                        .on_mouse_down(MouseButton::Left, record_press.clone())
+                        .on_mouse_up(MouseButton::Left, select_unit(TableUnit::Row(row_index)))
+                        .on_drag(
+                            TableRowDrag {
+                                table_start: table_range.start,
+                                row: row_index,
+                            },
+                            {
+                                let weak = editor.clone();
+                                let drag_table_range = table_range.clone();
+                                move |_, _, _, cx| {
+                                    record_drag_source(
+                                        &weak,
+                                        &drag_table_range,
+                                        TableUnit::Row(row_index),
+                                        cx,
+                                    );
+                                    cx.new(|_| EmptyDragPreview)
+                                }
+                            },
+                        )
+                        .into_any_element()
+                }
+            }
+        };
+        let rows_len = structure.rows.len();
+        let row_track_drag = |data_row: Option<usize>| {
+            let weak = editor.clone();
+            let row_table_range = table_range.clone();
+            move |event: &gpui::DragMoveEvent<TableRowDrag>, _: &mut Window, cx: &mut App| {
+                if !event.bounds.contains(&event.event.position) {
+                    return;
+                }
+                if event.drag(cx).table_start != row_table_range.start {
+                    return;
+                }
+                // Rows can only land below the header, so the header always
+                // targets boundary 0; data rows use pointer-side precision.
+                let boundary = match data_row {
+                    None => 0,
+                    Some(row) => {
+                        let after = event.event.position.y > event.bounds.center().y;
+                        row + usize::from(after)
+                    }
+                };
+                set_drop_boundary(&weak, &row_table_range, TableBoundary::Row(boundary), cx);
+            }
+        };
+        // Boundary b sits above data row b; b == 0 is the header's bottom
+        // edge and b == rows_len the last row's bottom edge. `Some(true)`
+        // draws at the container's bottom, `Some(false)` at its top.
+        let row_insertion = |data_row: Option<usize>| {
+            let boundary = match (drag_source_unit, drop_boundary) {
+                (Some(TableUnit::Row(_)), Some(TableBoundary::Row(boundary))) => boundary,
+                _ => return None,
+            };
+            match data_row {
+                None => (boundary == 0).then_some(true),
+                Some(row) => {
+                    if boundary == row && row > 0 {
+                        Some(false)
+                    } else if boundary == rows_len && row + 1 == rows_len {
+                        Some(true)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        let accent = colors.border_focused;
+        grid =
+            grid.child(
+                h_flex()
+                    .items_stretch()
+                    .when_some(row_insertion(None), |this, after| {
+                        let bar = div()
+                            .absolute()
+                            .left_0()
+                            .right_0()
+                            .h(gpui::px(3.))
+                            .bg(accent);
+                        this.relative().child(if after {
+                            bar.bottom(gpui::px(-2.))
+                        } else {
+                            bar.top(gpui::px(-2.))
+                        })
+                    })
+                    .on_drag_move::<TableRowDrag>(row_track_drag(None))
+                    .child(row_handle(None))
+                    .child(h_flex().items_stretch().children(
+                        header_markdown.iter().enumerate().map(|(column, pieces)| {
+                            let empty = Range {
+                                start: Anchor::Min,
+                                end: Anchor::Min,
+                            };
+                            let range = structure.header.get(column).unwrap_or(&empty);
+                            render_cell(range, pieces, column, None)
+                        }),
+                    )),
+            );
+        for (row_index, row_markdown) in rows_markdown.iter().enumerate() {
+            grid =
+                grid.child(
+                    h_flex()
+                        .items_stretch()
+                        .when_some(row_insertion(Some(row_index)), |this, after| {
+                            let bar = div()
+                                .absolute()
+                                .left_0()
+                                .right_0()
+                                .h(gpui::px(3.))
+                                .bg(accent);
+                            this.relative().child(if after {
+                                bar.bottom(gpui::px(-2.))
+                            } else {
+                                bar.top(gpui::px(-2.))
+                            })
+                        })
+                        .on_drag_move::<TableRowDrag>(row_track_drag(Some(row_index)))
+                        .child(row_handle(Some(row_index)))
+                        .child(h_flex().items_stretch().children(
+                            row_markdown.iter().enumerate().map(|(column, pieces)| {
+                                let empty = Range {
+                                    start: Anchor::Min,
+                                    end: Anchor::Min,
+                                };
+                                let range = structure
+                                    .rows
+                                    .get(row_index)
+                                    .and_then(|row| row.get(column))
+                                    .unwrap_or(&empty);
+                                render_cell(range, pieces, column, Some(row_index))
+                            }),
+                        )),
+                );
+        }
+
+        let add_column_editor = editor.clone();
+        let add_column_range = table_range.clone();
+        let add_row_editor = editor.clone();
+        let add_row_range = table_range.clone();
+        let reveal_source_editor = editor.clone();
+        let reveal_source_range = table_range.clone();
+
+        let unit_button =
+            |id: &'static str,
+             icon: IconName,
+             action: Option<(TableStructuralChange, Option<TableUnit>)>| {
+                let weak = editor.clone();
+                let action_range = table_range.clone();
+                let enabled = action.is_some();
+                div()
+                    .id(id)
+                    .px_1()
+                    .py_0p5()
+                    .rounded_sm()
+                    .child(Icon::new(icon).size(IconSize::XSmall).color(if enabled {
+                        Color::Muted
+                    } else {
+                        Color::Disabled
+                    }))
+                    .when_some(action, move |this, (change, new_unit)| {
+                        this.cursor_pointer()
+                            .hover(|this| this.bg(colors.element_hover))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.stop_propagation();
+                                weak.update(cx, |editor, cx| {
+                                    apply_table_structural_change(
+                                        editor,
+                                        &action_range,
+                                        change,
+                                        cx,
+                                    );
+                                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                                        addon.selected_table_unit =
+                                            new_unit.map(|unit| TableUnitSelection {
+                                                table_range: action_range.clone(),
+                                                unit,
+                                            });
+                                    }
+                                    cx.notify();
+                                })
+                                .log_err();
+                            })
+                    })
+            };
+        let controls = selected_unit.map(|unit| {
+            let rows_len = structure.rows.len();
+            let columns_len = structure.header.len();
+            let delete = match unit {
+                TableUnit::Row(row) => {
+                    (row < rows_len).then_some((TableStructuralChange::DeleteRow(row), None))
+                }
+                TableUnit::Column(column) => (columns_len > 1 && column < columns_len)
+                    .then_some((TableStructuralChange::DeleteColumn(column), None)),
+            };
+            h_flex().gap_1().pb_1().pl(handle_width).child(unit_button(
+                "mdlp-unit-delete",
+                IconName::Trash,
+                delete,
+            ))
+        });
+
+        let apply_boundary_drop = |weak: WeakEntity<Editor>,
+                                   container_table_range: Range<Anchor>,
+                                   from_unit: TableUnit| {
+            move |cx: &mut App| {
+                weak.update(cx, |editor, cx| {
+                    let Some(boundary) = editor
+                        .addon::<LivePreviewAddon>()
+                        .and_then(|addon| addon.drop_boundary.as_ref())
+                        .filter(|(range, _)| range.start == container_table_range.start)
+                        .map(|(_, boundary)| *boundary)
+                    else {
+                        return;
+                    };
+                    // Boundary b means "insert before index b". Removing the
+                    // source first shifts later indices down by one; the two
+                    // boundaries flanking the source are no-ops.
+                    let move_to = |from: usize, boundary: usize| {
+                        if boundary == from || boundary == from + 1 {
+                            None
+                        } else if boundary > from {
+                            Some(boundary - 1)
+                        } else {
+                            Some(boundary)
+                        }
+                    };
+                    let (change, unit) = match (from_unit, boundary) {
+                        (TableUnit::Row(from), TableBoundary::Row(boundary)) => {
+                            match move_to(from, boundary) {
+                                Some(to) => (
+                                    TableStructuralChange::MoveRow { from, to },
+                                    TableUnit::Row(to),
+                                ),
+                                None => return,
+                            }
+                        }
+                        (TableUnit::Column(from), TableBoundary::Column(boundary)) => {
+                            match move_to(from, boundary) {
+                                Some(to) => (
+                                    TableStructuralChange::MoveColumn { from, to },
+                                    TableUnit::Column(to),
+                                ),
+                                None => return,
+                            }
+                        }
+                        _ => return,
+                    };
+                    apply_table_structural_change(editor, &container_table_range, change, cx);
+                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        addon.drag_source = None;
+                        addon.drop_boundary = None;
+                        addon.selected_table_unit = Some(TableUnitSelection {
+                            table_range: container_table_range.clone(),
+                            unit,
+                        });
+                    }
+                    cx.notify();
+                })
+                .log_err();
+            }
+        };
+        let container_row_drop = {
+            let weak = editor.clone();
+            let container_table_range = table_range.clone();
+            move |drag: &TableRowDrag, _: &mut Window, cx: &mut App| {
+                if drag.table_start != container_table_range.start {
+                    return;
+                }
+                apply_boundary_drop(
+                    weak.clone(),
+                    container_table_range.clone(),
+                    TableUnit::Row(drag.row),
+                )(cx);
+            }
+        };
+        let container_column_drop = {
+            let weak = editor.clone();
+            let container_table_range = table_range.clone();
+            move |drag: &TableColumnDrag, _: &mut Window, cx: &mut App| {
+                if drag.table_start != container_table_range.start {
+                    return;
+                }
+                apply_boundary_drop(
+                    weak.clone(),
+                    container_table_range.clone(),
+                    TableUnit::Column(drag.column),
+                )(cx);
+            }
+        };
+
+        div()
+            .pl(gutter_width)
+            .w(max_width)
+            // Flex, not block: the table column should take its content
+            // width so the add-row strip and controls hug the grid.
+            .flex()
+            .group("mdlp-table")
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .on_drop::<TableRowDrag>(container_row_drop)
+            .on_drop::<TableColumnDrag>(container_column_drop)
+            .child(
+                v_flex()
+                    .children(controls)
+                    .child(
+                        h_flex()
+                            .items_stretch()
+                            .child(
+                                div()
+                                    .id(ElementId::from(block_cx.block_id))
+                                    .debug_selector(|| "mdlp-table-scroll".into())
+                                    .max_w(grid_max_width)
+                                    .overflow_x_scroll()
+                                    // Without this, GPUI turns a vertical wheel
+                                    // delta into horizontal scrolling because the
+                                    // container has no vertical overflow, so
+                                    // scrolling the document past a wide table
+                                    // swept the table sideways (#137).
+                                    .restrict_scroll_to_axis()
+                                    .child(grid),
+                            )
+                            .child(
+                                v_flex()
+                                    .w(gpui::px(22.))
+                                    .child(
+                                        // Reveal the table's markdown source.
+                                        div()
+                                            .id("mdlp-table-source")
+                                            .h(gpui::px(22.))
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .text_color(colors.text_muted)
+                                            .opacity(0.)
+                                            .group_hover("mdlp-table", |this| this.opacity(0.7))
+                                            .hover(|this| this.opacity(1.))
+                                            .child(
+                                                Icon::new(IconName::Code)
+                                                    .size(IconSize::XSmall)
+                                                    .color(Color::Muted),
+                                            )
+                                            .tooltip(ui::Tooltip::text("Edit table source"))
+                                            .on_mouse_down(
+                                                MouseButton::Left,
+                                                move |_, window, cx| {
+                                                    cx.stop_propagation();
+                                                    reveal_source_editor
+                                                        .update(cx, |editor, cx| {
+                                                            if let Some(addon) = editor
+                                                                .addon_mut::<LivePreviewAddon>(
+                                                            ) {
+                                                                addon.source_revealed = Some(
+                                                                    reveal_source_range.clone(),
+                                                                );
+                                                            }
+                                                            let snapshot = editor
+                                                                .buffer()
+                                                                .read(cx)
+                                                                .snapshot(cx);
+                                                            let offset = reveal_source_range
+                                                                .start
+                                                                .to_offset(&snapshot);
+                                                            editor.change_selections(
+                                                                Default::default(),
+                                                                window,
+                                                                cx,
+                                                                |selections| {
+                                                                    selections.select_ranges([
+                                                                        offset..offset,
+                                                                    ]);
+                                                                },
+                                                            );
+                                                        })
+                                                        .log_err();
+                                                },
+                                            ),
+                                    )
+                                    .child(
+                                        // Add column to the right.
+                                        div()
+                                            .id("mdlp-add-column")
+                                            .flex_grow(1.)
+                                            .flex()
+                                            .items_center()
+                                            .justify_center()
+                                            .cursor_pointer()
+                                            .text_color(colors.text_muted)
+                                            .opacity(0.)
+                                            .group_hover("mdlp-table", |this| this.opacity(0.7))
+                                            .hover(|this| this.opacity(1.))
+                                            .child("+")
+                                            .tooltip(ui::Tooltip::text("Add column to the right"))
+                                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                add_column_editor
+                                                    .update(cx, |editor, cx| {
+                                                        apply_table_structural_change(
+                                                            editor,
+                                                            &add_column_range,
+                                                            TableStructuralChange::AddColumn,
+                                                            cx,
+                                                        );
+                                                    })
+                                                    .log_err();
+                                            }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        // Add row below.
+                        div()
+                            .id("mdlp-add-row")
+                            .h(gpui::px(18.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .text_color(colors.text_muted)
+                            .opacity(0.)
+                            .group_hover("mdlp-table", |this| this.opacity(0.7))
+                            .hover(|this| this.opacity(1.))
+                            .child("+")
+                            .tooltip(ui::Tooltip::text("Add row below"))
+                            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                cx.stop_propagation();
+                                add_row_editor
+                                    .update(cx, |editor, cx| {
+                                        apply_table_structural_change(
+                                            editor,
+                                            &add_row_range,
+                                            TableStructuralChange::AddRow,
+                                            cx,
+                                        );
+                                    })
+                                    .log_err();
+                            }),
+                    ),
+            )
+            .into_any_element()
+    })
+}
+
+/// Drag payload for the image resize handle; renders no preview.
+struct ImageResizeDrag {
+    range: Range<Anchor>,
+    content_left_offset: gpui::Pixels,
+}
+
+/// Drag payload for moving an image to another line. Carries the marker range
+/// of the image being moved, which is its whole line — `push_block_rows`
+/// anchors block markers to full lines, and an image only becomes a block
+/// widget when it is alone on its line.
+struct ImageMoveDrag {
+    range: Range<Anchor>,
+}
+
+/// Type tag scoping the row highlight that marks where a dragged image will
+/// land, so clearing it cannot disturb any other row highlight.
+struct ImageDropTarget;
+
+struct EmptyDragPreview;
+
+impl gpui::Render for EmptyDragPreview {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        Empty
+    }
+}
+
+/// The chip that trails the pointer while an image is being dragged,
+/// Obsidian-style: a comfortable distance below-right of the mouse, with the
+/// drop cursor and tinted line marking where the image will land.
+///
+/// gpui paints the drag element at `pointer - grab_offset` and ignores
+/// margins on its root, so the chip is placed with an absolutely-positioned
+/// child offset by `grab_offset` plus the trailing distance, which puts it at
+/// a fixed offset from the live pointer.
+struct ImageDragPreview {
+    name: SharedString,
+    grab_offset: gpui::Point<gpui::Pixels>,
+}
+
+impl gpui::Render for ImageDragPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let colors = cx.theme().colors();
+        div().size_0().child(
+            div()
+                .absolute()
+                .left(self.grab_offset.x + px(16.))
+                // Vertically centered on the pointer: half the chip's height.
+                .top(self.grab_offset.y - px(13.))
+                .occlude()
+                .child(
+                    h_flex()
+                        .gap_1p5()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .border_1()
+                        .border_color(colors.border)
+                        .bg(colors.elevated_surface_background)
+                        .shadow_md()
+                        .child(
+                            Icon::new(IconName::Image)
+                                .size(IconSize::Small)
+                                .color(Color::Muted),
+                        )
+                        .child(Label::new(self.name.clone()).size(LabelSize::Small)),
+                ),
+        )
+    }
+}
+
+/// Rewrites (or inserts) Obsidian's `|width` suffix in an image's alt text.
+fn with_image_width(image_markdown: &str, width: u32) -> Option<String> {
+    let alt_start = image_markdown.find("![")? + 2;
+    let alt_end = alt_start + image_markdown.get(alt_start..)?.find(']')?;
+    let alt = image_markdown.get(alt_start..alt_end)?;
+    let base_alt = alt.rsplit_once('|').map_or(alt, |(base, suffix)| {
+        if suffix.chars().all(|c| c.is_ascii_digit() || c == 'x') && !suffix.is_empty() {
+            base
+        } else {
+            alt
+        }
+    });
+    Some(format!(
+        "{}{}|{}{}",
+        &image_markdown[..alt_start],
+        base_alt,
+        width,
+        &image_markdown[alt_end..]
+    ))
+}
+
+/// An Obsidian-style image widget: click to select, showing a border, a
+/// corner drag handle that resizes by rewriting `|width` into the source,
+/// and a code button that reveals the raw markdown.
+fn render_image_block(
+    markdown: Entity<Markdown>,
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    base_directory: Option<PathBuf>,
+    indent_columns: u32,
+    display_width: Option<f32>,
+    destination: Option<String>,
+    alt: SharedString,
+    image_cache: Entity<RetainAllImageCache>,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let mut style = block_markdown_style(block_cx.window, block_cx.app);
+        // Suppress the paragraph's trailing margin so the selection border
+        // hugs the image instead of leaving a gap beneath it.
+        style.height_is_multiple_of_line_height = true;
+        let start = range.start;
+        let base_directory = base_directory.clone();
+        let image_cache = image_cache.clone();
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        let max_width = block_cx.max_width;
+        let accent = block_cx.app.theme().colors().text_accent;
+        let surface = block_cx.app.theme().colors().elevated_surface_background;
+
+        // Images render at their explicit width, or capped at two thirds of
+        // the pane so screenshots do not dominate the note.
+        let content_width = display_width
+            .map(|width| gpui::px(width).min(max_width))
+            .map(gpui::Length::from);
+
+        let selected = editor
+            .upgrade()
+            .map(|editor_entity| {
+                let editor_ref = editor_entity.read(block_cx.app);
+                let snapshot = editor_ref
+                    .buffer()
+                    .read(block_cx.app)
+                    .snapshot(block_cx.app);
+                editor_ref
+                    .addon::<LivePreviewAddon>()
+                    .and_then(|addon| addon.selected_image.as_ref())
+                    .is_some_and(|selection| {
+                        selection.start.to_offset(&snapshot) == range.start.to_offset(&snapshot)
+                            && selection.end.to_offset(&snapshot) == range.end.to_offset(&snapshot)
+                    })
+            })
+            .unwrap_or(false);
+
+        let select_editor = editor.clone();
+        let select_range = range.clone();
+        let reveal_editor = editor.clone();
+        let reveal_range = range.clone();
+        let drag_editor = editor.clone();
+        let drag_range = range.clone();
+        let move_editor = editor.clone();
+        let move_drag_range = range.clone();
+        let menu_editor = editor.clone();
+        let menu_range = range.clone();
+        let menu_destination = destination.clone();
+        let menu_base_directory = base_directory.clone();
+
+        // A direct image element lets the selection border hug the image
+        // exactly; reference-style images (no inline destination) fall back
+        // to the markdown renderer.
+        let resolved = destination.as_deref().and_then(|destination| {
+            resolve_image_source(destination, base_directory.as_deref(), &image_cache)
+        });
+        let muted = block_cx.app.theme().colors().text_muted;
+        let preview_name: SharedString = destination
+            .as_deref()
+            .and_then(|destination| {
+                Path::new(destination)
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+            })
+            .map(SharedString::from)
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| {
+                if alt.is_empty() {
+                    SharedString::from("image")
+                } else {
+                    alt.clone()
+                }
+            });
+        let move_range = range.clone();
+        let image_content: gpui::AnyElement = match (&destination, resolved) {
+            (Some(_), Some(source)) => {
+                let fallback_alt = alt.clone();
+                gpui::img(source)
+                    .id(("mdlp-image", f32::from(max_width) as u64))
+                    .max_w_full()
+                    .rounded_sm()
+                    // The explicit width goes on the image itself, as an
+                    // absolute length, and the bordered container shrink-wraps
+                    // it. Sizing the container and giving the image `w_full()`
+                    // instead hits a gpui quirk: a percentage-width image with
+                    // auto height lays out at the file's natural height, not
+                    // the aspect-scaled one, so a widget stretched past the
+                    // file's natural width overflowed its container. Pinned by
+                    // `test_an_absolute_width_image_keeps_its_aspect_ratio`.
+                    .when_some(content_width, |this, width| this.w(width))
+                    .with_fallback(move || {
+                        div()
+                            .text_color(muted)
+                            .child(fallback_alt.clone())
+                            .into_any_element()
+                    })
+                    .into_any_element()
+            }
+            (Some(_), None) => div()
+                .text_color(muted)
+                .child(alt.clone())
+                .into_any_element(),
+            (None, _) => MarkdownElement::new(markdown.clone(), style)
+                .image_resolver(move |destination, _cx| {
+                    resolve_image_source(destination, base_directory.as_deref(), &image_cache)
+                })
+                .into_any_element(),
+        };
+
+        let mut content = div()
+            // `on_drag` is a stateful-element API, and the id must be unique
+            // per block: `Block::Custom` renders this closure with no id scope
+            // of its own, so a shared static id here would make every image
+            // block share one element-state entry — including the pending
+            // mouse-down that arms a drag, letting a different image's
+            // listener claim the gesture and drag the wrong image.
+            .id(block_cx.block_id)
+            // A no-op outside test builds.
+            .debug_selector(|| {
+                format!(
+                    "MDLP-IMAGE-{}",
+                    destination.as_deref().unwrap_or(alt.as_ref())
+                )
+            })
+            .relative()
+            .border_2()
+            .rounded_sm()
+            .map(|this| {
+                if selected {
+                    this.border_color(accent)
+                } else {
+                    this.border_color(gpui::transparent_black())
+                }
+            })
+            .when(content_width.is_none(), |this| this.max_w(max_width * 0.66))
+            .child(image_content)
+            .on_drag(
+                ImageMoveDrag { range: move_range },
+                move |_, grab_offset, _, cx| {
+                    cx.new(|_| ImageDragPreview {
+                        name: preview_name.clone(),
+                        grab_offset,
+                    })
+                },
+            );
+
+        if selected {
+            content = content
+                .child(
+                    // Reveal-source button, top right.
+                    div().absolute().top_1().right_1().child(
+                        IconButton::new("mdlp-show-source", IconName::Code)
+                            .style(ButtonStyle::Filled)
+                            .on_click(move |_, window, cx| {
+                                cx.stop_propagation();
+                                reveal_editor
+                                    .update(cx, |editor, cx| {
+                                        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>()
+                                        {
+                                            addon.source_revealed = Some(reveal_range.clone());
+                                        }
+                                        let snapshot = editor.buffer().read(cx).snapshot(cx);
+                                        let offset = start.to_offset(&snapshot);
+                                        editor.change_selections(
+                                            Default::default(),
+                                            window,
+                                            cx,
+                                            |selections| {
+                                                selections.select_ranges([offset..offset]);
+                                            },
+                                        );
+                                    })
+                                    .log_err();
+                            }),
+                    ),
+                )
+                .child(
+                    // Resize handle, bottom right.
+                    div()
+                        .id("mdlp-resize-handle")
+                        .absolute()
+                        .bottom_neg_1()
+                        .right_neg_1()
+                        .size_3()
+                        .rounded_full()
+                        .border_2()
+                        .border_color(accent)
+                        .bg(surface)
+                        .cursor_col_resize()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                            cx.stop_propagation();
+                        })
+                        .on_drag(
+                            ImageResizeDrag {
+                                range: drag_range,
+                                content_left_offset: gutter_width,
+                            },
+                            |_, _, _, cx| cx.new(|_| EmptyDragPreview),
+                        ),
+                );
+        }
+
+        div()
+            .pl(gutter_width)
+            .w(max_width)
+            .cursor_pointer()
+            .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                cx.stop_propagation();
+                select_editor
+                    .update(cx, |editor, cx| {
+                        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                            addon.selected_image = Some(select_range.clone());
+                        }
+                        cx.notify();
+                    })
+                    .log_err();
+            })
+            // The editor's own right-click menu acts on the markdown buffer,
+            // so its "Reveal in Finder" would open the note's folder, not the
+            // image's. Stopping propagation here keeps that menu from
+            // deploying and replaces it with one that targets the image file.
+            .on_mouse_down(MouseButton::Right, move |event, window, cx| {
+                cx.stop_propagation();
+                let image_path = menu_destination.as_deref().and_then(|destination| {
+                    local_image_path(destination, menu_base_directory.as_deref())
+                });
+                let range = menu_range.clone();
+                menu_editor
+                    .update(cx, |editor, cx| {
+                        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                            addon.selected_image = Some(range);
+                        }
+                        let menu =
+                            image_context_menu(image_path, editor.project().cloned(), window, cx);
+                        editor.deploy_mouse_context_menu(event.position, menu, window, cx);
+                        cx.notify();
+                    })
+                    .log_err();
+            })
+            .on_drag_move::<ImageResizeDrag>(move |event, _window, cx| {
+                let drag = event.drag(cx);
+                let width =
+                    (event.event.position.x - event.bounds.left() - drag.content_left_offset)
+                        .max(gpui::px(64.));
+                let width = (f32::from(width) / 4.).round() * 4.;
+                let drag_range = drag.range.clone();
+                drag_editor
+                    .update(cx, |editor, cx| {
+                        resize_image_to_width(editor, &drag_range, width as u32, cx);
+                    })
+                    .log_err();
+            })
+            // `on_drag_move` fires for every pointer move while the drag is
+            // live, not just those over this block, which is what lets one
+            // image widget follow the pointer across the whole document. Every
+            // image block hears every move, so each only handles its own.
+            .on_drag_move::<ImageMoveDrag>({
+                let editor = move_editor.clone();
+                let range = move_drag_range;
+                move |event, window, cx| {
+                    if event.drag(cx).range != range {
+                        return;
+                    }
+                    let position = event.event.position;
+                    editor
+                        .update(cx, |editor, cx| {
+                            let boundary = editor
+                                .buffer_row_boundary_at_position(position)
+                                .map(|row| row.0);
+                            track_image_drop_target(editor, &range, boundary, window, cx);
+                        })
+                        .log_err();
+                }
+            })
+            // The drop can land anywhere, so it is caught on mouse up rather
+            // than through `on_drop`, which only fires over this block.
+            .on_mouse_up(MouseButton::Left, {
+                let editor = move_editor.clone();
+                move |_, _window, cx| {
+                    let dropped = cx.has_active_drag();
+                    editor
+                        .update(cx, |editor, cx| finish_image_move(editor, dropped, cx))
+                        .log_err();
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, {
+                let editor = move_editor;
+                move |_, _window, cx| {
+                    let dropped = cx.has_active_drag();
+                    editor
+                        .update(cx, |editor, cx| finish_image_move(editor, dropped, cx))
+                        .log_err();
+                }
+            })
+            // `flex()` is load-bearing: gpui's `div()` is `display: block`, so a
+            // block child fills its parent's width and the bordered container
+            // would stretch to its own `max_w` cap — leaving the selection
+            // border, the `</>` button and the resize handle floating out to the
+            // right of any image narrower than that cap. As a flex item it
+            // shrink-wraps the image instead. Pinned by
+            // `test_a_block_child_fills_its_parent_but_a_flex_child_hugs`.
+            .child(div().flex().max_w(max_width).child(content))
+            .into_any_element()
+    })
+}
+
+/// Writes `|width` into the image markdown at `range`, throttled to actual
+/// changes; the edit round-trips through the normal reparse pipeline, so the
+/// widget re-renders at the new size and the whole drag undoes as one step.
+fn resize_image_to_width(
+    editor: &mut Editor,
+    range: &Range<Anchor>,
+    width: u32,
+    cx: &mut Context<Editor>,
+) {
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let start = range.start.to_offset(&snapshot);
+    let end = range.end.to_offset(&snapshot);
+    if start >= end {
+        return;
+    }
+    let current: String = snapshot.text_for_range(start..end).collect();
+    let Some(updated) = with_image_width(current.trim(), width) else {
+        return;
+    };
+    if updated == current.trim() {
+        return;
+    }
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.last_resize_at = Some(std::time::Instant::now());
+        // Keep the widget selected across the rewrite.
+        addon.selected_image = Some(range.clone());
+    }
+    editor.buffer().update(cx, |multibuffer, cx| {
+        multibuffer.edit([(start..end, updated)], None, cx);
+    });
+}
+
+/// Records the boundary a dragged image would land at and shows it two ways:
+/// the editor's own cursor moves to the drop point — a caret walking through
+/// the text as the reader drags, the same feedback dragging text gives — and
+/// the line the image will land above is tinted. `boundary` means "lands
+/// above this row"; it is `None` when the pointer is outside the text area,
+/// and may be one past the last row.
+fn track_image_drop_target(
+    editor: &mut Editor,
+    range: &Range<Anchor>,
+    boundary: Option<u32>,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let unchanged = editor.addon::<LivePreviewAddon>().is_some_and(|addon| {
+        addon
+            .image_move
+            .as_ref()
+            .is_some_and(|(_, row)| *row == boundary)
+    });
+    if unchanged {
+        return;
+    }
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.image_move = Some((range.clone(), boundary));
+    }
+    editor.clear_row_highlights::<ImageDropTarget>();
+    if let Some(boundary) = boundary {
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let max_row = snapshot.max_point().row;
+        let cursor = if boundary > max_row {
+            snapshot.max_point()
+        } else {
+            Point::new(boundary, 0)
+        };
+        let cursor = snapshot.point_to_offset(cursor);
+        let row = boundary.min(max_row);
+        let start = snapshot.anchor_before(Point::new(row, 0));
+        let end = snapshot.anchor_after(Point::new(row, snapshot.line_len(MultiBufferRow(row))));
+        editor.highlight_rows::<ImageDropTarget>(
+            start..end,
+            |cx| {
+                let mut color = cx.theme().colors().text_accent;
+                color.a = 0.2;
+                color
+            },
+            RowHighlightOptions {
+                autoscroll: false,
+                include_gutter: true,
+            },
+            cx,
+        );
+        editor.change_selections(
+            editor::SelectionEffects::default().nav_history(false),
+            window,
+            cx,
+            |selections| {
+                selections.select_ranges([cursor..cursor]);
+            },
+        );
+    }
+    cx.notify();
+}
+
+/// Completes an image move: drops the image on the row the pointer last
+/// indicated, and clears the drag's highlight either way. Runs on every mouse
+/// up, so it must be a no-op when no image is being dragged. `dropped` is
+/// false when the gesture ended without a live drag — the pointer was released
+/// after Escape cancelled it — and the tracked position is then only cleared,
+/// never acted on.
+fn finish_image_move(editor: &mut Editor, dropped: bool, cx: &mut Context<Editor>) {
+    let Some((range, target_row)) = editor
+        .addon_mut::<LivePreviewAddon>()
+        .and_then(|addon| addon.image_move.take())
+    else {
+        return;
+    };
+    editor.clear_row_highlights::<ImageDropTarget>();
+    if let Some(target_row) = target_row
+        && dropped
+    {
+        move_image_to_row(editor, &range, target_row, cx);
+    }
+    cx.notify();
+}
+
+/// Moves an image's whole line so it lands above `target_row`, as one undo
+/// step; `target_row` may be one past the last row, meaning the end of the
+/// document. Moving the line rather than the image span is safe because an
+/// image only becomes a block widget when it is alone on its line.
+///
+/// Blank lines are adjusted around both ends so the image stays a block of its
+/// own: dropped against a paragraph it would otherwise join that paragraph, and
+/// lifted out from between two blank lines it would otherwise leave a widening
+/// gap behind.
+fn move_image_to_row(
+    editor: &mut Editor,
+    range: &Range<Anchor>,
+    target_row: u32,
+    cx: &mut Context<Editor>,
+) {
+    if editor.read_only(cx) {
+        return;
+    }
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let row = range.start.to_point(&snapshot).row;
+    let max_row = snapshot.max_point().row;
+    let target_row = target_row.min(max_row + 1);
+    // Landing above its own line, or above the line under it, leaves the image
+    // exactly where it already is.
+    if target_row == row || target_row == row + 1 {
+        return;
+    }
+
+    let line = |row: u32| -> String {
+        let start = Point::new(row, 0);
+        let end = Point::new(row, snapshot.line_len(MultiBufferRow(row)));
+        snapshot.text_for_range(start..end).collect()
+    };
+    let is_blank = |row: u32| line(row).trim().is_empty();
+    let line_text = line(row);
+
+    // The line's own newline travels with it, or the one in front of it when
+    // the image is the last line in the buffer.
+    let cut = if row < max_row {
+        // An image sitting alone between two blank lines takes one of them
+        // with it, so repeated moves do not widen the gap it leaves behind.
+        let stranded_blank = row > 0 && row + 1 < max_row && is_blank(row - 1) && is_blank(row + 1);
+        let cut_end_row = if stranded_blank { row + 2 } else { row + 1 };
+        Point::new(row, 0)..Point::new(cut_end_row, 0)
+    } else if row > 0 {
+        Point::new(row - 1, snapshot.line_len(MultiBufferRow(row - 1)))
+            ..Point::new(row, snapshot.line_len(MultiBufferRow(row)))
+    } else {
+        Point::new(row, 0)..Point::new(row, snapshot.line_len(MultiBufferRow(row)))
+    };
+
+    let (insert_at, insert_text, prefix_len) = if target_row > max_row {
+        let prefix = if is_blank(max_row) { "\n" } else { "\n\n" };
+        (
+            snapshot.max_point(),
+            format!("{prefix}{line_text}"),
+            prefix.len(),
+        )
+    } else {
+        let prefix = if target_row > 0 && !is_blank(target_row - 1) {
+            "\n"
+        } else {
+            ""
+        };
+        let suffix = if is_blank(target_row) { "" } else { "\n" };
+        (
+            Point::new(target_row, 0),
+            format!("{prefix}{line_text}\n{suffix}"),
+            prefix.len(),
+        )
+    };
+
+    let cut = snapshot.point_to_offset(cut.start)..snapshot.point_to_offset(cut.end);
+    let insert_at = snapshot.point_to_offset(insert_at);
+    // Where the image ends up, in the edited buffer: the insertion point, past
+    // any blank line added in front of it, less whatever the cut removed from
+    // above it.
+    let landed_offset = if cut.end <= insert_at {
+        insert_at + prefix_len - (cut.end - cut.start)
+    } else {
+        insert_at + prefix_len
+    };
+    let mut edits = vec![(cut, String::new()), (insert_at..insert_at, insert_text)];
+    edits.sort_by_key(|(range, _)| range.start);
+
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        // The edit refreshes selections, which would otherwise deselect the
+        // widget the reader just dropped.
+        addon.last_resize_at = Some(std::time::Instant::now());
+    }
+    editor.buffer().update(cx, |multibuffer, cx| {
+        multibuffer.edit(edits, None, cx);
+    });
+
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let landed_row = landed_offset.to_point(&snapshot).row;
+    let start = snapshot.anchor_before(Point::new(landed_row, 0));
+    let end = snapshot.anchor_after(Point::new(
+        landed_row,
+        snapshot.line_len(MultiBufferRow(landed_row)),
+    ));
+    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+        addon.selected_image = Some(start..end);
+    }
+}
+
+fn render_references_block(
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    heading: String,
+    items: Vec<(SharedString, SharedString)>,
+    note: Option<ReferencesNote>,
+    indent_columns: u32,
+) -> RenderBlock {
+    let heading = SharedString::from(heading);
+    Arc::new(move |block_cx| {
+        let editor = editor.clone();
+        let start = range.start;
+        let note = note.clone();
+        let text_color = block_cx.app.theme().colors().text;
+        let link_color = block_cx.app.theme().colors().text_accent;
+        let warning_color = block_cx.app.theme().status().warning;
+        let entry_gap = theme_settings::ThemeSettings::get_global(block_cx.app)
+            .buffer_font_size(block_cx.app)
+            * 1.2;
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        // `max_width` includes the editor's horizontal scroll range (see the
+        // table block), so text wrapped to it runs past the viewport. Wrap
+        // to the visible width instead.
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width);
+        let text_width = (visible_width - gutter_width - block_cx.margins.right - gpui::px(38.))
+            .max(gpui::px(200.));
+        div()
+            .pl(gutter_width)
+            .w(block_cx.max_width)
+            .flex()
+            .flex_col()
+            .cursor_pointer()
+            .text_color(text_color)
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor, start),
+            )
+            .child(
+                div()
+                    .w(text_width)
+                    .text_xl()
+                    .font_weight(FontWeight::BOLD)
+                    .pb_2()
+                    .child(heading.clone()),
+            )
+            // Entries wrap at the body's line height and sit Typst's
+            // paragraph spacing (1.2em) apart: enough that the next work
+            // starts visibly after a long author list, less than the blank
+            // line between body paragraphs.
+            .children(items.iter().enumerate().map(|(index, (_, text))| {
+                div()
+                    .w(text_width)
+                    .line_height(block_cx.line_height)
+                    .when(index + 1 < items.len(), |this| this.pb(entry_gap))
+                    .child(text.clone())
+            }))
+            .when_some(note, |this, note| {
+                let url = note.url.clone();
+                this.child(
+                    div()
+                        .w(text_width)
+                        .pt_1()
+                        .flex()
+                        .flex_col()
+                        .items_start()
+                        .text_color(warning_color)
+                        .child(note.text)
+                        .child(
+                            div()
+                                .id("mdlp-references-note-link")
+                                .cursor_pointer()
+                                .text_color(link_color)
+                                .underline()
+                                .child(note.link_label)
+                                // The block above reveals the heading's source
+                                // on mouse down; the link must not.
+                                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        ),
+                )
+            })
+            .into_any_element()
+    })
+}
+
+fn render_rule_block(
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    indent_columns: u32,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let editor = editor.clone();
+        let start = range.start;
+        let border_color = block_cx.app.theme().colors().border;
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        div()
+            .pl(gutter_width)
+            .w(block_cx.max_width)
+            .h(block_cx.line_height)
+            .flex()
+            .items_center()
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor, start),
+            )
+            .child(div().flex_1().h(gpui::px(2.)).bg(border_color))
+            .into_any_element()
+    })
+}
+
+fn open_link(
+    editor: &WeakEntity<Editor>,
+    destination: &LinkDestination,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    match destination {
+        LinkDestination::Wikilink(target) => open_wikilink(editor, target, window, cx),
+        LinkDestination::Markdown(destination) => {
+            open_markdown_link(editor, destination, window, cx)
+        }
+    }
+}
+
+/// Opens a markdown link's destination: a URL goes to the browser, anything
+/// else is a file path relative to the note (absolute paths are taken as
+/// they are), opened in the workspace. A `#fragment` on a file puts the
+/// cursor on the heading it names. A path with no file behind it is reported
+/// in a toast rather than silently doing nothing.
+fn open_markdown_link(
+    editor: &WeakEntity<Editor>,
+    destination: &str,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let destination = destination.trim();
+    if destination.is_empty() {
+        return;
+    }
+    let has_scheme = destination.split_once(':').is_some_and(|(scheme, _)| {
+        !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "+-.".contains(character))
+    });
+    if has_scheme {
+        // Through the OS, a zed:// link would reach Zed itself, since Suzuri
+        // registers suzuri:// instead. Both are Suzuri's own commands here.
+        if destination.starts_with("zed://") || destination.starts_with("suzuri://") {
+            window.dispatch_action(
+                Box::new(zed_actions::OpenZedUrl {
+                    url: destination.into(),
+                }),
+                cx,
+            );
+        } else {
+            cx.open_url(destination);
+        }
+        return;
+    }
+
+    let (path, fragment) = match destination.split_once('#') {
+        Some((path, fragment)) => (path, Some(fragment.to_string())),
+        None => (destination, None),
+    };
+    // Markdown links percent-encode spaces; the filesystem stores them raw.
+    let decoded = urlencoding::decode(path)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| path.to_string());
+    let Some((workspace, project, source_directory)) = editor
+        .read_with(cx, |editor, cx| {
+            Some((
+                editor.workspace()?,
+                editor.project()?.clone(),
+                buffer_base_directory(editor, cx),
+            ))
+        })
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+
+    if decoded.is_empty() {
+        // `[text](#heading)` stays in the current note.
+        if let Some(fragment) = fragment {
+            editor
+                .update(cx, |editor, cx| {
+                    jump_to_heading(editor, &fragment, window, cx)
+                })
+                .log_err();
+        }
+        return;
+    }
+
+    let path = Path::new(&decoded);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        let Some(source_directory) = source_directory else {
+            return;
+        };
+        source_directory.join(path)
+    };
+    let fs = project.read(cx).fs().clone();
+    window
+        .spawn(cx, async move |cx| {
+            if !fs.is_file(&path).await {
+                workspace.update(cx, |workspace, cx| {
+                    workspace.show_toast(
+                        workspace::Toast::new(
+                            workspace::notifications::NotificationId::Named(
+                                "markdown-live-preview-link".into(),
+                            ),
+                            format!("No file at \u{201c}{}\u{201d}.", path.display()),
+                        )
+                        .autohide(),
+                        cx,
+                    );
+                });
+                return anyhow::Ok(());
+            }
+            let open = workspace.update_in(cx, |workspace, window, cx| {
+                // A file inside the project opens as one of its own; anything
+                // else is opened by absolute path, which the workspace adds
+                // as a single-file worktree.
+                match project.read(cx).find_project_path(&path, cx) {
+                    Some(project_path) => workspace.open_path(project_path, None, true, window, cx),
+                    None => workspace.open_abs_path(
+                        path.clone(),
+                        workspace::OpenOptions::default(),
+                        window,
+                        cx,
+                    ),
+                }
+            })?;
+            let item = open.await?;
+            if let Some(fragment) = fragment
+                && let Some(opened) = item.downcast::<Editor>()
+            {
+                opened.update_in(cx, |editor, window, cx| {
+                    jump_to_heading(editor, &fragment, window, cx)
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+}
+
+/// Opens the note a wikilink names, resolved like an embed's target, and
+/// puts the cursor on the heading when the link carries one
+/// (`[[Note#Heading]]`). `[[#Heading]]` names a heading of the current note
+/// and only moves the cursor. A name no note answers to is reported in a
+/// toast rather than silently doing nothing.
+fn open_wikilink(editor: &WeakEntity<Editor>, target: &str, window: &mut Window, cx: &mut App) {
+    let (note, section) = match target.split_once('#') {
+        Some((note, section)) => (note.trim(), Some(section.trim().to_string())),
+        None => (target.trim(), None),
+    };
+    let Some((workspace, project, source_directory)) = editor
+        .read_with(cx, |editor, cx| {
+            Some((
+                editor.workspace()?,
+                editor.project()?.clone(),
+                buffer_base_directory(editor, cx),
+            ))
+        })
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+
+    if note.is_empty() {
+        if let Some(section) = section {
+            editor
+                .update(cx, |editor, cx| {
+                    jump_to_heading(editor, &section, window, cx)
+                })
+                .log_err();
+        }
+        return;
+    }
+
+    let Some((path, _)) = resolve_embed_target(&project, source_directory.as_deref(), note, cx)
+    else {
+        workspace.update(cx, |workspace, cx| {
+            workspace.show_toast(
+                workspace::Toast::new(
+                    workspace::notifications::NotificationId::Named(
+                        "markdown-live-preview-wikilink".into(),
+                    ),
+                    format!("No note named \u{201c}{note}\u{201d} in this project."),
+                )
+                .autohide(),
+                cx,
+            );
+        });
+        return;
+    };
+
+    let open = workspace.update(cx, |workspace, cx| {
+        workspace.open_path(path, None, true, window, cx)
+    });
+    window
+        .spawn(cx, async move |cx| {
+            let item = open.await?;
+            if let Some(section) = section
+                && let Some(opened) = item.downcast::<Editor>()
+            {
+                opened.update_in(cx, |editor, window, cx| {
+                    jump_to_heading(editor, &section, window, cx)
+                })?;
+            }
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+}
+
+/// Moves the cursor to the first heading titled `section` (case-insensitive,
+/// any level), scrolling it into view. Markdown fragments usually spell the
+/// heading as a slug (`#my-heading` for `# My Heading`), so a slug of the
+/// title matches too. A note without that heading is left where it is.
+fn jump_to_heading(
+    editor: &mut Editor,
+    section: &str,
+    window: &mut Window,
+    cx: &mut Context<Editor>,
+) {
+    let wanted = section.to_lowercase();
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let row = (0..=snapshot.max_point().row).find(|row| {
+        let line: String = snapshot
+            .text_for_range(
+                Point::new(*row, 0)..Point::new(*row, snapshot.line_len(MultiBufferRow(*row))),
+            )
+            .collect();
+        heading_title(&line).is_some_and(|(_, title)| {
+            let title = title.to_lowercase();
+            title == wanted || heading_slug(&title) == wanted
+        })
+    });
+    if let Some(row) = row {
+        let start = Point::new(row, 0);
+        editor.change_selections(
+            editor::SelectionEffects::scroll(editor::scroll::Autoscroll::center()),
+            window,
+            cx,
+            |selections| selections.select_ranges([start..start]),
+        );
+    }
+}
+
+/// Opens the note a transclusion is showing, in the workspace the embedding
+/// editor belongs to.
+fn open_embedded_note(
+    editor: &WeakEntity<Editor>,
+    path: ProjectPath,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(workspace) = editor
+        .read_with(cx, |editor, _| editor.workspace())
+        .ok()
+        .flatten()
+    else {
+        return;
+    };
+    workspace.update(cx, |workspace, cx| {
+        workspace
+            .open_path(path, None, true, window, cx)
+            .detach_and_log_err(cx);
+    });
+}
+
+/// Renders a note transclusion as a card: a header naming the note, which
+/// opens it, over the note's own markdown.
+///
+/// The body is loaded asynchronously, so the card also has to draw the two
+/// states that are not content — still loading, and no such note — rather
+/// than collapsing to nothing and leaving the reader with a blank line where
+/// they wrote an embed.
+#[allow(clippy::too_many_arguments)]
+fn render_embed_block(
+    state: EmbedState,
+    label: SharedString,
+    body: Option<Entity<Markdown>>,
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    base_directory: Option<PathBuf>,
+    indent_columns: u32,
+    image_cache: Entity<RetainAllImageCache>,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let colors = block_cx.app.theme().colors();
+        let border_color = colors.border;
+        let muted_color = colors.text_muted;
+        let accent_color = colors.text_accent;
+        let style = block_markdown_style(block_cx.window, block_cx.app);
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        let header_id = block_cx.block_id;
+        let start = range.start;
+        let base_directory = base_directory.clone();
+        let image_cache = image_cache.clone();
+        let body = body.clone();
+        let open_editor = editor.clone();
+        let open_path = match &state {
+            EmbedState::Ready { path, .. } => Some(path.clone()),
+            EmbedState::Loading | EmbedState::Missing => None,
+        };
+        // Accent color promises a click. A target that has not resolved has
+        // nothing to open, so its header recedes instead of lying.
+        let label_color = if open_path.is_some() {
+            accent_color
+        } else {
+            muted_color
+        };
+        let source_click_editor = editor.clone();
+        let source_range = range.clone();
+
+        div()
+            .pl(gutter_width)
+            .w(block_cx.max_width)
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor.clone(), start),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .border_1()
+                    .border_color(border_color)
+                    .rounded_md()
+                    .child(
+                        h_flex()
+                            .id(header_id)
+                            .debug_selector({
+                                let label = label.clone();
+                                move || format!("mdlp-embed-header-{label}")
+                            })
+                            .gap_1p5()
+                            .items_center()
+                            .when_some(open_path, |this, path| {
+                                // Opening the note is the header's job, so it
+                                // claims the click instead of letting the
+                                // wrapper reveal the embed's source.
+                                this.on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.prevent_default()
+                                })
+                                .on_click(move |_, window, cx| {
+                                    open_embedded_note(&open_editor, path.clone(), window, cx);
+                                })
+                            })
+                            .child(
+                                Icon::new(IconName::Link)
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Custom(muted_color)),
+                            )
+                            .child(
+                                div()
+                                    .text_size(
+                                        block_cx
+                                            .window
+                                            .text_style()
+                                            .font_size
+                                            .to_pixels(block_cx.window.rem_size())
+                                            * 0.9,
+                                    )
+                                    .text_color(label_color)
+                                    .child(label.clone()),
+                            ),
+                    )
+                    .map(|this| match (&state, body) {
+                        (EmbedState::Ready { .. }, Some(body)) => this.child(
+                            MarkdownElement::new(body, style)
+                                .image_resolver(move |destination, _cx| {
+                                    resolve_image_source(
+                                        destination,
+                                        base_directory.as_deref(),
+                                        &image_cache,
+                                    )
+                                })
+                                .on_source_click(move |_source_index, _click_count, window, cx| {
+                                    if window.default_prevented() {
+                                        return false;
+                                    }
+                                    // The indices point into the embedded
+                                    // note, not this buffer, so they cannot
+                                    // be mapped to a character here; reveal
+                                    // at the embed's own start instead.
+                                    reveal_at_source_index(
+                                        &source_click_editor,
+                                        &source_range,
+                                        0,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                        ),
+                        (EmbedState::Missing, _) => this.child(
+                            div()
+                                .text_color(muted_color)
+                                .child("No note in this project answers to that name."),
+                        ),
+                        _ => this.child(div().text_color(muted_color).child("Loading\u{2026}")),
+                    }),
+            )
+            .into_any_element()
+    })
+}
+
+/// Renders an Obsidian callout as a tinted card: the type's icon and color, a
+/// title row, and the quote's body with its `>` prefixes stripped.
+///
+/// A collapsible callout's title row claims its own click so it toggles
+/// instead of revealing source, the way a rendered code block's copy button
+/// does. Everything else in the card falls through to the wrapper and reveals
+/// the markdown for editing, like any other block widget.
+#[allow(clippy::too_many_arguments)]
+fn render_callout_block(
+    kind: CalloutKind,
+    title: SharedString,
+    body: Option<Entity<Markdown>>,
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    base_directory: Option<PathBuf>,
+    indent_columns: u32,
+    image_cache: Entity<RetainAllImageCache>,
+    collapsible: bool,
+    collapsed: bool,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let accent = kind.accent(block_cx.app);
+        let style = block_markdown_style(block_cx.window, block_cx.app);
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        // The title row is the only stateful element in the card, so the
+        // block's own id is enough to keep it distinct from every other
+        // callout on screen.
+        let title_id = block_cx.block_id;
+        let start = range.start;
+        let base_directory = base_directory.clone();
+        let image_cache = image_cache.clone();
+        let body = body.clone();
+        let toggle_editor = editor.clone();
+        let toggle_range = range.clone();
+        let source_click_editor = editor.clone();
+        let source_range = range.clone();
+
+        div()
+            .pl(gutter_width)
+            .w(block_cx.max_width)
+            .cursor_pointer()
+            .on_mouse_down(
+                MouseButton::Left,
+                reveal_source_on_mouse_down(editor.clone(), start),
+            )
+            .child(
+                v_flex()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .border_l_2()
+                    .border_color(accent)
+                    .rounded_r_md()
+                    .bg(accent.opacity(0.1))
+                    .child(
+                        h_flex()
+                            .id(title_id)
+                            .debug_selector({
+                                let title = title.clone();
+                                move || format!("mdlp-callout-title-{title}")
+                            })
+                            .gap_1p5()
+                            .items_center()
+                            .when(collapsible, |this| {
+                                this.on_mouse_down(MouseButton::Left, |_, window, _| {
+                                    window.prevent_default()
+                                })
+                                .on_click(move |_, _, cx| {
+                                    toggle_callout(&toggle_editor, &toggle_range, collapsed, cx);
+                                })
+                            })
+                            .child(
+                                Icon::new(kind.icon())
+                                    .size(IconSize::Small)
+                                    .color(Color::Custom(accent)),
+                            )
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::BOLD)
+                                    .text_color(accent)
+                                    .child(title.clone()),
+                            )
+                            .when(collapsible, |this| {
+                                this.child(
+                                    Icon::new(if collapsed {
+                                        IconName::ChevronRight
+                                    } else {
+                                        IconName::ChevronDown
+                                    })
+                                    .size(IconSize::XSmall)
+                                    .color(Color::Custom(accent)),
+                                )
+                            }),
+                    )
+                    .when_some(body, |this, body| {
+                        this.child(
+                            MarkdownElement::new(body, style)
+                                .image_resolver(move |destination, _cx| {
+                                    resolve_image_source(
+                                        destination,
+                                        base_directory.as_deref(),
+                                        &image_cache,
+                                    )
+                                })
+                                .on_source_click(move |_source_index, _click_count, window, cx| {
+                                    if window.default_prevented() {
+                                        return false;
+                                    }
+                                    // The body's indices point into the
+                                    // stripped markdown, which has had a
+                                    // header line and a `>` per line removed,
+                                    // so they do not map back onto buffer
+                                    // characters; reveal at the callout's
+                                    // start instead of at the wrong one.
+                                    reveal_at_source_index(
+                                        &source_click_editor,
+                                        &source_range,
+                                        0,
+                                        window,
+                                        cx,
+                                    )
+                                }),
+                        )
+                    }),
+            )
+            .into_any_element()
+    })
+}
+
+/// Renders display math as a centered formula.
+///
+/// In replace mode (`below == false`) the widget stands in for the source
+/// lines, so while the render is pending — or permanently, if the LaTeX does
+/// not parse — it shows the source text instead: the buffer content must
+/// never disappear. In below mode the source lines are already visible above
+/// the widget, so those states render nothing.
+fn render_math_block(
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    source: SharedString,
+    below: bool,
+    indent_columns: u32,
+) -> RenderBlock {
+    Arc::new(move |block_cx| {
+        let editor = editor.clone();
+        let start = range.start;
+        // The block's origin is the editor's left edge, so centering inside
+        // `max_width` alone would center on the gutter's midpoint rather than
+        // the text's. `max_width` also grows with the horizontal scroll range
+        // a long source line adds, so measure the visible text area instead:
+        // a replace block never extends the editor's scroll range, and a
+        // formula centered past the viewport could not be scrolled to.
+        let gutter_width =
+            block_cx.margins.gutter.full_width() + block_cx.em_width * indent_columns as f32;
+        let visible_width = editor
+            .upgrade()
+            .and_then(|entity| {
+                entity
+                    .read(block_cx.app)
+                    .last_bounds()
+                    .map(|bounds| bounds.size.width)
+            })
+            .unwrap_or(block_cx.max_width + gutter_width);
+        let text_width = (visible_width - gutter_width - block_cx.margins.right)
+            .min(block_cx.max_width)
+            .max(block_cx.em_width);
+        let horizontal_padding = block_cx.em_width;
+        let cx = &mut *block_cx.app;
+        let font_size = theme_settings::ThemeSettings::get_global(cx).buffer_font_size(cx);
+        let text_color = cx.theme().colors().editor_foreground;
+        let key = MathKey {
+            source: source.clone(),
+            style: MathStyle::Display,
+        };
+
+        let content = match cx
+            .try_global::<MathCache>()
+            .and_then(|cache| cache.entries.get(&key))
+        {
+            Some(MathEntry::Ready {
+                svg: document,
+                width_em,
+                height_em,
+                ..
+            }) => {
+                let math_em = font_size * MATH_FONT_SCALE;
+                let size = fit_display_math(
+                    gpui::size(math_em * *width_em, math_em * *height_em),
+                    text_width - horizontal_padding * 2.0,
+                );
+                svg()
+                    .data(document)
+                    .text_color(text_color)
+                    .h(size.height)
+                    .w(size.width)
+                    .into_any_element()
+            }
+            _ if below => Empty.into_any_element(),
+            entry => div()
+                .max_w_full()
+                .child(math_source_fallback(
+                    block_cx.block_id,
+                    source.clone(),
+                    entry,
+                    font_size,
+                    cx,
+                ))
+                .into_any_element(),
+        };
+
+        div()
+            .w(gutter_width + text_width)
+            .pl(gutter_width + horizontal_padding)
+            .pr(horizontal_padding)
+            .py(block_cx.line_height * 0.25)
+            .flex()
+            .justify_center()
+            .items_center()
+            .when(!below, |this| {
+                this.cursor_pointer().on_mouse_down(
+                    MouseButton::Left,
+                    reveal_source_on_mouse_down(editor, start),
+                )
+            })
+            .child(content)
+            .into_any_element()
+    })
+}
+
+/// Shrinks a display formula, keeping its aspect ratio, to the width it is
+/// centered in. A formula that is wider than the text area cannot be centered
+/// in it: flex centering overflows both sides equally, so the left half lands
+/// on the gutter and the right half past the viewport, where nothing can
+/// scroll to it. A formula that fits is returned unchanged.
+fn fit_display_math(
+    size: gpui::Size<gpui::Pixels>,
+    available: gpui::Pixels,
+) -> gpui::Size<gpui::Pixels> {
+    if size.width <= available || size.width <= gpui::Pixels::ZERO {
+        return size;
+    }
+    let scale = f32::from(available.max(gpui::Pixels::ZERO)) / f32::from(size.width);
+    gpui::size(size.width * scale, size.height * scale)
+}
+
+/// Parses frontmatter (YAML `---` or TOML `+++`) into Properties-card rows.
+/// Deliberately shallow: top-level `key: value` lines, inline `[a, b]`
+/// arrays, and block lists. Nested mappings and multi-line scalars stay
+/// unparsed and are edited through the card's `</>` source view.
+fn parse_frontmatter_properties(source: &str) -> Vec<FrontmatterProperty> {
+    let mut lines = Vec::new();
+    let mut offset = 0;
+    for line in source.split('\n') {
+        lines.push((offset, line));
+        offset += line.len() + 1;
+    }
+
+    let mut properties = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let (line_start, line) = lines[index];
+        index += 1;
+        let trimmed = line.trim();
+        if trimmed.is_empty()
+            || trimmed == "---"
+            || trimmed == "+++"
+            || trimmed.starts_with('#')
+            || line.starts_with(char::is_whitespace)
+        {
+            continue;
+        }
+        let Some(separator) = line.find(':').or_else(|| line.find('=')) else {
+            continue;
+        };
+        let key = line[..separator].trim();
+        if key.is_empty() {
+            continue;
+        }
+        let value_start = separator + 1;
+        let raw_value = line[value_start..].trim();
+        let value_span = line_start + value_start..line_start + line.len();
+        let value = if raw_value.is_empty() {
+            let mut items = Vec::new();
+            while let Some((_, next)) = lines.get(index).copied() {
+                let next_trimmed = next.trim();
+                let continues = !next_trimmed.is_empty()
+                    && (next.starts_with(char::is_whitespace) || next_trimmed.starts_with("- "));
+                if !continues {
+                    break;
+                }
+                if let Some(item) = next_trimmed.strip_prefix('-') {
+                    let item = unquote(item.trim());
+                    if !item.is_empty() {
+                        items.push(item.to_string());
+                    }
+                }
+                index += 1;
+            }
+            if items.is_empty() {
+                FrontmatterValue::Scalar(String::new())
+            } else {
+                FrontmatterValue::List(items)
+            }
+        } else if let Some(inner) = raw_value
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            FrontmatterValue::List(
+                inner
+                    .split(',')
+                    .map(|item| unquote(item.trim()).to_string())
+                    .filter(|item| !item.is_empty())
+                    .collect(),
+            )
+        } else {
+            FrontmatterValue::Scalar(unquote(raw_value).to_string())
+        };
+        properties.push(FrontmatterProperty {
+            key: key.to_string(),
+            value_span,
+            value,
+        });
+    }
+    properties
+}
+
+/// Shortens ISO 8601 timestamps for the Properties card. Tools that write
+/// frontmatter from JavaScript store a plain date as `new Date(..)
+/// .toISOString()`, i.e. midnight UTC, so that case shows as the date alone
+/// rather than shifting to the previous day in western timezones. The source
+/// text is untouched; editing the value still shows it verbatim.
+fn display_scalar_property(text: &str) -> String {
+    use chrono::{DateTime, Local, NaiveDateTime, NaiveTime, Utc};
+
+    if let Ok(timestamp) = DateTime::parse_from_rfc3339(text) {
+        let utc = timestamp.with_timezone(&Utc);
+        if utc.time() == NaiveTime::MIN {
+            return utc.format("%Y-%m-%d").to_string();
+        }
+        return timestamp
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string();
+    }
+    if let Ok(timestamp) = NaiveDateTime::parse_from_str(text, "%Y-%m-%dT%H:%M:%S%.f") {
+        return if timestamp.time() == NaiveTime::MIN {
+            timestamp.format("%Y-%m-%d").to_string()
+        } else {
+            timestamp.format("%Y-%m-%d %H:%M").to_string()
+        };
+    }
+    text.to_string()
+}
+
+fn unquote(value: &str) -> &str {
+    for quote in ['"', '\''] {
+        if let Some(inner) = value
+            .strip_prefix(quote)
+            .and_then(|rest| rest.strip_suffix(quote))
+        {
+            return inner;
+        }
+    }
+    value
+}
+
+/// Re-resolves a scalar property's value span from live text (spans captured
+/// at render time go stale whenever an edit lands before the widget
+/// refreshes). Returns the absolute byte range starting right after the
+/// separator, and its current text.
+fn resolve_property_value_span(
+    snapshot: &MultiBufferSnapshot,
+    frontmatter_range: &Range<Anchor>,
+    key: &str,
+) -> Option<(Range<usize>, String)> {
+    let start = frontmatter_range.start.to_offset(snapshot).0;
+    let end = frontmatter_range.end.to_offset(snapshot).0;
+    if start > end || end > snapshot.len().0 {
+        return None;
+    }
+    let source: String = snapshot
+        .text_for_range(MultiBufferOffset(start)..MultiBufferOffset(end))
+        .collect();
+    let property = parse_frontmatter_properties(&source)
+        .into_iter()
+        .find(|property| property.key == key)?;
+    if !matches!(property.value, FrontmatterValue::Scalar(_)) {
+        return None;
+    }
+    let text = source.get(property.value_span.clone())?.to_string();
+    let span = start + property.value_span.start..start + property.value_span.end;
+    Some((span, text))
+}
+
+/// Rewrites `key`'s value in place; used by the bool checkbox toggle.
+fn set_property_value(
+    editor: &WeakEntity<Editor>,
+    frontmatter_range: &Range<Anchor>,
+    key: &str,
+    new_value: &str,
+    cx: &mut App,
+) {
+    editor
+        .update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let Some((span, _)) = resolve_property_value_span(&snapshot, frontmatter_range, key)
+            else {
+                return;
+            };
+            editor.buffer().update(cx, |multibuffer, cx| {
+                multibuffer.edit(
+                    [(
+                        MultiBufferOffset(span.start)..MultiBufferOffset(span.end),
+                        format!(" {new_value}"),
+                    )],
+                    None,
+                    cx,
+                );
+            });
+        })
+        .log_err();
+}
+
+/// Starts editing `key`'s value in place: mounts a focused single-line editor
+/// in the property's row, committing on enter/tab/blur and cancelling on
+/// escape.
+fn start_property_edit(
+    weak_editor: WeakEntity<Editor>,
+    frontmatter_range: Range<Anchor>,
+    key: String,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(main_editor) = weak_editor.upgrade() else {
+        return;
+    };
+    main_editor.update(cx, |editor, cx| {
+        commit_active_property(editor, cx);
+    });
+
+    let snapshot = main_editor.read(cx).buffer().read(cx).snapshot(cx);
+    let Some((_, raw_value)) = resolve_property_value_span(&snapshot, &frontmatter_range, &key)
+    else {
+        return;
+    };
+
+    let property_editor = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_text(raw_value.trim(), window, cx);
+        editor
+    });
+    install_property_editor(
+        weak_editor,
+        main_editor,
+        frontmatter_range,
+        PropertyEditTarget::Value { key },
+        property_editor,
+        window,
+        cx,
+    );
+}
+
+/// Starts the Obsidian-style "Add property" flow: an inline key editor whose
+/// commit inserts a `<key>: ` line, chaining into editing its value.
+fn start_add_property(
+    weak_editor: WeakEntity<Editor>,
+    frontmatter_range: Range<Anchor>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let Some(main_editor) = weak_editor.upgrade() else {
+        return;
+    };
+    main_editor.update(cx, |editor, cx| {
+        commit_active_property(editor, cx);
+    });
+
+    let property_editor = cx.new(|cx| {
+        let mut editor = Editor::single_line(window, cx);
+        editor.set_placeholder_text("Property name", window, cx);
+        editor
+    });
+    install_property_editor(
+        weak_editor,
+        main_editor,
+        frontmatter_range,
+        PropertyEditTarget::NewKey,
+        property_editor,
+        window,
+        cx,
+    );
+}
+
+fn install_property_editor(
+    weak_editor: WeakEntity<Editor>,
+    main_editor: Entity<Editor>,
+    frontmatter_range: Range<Anchor>,
+    target: PropertyEditTarget,
+    property_editor: Entity<Editor>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let mut subscriptions = Vec::new();
+    main_editor.update(cx, |_, cx| {
+        subscriptions.push(cx.subscribe(
+            &property_editor,
+            |editor, blurred, event: &EditorEvent, cx| {
+                // Only commit if this editor is still the active property:
+                // when Enter chains the key editor into the value editor, the
+                // old editor's blur must not commit (and clear) the new one.
+                if matches!(event, EditorEvent::Blurred)
+                    && editor
+                        .addon::<LivePreviewAddon>()
+                        .and_then(|addon| addon.active_property.as_ref())
+                        .is_some_and(|active| active.editor == blurred)
+                {
+                    commit_active_property(editor, cx);
+                }
+            },
+        ));
+    });
+
+    property_editor.update(cx, |editor, _| {
+        let weak = weak_editor.clone();
+        let chain_range = frontmatter_range.clone();
+        subscriptions.push(editor.register_action::<editor::actions::Newline>(
+            move |_, window, cx| {
+                let created_key = weak
+                    .update(cx, |editor, cx| commit_active_property(editor, cx))
+                    .ok()
+                    .flatten();
+                match created_key {
+                    // Enter in the key editor chains straight into editing
+                    // the new property's value, like Obsidian.
+                    Some(key) => {
+                        start_property_edit(weak.clone(), chain_range.clone(), key, window, cx)
+                    }
+                    None => {
+                        weak.update(cx, |editor, cx| refocus_main_editor(editor, window, cx))
+                            .log_err();
+                    }
+                }
+            },
+        ));
+        let weak = weak_editor.clone();
+        subscriptions.push(
+            editor.register_action::<editor::actions::Tab>(move |_, window, cx| {
+                weak.update(cx, |editor, cx| {
+                    commit_active_property(editor, cx);
+                    refocus_main_editor(editor, window, cx);
+                })
+                .log_err();
+            }),
+        );
+        let weak = weak_editor.clone();
+        subscriptions.push(editor.register_action::<editor::actions::Cancel>(
+            move |_, window, cx| {
+                weak.update(cx, |editor, cx| {
+                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        addon.active_property = None;
+                    }
+                    refocus_main_editor(editor, window, cx);
+                    cx.notify();
+                })
+                .log_err();
+            },
+        ));
+    });
+
+    let focus_handle = property_editor.read(cx).focus_handle(cx);
+    window.focus(&focus_handle, cx);
+
+    main_editor.update(cx, |editor, cx| {
+        if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+            addon.active_property = Some(ActivePropertyEdit {
+                frontmatter_range,
+                target,
+                editor: property_editor,
+                _subscriptions: subscriptions,
+            });
+        }
+        cx.notify();
+    });
+}
+
+/// Writes the active property editor's text back into the frontmatter.
+/// Returns the key of a property line the commit just created, so Enter in
+/// the "Add property" key editor can chain into editing its value.
+fn commit_active_property(editor: &mut Editor, cx: &mut Context<Editor>) -> Option<String> {
+    let active = editor
+        .addon_mut::<LivePreviewAddon>()
+        .and_then(|addon| addon.active_property.take())?;
+    let text = active
+        .editor
+        .read(cx)
+        .text(cx)
+        .replace('\n', " ")
+        .trim()
+        .to_string();
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    match active.target {
+        PropertyEditTarget::Value { key } => {
+            let Some((span, current)) =
+                resolve_property_value_span(&snapshot, &active.frontmatter_range, &key)
+            else {
+                cx.notify();
+                return None;
+            };
+            if current.trim() == text {
+                cx.notify();
+                return None;
+            }
+            let replacement = if text.is_empty() {
+                String::new()
+            } else {
+                format!(" {text}")
+            };
+            editor.buffer().update(cx, |multibuffer, cx| {
+                multibuffer.edit(
+                    [(
+                        MultiBufferOffset(span.start)..MultiBufferOffset(span.end),
+                        replacement,
+                    )],
+                    None,
+                    cx,
+                );
+            });
+            cx.notify();
+            None
+        }
+        PropertyEditTarget::NewKey => {
+            let key = text.trim_end_matches(':').trim().to_string();
+            if key.is_empty() || key.contains(':') {
+                cx.notify();
+                return None;
+            }
+            // Insert before the closing delimiter, which is the last line of
+            // the frontmatter block's range.
+            let end_row = active.frontmatter_range.end.to_point(&snapshot).row;
+            let insert_at = Point::new(end_row, 0).to_offset(&snapshot);
+            editor.buffer().update(cx, |multibuffer, cx| {
+                multibuffer.edit([(insert_at..insert_at, format!("{key}: \n"))], None, cx);
+            });
+            cx.notify();
+            Some(key)
+        }
+    }
+}
+
+fn render_frontmatter_block(
+    editor: WeakEntity<Editor>,
+    range: Range<Anchor>,
+    source: String,
+) -> RenderBlock {
+    let properties = Arc::new(parse_frontmatter_properties(&source));
+
+    Arc::new(move |block_cx| {
+        let colors = block_cx.app.theme().colors().clone();
+        let gutter_width = block_cx.margins.gutter.full_width();
+        let max_width = block_cx.max_width;
+
+        // The single-line editor mounted in the row being edited, if any.
+        let active = editor.upgrade().and_then(|entity| {
+            let editor_ref = entity.read(block_cx.app);
+            let snapshot = editor_ref
+                .buffer()
+                .read(block_cx.app)
+                .snapshot(block_cx.app);
+            editor_ref
+                .addon::<LivePreviewAddon>()
+                .and_then(|addon| addon.active_property.as_ref())
+                .filter(|active| {
+                    active.frontmatter_range.start.to_offset(&snapshot)
+                        == range.start.to_offset(&snapshot)
+                })
+                .map(|active| (active.target.clone(), active.editor.clone()))
+        });
+
+        let reveal_source = {
+            let weak = editor.clone();
+            let reveal_range = range.clone();
+            move |window: &mut Window, cx: &mut App| {
+                weak.update(cx, |editor, cx| {
+                    if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                        addon.source_revealed = Some(reveal_range.clone());
+                    }
+                    let snapshot = editor.buffer().read(cx).snapshot(cx);
+                    let offset = reveal_range.start.to_offset(&snapshot);
+                    editor.change_selections(Default::default(), window, cx, |selections| {
+                        selections.select_ranges([offset..offset]);
+                    });
+                })
+                .log_err();
+            }
+        };
+
+        // Reveal the frontmatter's raw source, mirroring the table widget's
+        // `</>` button in its right-hand rail.
+        let source_button = div()
+            .id("mdlp-frontmatter-source")
+            .h(gpui::px(22.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .cursor_pointer()
+            .text_color(colors.text_muted)
+            .opacity(0.)
+            .group_hover("mdlp-frontmatter", |this| this.opacity(0.7))
+            .hover(|this| this.opacity(1.))
+            .child(
+                Icon::new(IconName::Code)
+                    .size(IconSize::XSmall)
+                    .color(Color::Muted),
+            )
+            .tooltip(ui::Tooltip::text("Edit frontmatter source"))
+            .on_mouse_down(MouseButton::Left, {
+                let reveal_source = reveal_source.clone();
+                move |_, window, cx| {
+                    cx.stop_propagation();
+                    reveal_source(window, cx);
+                }
+            });
+
+        // Styled after Zed's own markdown preview, which renders frontmatter
+        // as a bordered two-column table with a muted key column.
+        let mut table = v_flex();
+
+        for (index, property) in properties.iter().enumerate() {
+            let key = property.key.clone();
+            let active_value_editor = match &active {
+                Some((PropertyEditTarget::Value { key: active_key }, active_editor))
+                    if *active_key == key =>
+                {
+                    Some(active_editor.clone())
+                }
+                _ => None,
+            };
+
+            let value_element: AnyElement = if let Some(active_editor) = active_value_editor {
+                div().w_full().child(active_editor).into_any_element()
+            } else {
+                match &property.value {
+                    FrontmatterValue::List(items) => h_flex()
+                        .id(("mdlp-property-list", index))
+                        .flex_wrap()
+                        .gap_1()
+                        .cursor_pointer()
+                        .children(items.iter().map(|item| {
+                            div()
+                                .px_1p5()
+                                .rounded_md()
+                                .bg(colors.element_background)
+                                .child(SharedString::from(item.clone()))
+                        }))
+                        .tooltip(ui::Tooltip::text("Edit list in source"))
+                        .on_mouse_down(MouseButton::Left, {
+                            let reveal_source = reveal_source.clone();
+                            move |_, window, cx| {
+                                cx.stop_propagation();
+                                reveal_source(window, cx);
+                            }
+                        })
+                        .into_any_element(),
+                    FrontmatterValue::Scalar(text) if text == "true" || text == "false" => {
+                        let checked = text == "true";
+                        let weak = editor.clone();
+                        let toggle_range = range.clone();
+                        Checkbox::new(
+                            ("mdlp-property-bool", index),
+                            if checked {
+                                ToggleState::Selected
+                            } else {
+                                ToggleState::Unselected
+                            },
+                        )
+                        .on_click(move |_, _, cx| {
+                            set_property_value(
+                                &weak,
+                                &toggle_range,
+                                &key,
+                                if checked { "false" } else { "true" },
+                                cx,
+                            );
+                        })
+                        .into_any_element()
+                    }
+                    FrontmatterValue::Scalar(text) => {
+                        let weak = editor.clone();
+                        let edit_range = range.clone();
+                        div()
+                            .id(("mdlp-property-value", index))
+                            .w_full()
+                            .px_1()
+                            .rounded_sm()
+                            .cursor_text()
+                            .hover(|this| this.bg(colors.element_hover))
+                            .map(|this| {
+                                if text.is_empty() {
+                                    this.text_color(colors.text_muted).child("Empty")
+                                } else {
+                                    this.child(SharedString::from(display_scalar_property(text)))
+                                }
+                            })
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                cx.stop_propagation();
+                                start_property_edit(
+                                    weak.clone(),
+                                    edit_range.clone(),
+                                    key.clone(),
+                                    window,
+                                    cx,
+                                );
+                            })
+                            .into_any_element()
+                    }
+                }
+            };
+
+            table = table.child(
+                h_flex()
+                    .items_stretch()
+                    .child(
+                        div()
+                            .w(rems(9.))
+                            .px_2()
+                            .py_1()
+                            .border_l_1()
+                            .border_r_1()
+                            .border_b_1()
+                            .when(index == 0, |this| this.border_t_1())
+                            .border_color(colors.border_variant)
+                            .bg(colors.elevated_surface_background)
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child(SharedString::from(property.key.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_2()
+                            .py_1()
+                            .border_r_1()
+                            .border_b_1()
+                            .when(index == 0, |this| this.border_t_1())
+                            .border_color(colors.border_variant)
+                            .flex()
+                            .items_center()
+                            .child(value_element),
+                    ),
+            );
+        }
+
+        let add_property: AnyElement =
+            if let Some((PropertyEditTarget::NewKey, active_editor)) = &active {
+                h_flex()
+                    .gap_1p5()
+                    .items_center()
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child(div().w_full().child(active_editor.clone()))
+                    .into_any_element()
+            } else {
+                let weak = editor.clone();
+                let add_range = range.clone();
+                h_flex()
+                    .id("mdlp-add-property")
+                    .gap_1p5()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_color(colors.text_muted)
+                    .opacity(0.6)
+                    .hover(|this| this.opacity(1.))
+                    .child(
+                        Icon::new(IconName::Plus)
+                            .size(IconSize::XSmall)
+                            .color(Color::Muted),
+                    )
+                    .child("Add property")
+                    .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                        cx.stop_propagation();
+                        start_add_property(weak.clone(), add_range.clone(), window, cx);
+                    })
+                    .into_any_element()
+            };
+        div()
+            .pl(gutter_width)
+            .w(max_width)
+            .pb(gpui::px(4.))
+            .group("mdlp-frontmatter")
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                cx.stop_propagation();
+            })
+            .child(
+                v_flex()
+                    // Zed's markdown preview leaves generous air above the
+                    // frontmatter table; without it the card hugs the tab
+                    // bar. The padding lives on this opaquely-painted wrapper
+                    // rather than the block's outer div: the editor still
+                    // paints the replaced first line's cursor at the block's
+                    // origin, and the background is what keeps that bar from
+                    // showing through the breathing room.
+                    .pt(gpui::px(14.))
+                    .bg(colors.editor_background)
+                    .gap_1()
+                    .text_size(rems(0.85))
+                    .child(
+                        h_flex()
+                            .items_start()
+                            .child(table.flex_grow(1.))
+                            .child(v_flex().w(gpui::px(22.)).child(source_button)),
+                    )
+                    .child(add_property),
+            )
+            .into_any_element()
+    })
+}
+
+/// Extensions live preview treats as images. Shared by the `![[embed]]`
+/// scanner and the on-disk change watcher so the two agree on what counts.
+fn is_image_extension(extension: &str) -> bool {
+    matches!(
+        extension.to_ascii_lowercase().as_str(),
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "bmp"
+    )
+}
+
+fn resolve_image_source(
+    destination: &str,
+    base_directory: Option<&std::path::Path>,
+    image_cache: &Entity<RetainAllImageCache>,
+) -> Option<ImageSource> {
+    if destination.starts_with("data:") {
+        return None;
+    }
+    if destination.starts_with("http://") || destination.starts_with("https://") {
+        return Some(ImageSource::Resource(Resource::Uri(SharedUri::from(
+            destination.to_string(),
+        ))));
+    }
+    let path = local_image_path(destination, base_directory)?;
+    // Deliberately not `ImageSource::Resource`: that reads through gpui's
+    // app-level asset cache, which has no eviction, so a file rewritten in
+    // place would keep serving its first-decoded bitmap. Routing every local
+    // image through the editor's own cache is what makes the eviction in
+    // `register_editor` possible.
+    let resource = Resource::Path(Arc::from(path.as_path()));
+    let image_cache = image_cache.clone();
+    Some(ImageSource::Custom(Arc::new(move |window, cx| {
+        image_cache.update(cx, |image_cache, cx| {
+            image_cache.load(&resource, window, cx)
+        })
+    })))
+}
+
+/// The on-disk file an image link points at, or `None` for remote and
+/// data-URI images and for links whose file does not exist.
+fn local_image_path(destination: &str, base_directory: Option<&Path>) -> Option<PathBuf> {
+    if destination.starts_with("data:")
+        || destination.starts_with("http://")
+        || destination.starts_with("https://")
+    {
+        return None;
+    }
+    // Markdown links percent-encode spaces; the filesystem stores them raw.
+    let decoded = urlencoding::decode(destination)
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| destination.to_string());
+    let path = Path::new(&decoded);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_directory?.join(path)
+    };
+    // Canonicalizing proves the file exists *and* collapses `..` and symlinks,
+    // so a note that spells its image `../images/x.png` keys the cache by the
+    // same path the worktree reports when that file changes. Without it the two
+    // spellings hash differently and the eviction in `register_editor` silently
+    // matches nothing — which is the common case, since a shared `images/`
+    // folder beside the notes is an ordinary vault layout.
+    std::fs::canonicalize(&path).ok()
+}
+
+/// The right-click menu for an image widget. Its reveal entry targets the
+/// image file, where the editor's default menu would target the note.
+fn image_context_menu(
+    image_path: Option<PathBuf>,
+    project: Option<Entity<Project>>,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<ContextMenu> {
+    ContextMenu::build(window, cx, |menu, _, _| {
+        let reveal_path = image_path.clone();
+        menu.item(
+            ContextMenuEntry::new(ui::utils::reveal_in_file_manager_label(false))
+                .disabled(image_path.is_none())
+                .handler(move |_, cx| {
+                    let Some(path) = reveal_path.as_deref() else {
+                        return;
+                    };
+                    match project.as_ref() {
+                        Some(project) => {
+                            project.update(cx, |project, cx| project.reveal_path(path, cx))
+                        }
+                        None => cx.reveal_path(path),
+                    }
+                }),
+        )
+    })
+}
+
+fn block_markdown_style(window: &Window, cx: &App) -> MarkdownStyle {
+    let mut style = MarkdownStyle::themed(MarkdownFont::Editor, window, cx);
+    // A quote marker needs foreground contrast; theme borders can blend into the editor background.
+    let quote_settings = MarkdownLivePreviewSettings::get_global(cx);
+    style.block_quote_border_width = quote_settings.block_quote_border_width.map(gpui::px);
+    style.block_quote_gap = quote_settings.block_quote_gap.map(gpui::px);
+    let colors = cx.theme().colors();
+    style.block_quote_border_color =
+        match MarkdownLivePreviewSettings::get_global(cx).block_quote_border_color {
+            settings::MarkdownQuoteBorderColor::Accent => colors.text_accent,
+            settings::MarkdownQuoteBorderColor::Text => colors.editor_foreground,
+            settings::MarkdownQuoteBorderColor::MutedText => colors.text_muted,
+            settings::MarkdownQuoteBorderColor::LineNumber => colors.editor_line_number,
+        };
+    let settings = theme_settings::ThemeSettings::get_global(cx);
+    let font_family = settings.buffer_font.family.clone();
+    // Rendered prose must retain the source editor's metrics rather than the
+    // UI typography that MarkdownFont::Editor uses for general Markdown views.
+    let typography = TextStyleRefinement {
+        font_family: Some(font_family.clone()),
+        font_features: Some(settings.buffer_font.features.clone()),
+        font_fallbacks: settings.buffer_font.fallbacks.clone(),
+        font_size: Some(settings.buffer_font_size(cx).into()),
+        font_weight: Some(settings.buffer_font.weight),
+        line_height: Some(gpui::relative(settings.buffer_line_height.value())),
+        ..Default::default()
+    };
+    style.base_text_style.refine(&typography);
+    style.base_text_style.font_fallbacks = settings.buffer_font.fallbacks.clone();
+    style.container_style.text = typography;
+    style.paragraph_line_height = gpui::relative(settings.buffer_line_height.value());
+    style.heading.text.font_family = Some(font_family.clone());
+    style.heading.text.color = Some(colors.text);
+
+    let heading = |level| {
+        let metrics = heading_metrics(Some(level), cx);
+        Some(TextStyleRefinement {
+            font_family: Some(font_family.clone()),
+            font_size: Some(metrics.font_size.into()),
+            font_weight: Some(metrics.text.font_weight),
+            color: (level == 6).then_some(cx.theme().colors().text_muted),
+            line_height: Some(metrics.content_line_height.into()),
+            ..Default::default()
+        })
+    };
+    style.heading_level_styles = Some(HeadingLevelStyles {
+        h1: heading(1),
+        h2: heading(2),
+        h3: heading(3),
+        h4: heading(4),
+        h5: heading(5),
+        h6: heading(6),
+    });
+    style
+}
+
+// --- Marker extraction ---
+
+fn extract_markers(editor: &Editor, cx: &App) -> Option<MarkerSet> {
+    let multibuffer = editor.buffer().read(cx);
+    let buffer = multibuffer.as_singleton()?;
+    // Extraction reads tree-sitter's byte offsets, which are buffer-relative,
+    // and anchors them as multibuffer offsets. An expanded diff hunk splices
+    // the deleted rows into the multibuffer's coordinate space, so the two
+    // stop agreeing and every decoration below the hunk lands shifted by the
+    // deleted text's length — replacing the wrong rows and concealing the
+    // wrong spans, which reads as missing text. Reviewing a diff wants
+    // unconcealed source anyway; the preview returns when the hunks collapse
+    // (`DiffHunksToggled` drives that recompute, since collapsing edits no
+    // buffer text and so reparses nothing).
+    if multibuffer.has_expanded_diff_hunks_in_ranges(&[Anchor::Min..Anchor::Max], cx) {
+        return None;
+    }
+    let buffer = buffer.read(cx);
+    let language = buffer.language()?;
+    if language.name() != LanguageName::new(MARKDOWN) {
+        return None;
+    }
+    let buffer_snapshot = buffer.snapshot();
+    let multibuffer_snapshot = editor.buffer().read(cx).snapshot(cx);
+    let text = buffer_snapshot.text();
+
+    let mut extraction = Extraction {
+        text: &text,
+        snapshot: &multibuffer_snapshot,
+        prose_regions: Vec::new(),
+        code_spans: Vec::new(),
+        last_table_end_row: None,
+        references_heading: None,
+        inline: Vec::new(),
+        blocks: Vec::new(),
+        strikethrough: Vec::new(),
+        italic: Vec::new(),
+        bold: Vec::new(),
+        link_text: Vec::new(),
+        definitions: Vec::new(),
+        definition_ranges: Vec::new(),
+        ordered_markers: Vec::new(),
+        citations: Vec::new(),
+        citation_groups: Vec::new(),
+        bare_citations: Vec::new(),
+        highlights: Vec::new(),
+        tags: Vec::new(),
+        code: Vec::new(),
+    };
+
+    for layer in buffer_snapshot.syntax_layers() {
+        let root = layer.node();
+        match layer.language.name().as_ref() {
+            MARKDOWN => extraction.walk_block_layer(root),
+            MARKDOWN_INLINE => extraction.walk_inline_layer(root),
+            _ => {}
+        }
+    }
+
+    extraction.scan_wikilinks();
+    extraction.scan_citations();
+    extraction.scan_footnotes();
+    extraction.scan_highlights();
+    extraction.scan_tags();
+
+    let Extraction {
+        inline,
+        mut blocks,
+        references_heading,
+        strikethrough,
+        italic,
+        bold,
+        link_text,
+        definitions,
+        definition_ranges,
+        ordered_markers,
+        citations,
+        citation_groups,
+        bare_citations,
+        highlights,
+        tags,
+        code,
+        ..
+    } = extraction;
+
+    // Blocks from different layers can overlap (e.g. an image inside a table
+    // row); keep the outermost region and drop any block nested in or
+    // overlapping a previous one.
+    blocks.sort_by(|a, b| {
+        let a_start = a.range.start.to_offset(&multibuffer_snapshot);
+        let b_start = b.range.start.to_offset(&multibuffer_snapshot);
+        a_start.cmp(&b_start).then_with(|| {
+            let a_end = a.range.end.to_offset(&multibuffer_snapshot);
+            let b_end = b.range.end.to_offset(&multibuffer_snapshot);
+            b_end.cmp(&a_end)
+        })
+    });
+    let mut last_end = 0;
+    blocks.retain(|block| {
+        let start = block.range.start.to_offset(&multibuffer_snapshot).0;
+        let end = block.range.end.to_offset(&multibuffer_snapshot).0;
+        if start < last_end {
+            false
+        } else {
+            last_end = end;
+            true
+        }
+    });
+
+    Some(MarkerSet {
+        inline,
+        blocks,
+        references_heading,
+        strikethrough,
+        italic,
+        bold,
+        link_text,
+        definitions: definitions.join("\n"),
+        definition_ranges,
+        ordered_markers,
+        citations,
+        citation_groups,
+        bare_citations,
+        highlights,
+        tags,
+        code,
+    })
+}
+
+struct Extraction<'a> {
+    text: &'a str,
+    snapshot: &'a MultiBufferSnapshot,
+    /// Prose regions (the block grammar's `inline` nodes) and code spans,
+    /// used to scan for wikilinks only where they can occur.
+    prose_regions: Vec<Range<usize>>,
+    code_spans: Vec<Range<usize>>,
+    /// End row of the last table block pushed, for deduplicating table nodes
+    /// that fall inside an already-claimed textual table.
+    last_table_end_row: Option<u32>,
+    inline: Vec<InlineMarker>,
+    blocks: Vec<BlockMarker>,
+    references_heading: Option<Range<Anchor>>,
+    strikethrough: Vec<Range<Anchor>>,
+    italic: Vec<Range<Anchor>>,
+    bold: Vec<Range<Anchor>>,
+    link_text: Vec<Range<Anchor>>,
+    definitions: Vec<String>,
+    definition_ranges: Vec<Range<Anchor>>,
+    ordered_markers: Vec<Range<Anchor>>,
+    citations: Vec<Range<Anchor>>,
+    citation_groups: Vec<Range<Anchor>>,
+    bare_citations: Vec<Range<Anchor>>,
+    highlights: Vec<Range<Anchor>>,
+    tags: Vec<Range<Anchor>>,
+    /// Inline code content (between the backticks), styled like the
+    /// preview's pill: plain text color on a faint background.
+    code: Vec<Range<Anchor>>,
+}
+
+impl Extraction<'_> {
+    fn anchor_range(&self, range: Range<usize>) -> Range<Anchor> {
+        // Bias the anchors inward so text inserted at the boundaries falls
+        // outside the hidden range rather than growing it.
+        self.snapshot.anchor_after(MultiBufferOffset(range.start))
+            ..self.snapshot.anchor_before(MultiBufferOffset(range.end))
+    }
+
+    fn hide(&mut self, range: Range<usize>, reveal_span: Range<usize>) {
+        if range.start < range.end {
+            self.inline.push(InlineMarker {
+                range: self.anchor_range(range),
+                kind: InlineKind::Hide {
+                    reveal_span: self.anchor_range(reveal_span),
+                },
+            });
+        }
+    }
+
+    /// Claims a `latex_block` node (`$x$` or `$$x$$`) as a math marker
+    /// spanning the delimiters as well as the body, so concealing it replaces
+    /// the whole construct with one typeset image.
+    ///
+    /// The grammar treats a run of one or more `$` as the delimiter, so the
+    /// opening run's length is what separates inline from display math.
+    /// Following Obsidian, `$...$` requires a non-space immediately inside
+    /// each delimiter — so prose like "cost $5 and $10" stays prose — while
+    /// `$$...$$` tolerates padding. Display math that sits alone on its lines
+    /// becomes a centered block; mid-line `$$...$$` renders inline (in
+    /// compact text style) because a block replacement would swallow its
+    /// neighbors and display-style layout cannot fit within a line.
+    fn latex(&mut self, node: tree_sitter::Node) {
+        let mut delimiters = Vec::new();
+        for index in 0..node.child_count() {
+            let Some(child) = node.child(index) else {
+                continue;
+            };
+            if child.kind() == "latex_span_delimiter" {
+                delimiters.push(child);
+            }
+        }
+        // An unterminated `$` parses without a closing delimiter; leave it as
+        // plain text so typing a lone dollar sign does not flicker.
+        let (Some(open), Some(close)) = (delimiters.first(), delimiters.last()) else {
+            return;
+        };
+        if delimiters.len() < 2 || open.end_byte() > close.start_byte() {
+            return;
+        }
+
+        let Some(source) = self.text.get(open.end_byte()..close.start_byte()) else {
+            return;
+        };
+        if source.trim().is_empty() {
+            return;
+        }
+
+        let display = open.byte_range().len() >= 2;
+        if !display
+            && (source.starts_with(|c: char| c.is_whitespace())
+                || source.ends_with(|c: char| c.is_whitespace()))
+        {
+            return;
+        }
+
+        if display && self.node_is_alone_on_its_lines(node) {
+            let (start_row, end_row) = self.node_rows(node);
+            let height_estimate = (end_row - start_row + 1).max(2);
+            self.push_block_rows(
+                start_row,
+                end_row,
+                height_estimate,
+                BlockRenderKind::Math {
+                    source: source.to_string(),
+                },
+            );
+            return;
+        }
+
+        self.inline.push(InlineMarker {
+            range: self.anchor_range(node.byte_range()),
+            kind: InlineKind::Math {
+                source: SharedString::from(source.to_string()),
+                // Mid-line `$$...$$` also uses inline (text) style: display
+                // style stacks limits and full-size fractions, which cannot
+                // fit within a fixed-height editor line.
+                style: MathStyle::Inline,
+            },
+        });
+    }
+
+    /// Whether only whitespace shares the node's first and last lines with it.
+    fn node_is_alone_on_its_lines(&self, node: tree_sitter::Node) -> bool {
+        let line_start = self.text[..node.start_byte()]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let line_end = self.text[node.end_byte()..]
+            .find('\n')
+            .map_or(self.text.len(), |index| node.end_byte() + index);
+        let before = self.text.get(line_start..node.start_byte());
+        let after = self.text.get(node.end_byte()..line_end);
+        match (before, after) {
+            (Some(before), Some(after)) => {
+                before.chars().all(char::is_whitespace) && after.chars().all(char::is_whitespace)
+            }
+            _ => false,
+        }
+    }
+
+    /// The row extent of a node, excluding a trailing newline that tree-sitter
+    /// includes in block constructs.
+    fn node_rows(&self, node: tree_sitter::Node) -> (u32, u32) {
+        let start_row = node.start_position().row as u32;
+        let mut end_row = node.end_position().row as u32;
+        if node.end_position().column == 0 && end_row > start_row {
+            end_row -= 1;
+        }
+        (start_row, end_row)
+    }
+
+    /// Remembers the heading block just pushed when it names the reference
+    /// list. The last such heading wins, matching where a reference list
+    /// sits in a manuscript.
+    fn note_references_heading(&mut self, node: tree_sitter::Node) {
+        let title = self
+            .text
+            .get(node.byte_range())
+            .and_then(|text| text.lines().next())
+            .map(plain_heading_text)
+            .unwrap_or_default();
+        if is_references_heading(&title)
+            && let Some(block) = self.blocks.last()
+        {
+            self.references_heading = Some(block.range.clone());
+        }
+    }
+
+    fn push_block_rows(
+        &mut self,
+        start_row: u32,
+        end_row: u32,
+        height_estimate: u32,
+        kind: BlockRenderKind,
+    ) {
+        let start = Point::new(start_row, 0);
+        let end = Point::new(end_row, self.snapshot.line_len(MultiBufferRow(end_row)));
+        let line_start = self.snapshot.point_to_offset(start);
+        let line_end = self.snapshot.point_to_offset(end);
+        let first_line: String = self.snapshot.text_for_range(line_start..line_end).collect();
+        let indent_columns = first_line
+            .chars()
+            .take_while(|character| character.is_whitespace())
+            .map(|character| if character == '\t' { 4 } else { 1 })
+            .sum();
+        let range = self.snapshot.anchor_before(start)..self.snapshot.anchor_after(end);
+        self.blocks.push(BlockMarker {
+            range,
+            height_estimate,
+            kind,
+            indent_columns,
+        });
+    }
+
+    fn walk_block_layer(&mut self, root: tree_sitter::Node) {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "atx_heading" => {
+                    let (start_row, end_row) = self.node_rows(node);
+                    let level = heading_level(node) as u8;
+                    self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Heading { level });
+                    self.note_references_heading(node);
+                }
+                "setext_heading" => {
+                    let (start_row, end_row) = self.node_rows(node);
+                    self.push_block_rows(start_row, end_row, 2, BlockRenderKind::Markdown);
+                    self.note_references_heading(node);
+                }
+                "thematic_break" => {
+                    let (start_row, end_row) = self.node_rows(node);
+                    self.push_block_rows(start_row, end_row, 1, BlockRenderKind::Rule);
+                }
+                "pipe_table" => {
+                    // Extent and structure come from the text parser, not the
+                    // tree: tree-sitter-md chokes on valid GFM like a row of
+                    // all-empty cells, ending the table node early.
+                    let near = MultiBufferOffset(node.start_byte());
+                    match parse_table_at(self.snapshot, near) {
+                        Some((offsets, structure)) => {
+                            let start_row = offsets.start.to_point(self.snapshot).row;
+                            let end_row = offsets.end.to_point(self.snapshot).row;
+                            // One textual table can contain several table
+                            // nodes; only the first one produces the block.
+                            let claimed = self
+                                .last_table_end_row
+                                .is_some_and(|last| start_row <= last);
+                            if !claimed {
+                                self.last_table_end_row = Some(end_row);
+                                self.push_block_rows(
+                                    start_row,
+                                    end_row,
+                                    end_row - start_row + 2,
+                                    BlockRenderKind::Table(structure),
+                                );
+                            }
+                        }
+                        None => {
+                            let (start_row, end_row) = self.node_rows(node);
+                            self.push_block_rows(
+                                start_row,
+                                end_row,
+                                end_row - start_row + 2,
+                                BlockRenderKind::Markdown,
+                            );
+                        }
+                    }
+                }
+                "fenced_code_block" => {
+                    let (start_row, end_row) = self.node_rows(node);
+                    self.push_block_rows(
+                        start_row,
+                        end_row,
+                        end_row - start_row + 2,
+                        BlockRenderKind::Markdown,
+                    );
+                }
+                "minus_metadata" | "plus_metadata" => {
+                    let (start_row, end_row) = self.node_rows(node);
+                    // The card adds a "Properties" header and an "Add
+                    // property" row beyond the property lines themselves.
+                    self.push_block_rows(
+                        start_row,
+                        end_row,
+                        end_row - start_row + 2,
+                        BlockRenderKind::Frontmatter,
+                    );
+                }
+                "html_block" => {
+                    let (start_row, end_row) = self.node_rows(node);
+                    self.push_block_rows(
+                        start_row,
+                        end_row,
+                        end_row - start_row + 1,
+                        BlockRenderKind::Markdown,
+                    );
+                }
+                "block_quote" => {
+                    let (start_row, end_row) = self.node_rows(node);
+                    let header = self
+                        .text
+                        .get(node.byte_range())
+                        .and_then(|text| text.lines().next())
+                        .and_then(parse_callout_header);
+                    let (kind, height) = match header {
+                        Some((kind, title, collapse)) => (
+                            BlockRenderKind::Callout {
+                                kind,
+                                title,
+                                collapse,
+                            },
+                            // The same row count a plain block quote uses.
+                            // A card looks taller than its source — padding,
+                            // a title row — but its body is markdown, where
+                            // consecutive quoted lines collapse into one
+                            // wrapped paragraph, so it usually is not.
+                            // Guessing high made every callout on screen
+                            // need a resize round, and enough of them at
+                            // once exhausted the editor's prepaint depth.
+                            end_row - start_row + 1,
+                        ),
+                        None => (BlockRenderKind::Markdown, end_row - start_row + 1),
+                    };
+                    self.push_block_rows(start_row, end_row, height, kind);
+                    push_children(node, &mut stack);
+                }
+                "link_reference_definition" => {
+                    if let Some(text) = self.text.get(node.byte_range()) {
+                        self.definitions.push(text.trim_end().to_string());
+                    }
+                    let trimmed_len = self
+                        .text
+                        .get(node.byte_range())
+                        .map_or(0, |text| text.trim_end().len());
+                    if trimmed_len > 0 {
+                        let start = node.start_byte();
+                        let range = self.anchor_range(start..start + trimmed_len);
+                        self.definition_ranges.push(range);
+                    }
+                }
+                "list_item" => {
+                    self.list_item_markers(node);
+                    push_children(node, &mut stack);
+                }
+                "inline" => self.prose_regions.push(node.byte_range()),
+                _ => push_children(node, &mut stack),
+            }
+        }
+    }
+
+    fn list_item_markers(&mut self, node: tree_sitter::Node) {
+        let mut list_marker = None;
+        let mut task_marker = None;
+        for index in 0..node.child_count() {
+            let Some(child) = node.child(index) else {
+                continue;
+            };
+            match child.kind() {
+                "list_marker_minus" | "list_marker_plus" | "list_marker_star" => {
+                    list_marker = Some(child);
+                }
+                "list_marker_dot" | "list_marker_parenthesis" => {
+                    let Some(marker_text) = self.text.get(child.byte_range()) else {
+                        continue;
+                    };
+                    let trimmed_len = marker_text.trim_end().len();
+                    if trimmed_len > 0 {
+                        let start = child.start_byte();
+                        let range = self.anchor_range(start..start + trimmed_len);
+                        self.ordered_markers.push(range);
+                    }
+                }
+                "task_list_marker_checked" => task_marker = Some((child, true)),
+                "task_list_marker_unchecked" => task_marker = Some((child, false)),
+                _ => {}
+            }
+        }
+
+        let Some(list_marker) = list_marker else {
+            return;
+        };
+
+        if let Some((task_node, checked)) = task_marker {
+            let range = list_marker.start_byte()..task_node.end_byte();
+            let marker_range = self.anchor_range(task_node.byte_range());
+            self.inline.push(InlineMarker {
+                range: self.anchor_range(range),
+                kind: InlineKind::Checkbox {
+                    checked,
+                    marker_range,
+                },
+            });
+        } else {
+            let Some(marker_text) = self.text.get(list_marker.byte_range()) else {
+                return;
+            };
+            let trimmed_len = marker_text.trim_end().len();
+            if trimmed_len == 0 {
+                return;
+            }
+            let start = list_marker.start_byte();
+            self.inline.push(InlineMarker {
+                range: self.anchor_range(start..start + trimmed_len),
+                kind: InlineKind::Bullet,
+            });
+        }
+    }
+
+    fn walk_inline_layer(&mut self, root: tree_sitter::Node) {
+        let mut stack = vec![root];
+        while let Some(node) = stack.pop() {
+            match node.kind() {
+                "emphasis" | "strong_emphasis" | "strikethrough" => {
+                    let range = self.anchor_range(node.byte_range());
+                    match node.kind() {
+                        "strikethrough" => self.strikethrough.push(range),
+                        "emphasis" => self.italic.push(range),
+                        _ => self.bold.push(range),
+                    }
+                    for index in 0..node.child_count() {
+                        let Some(child) = node.child(index) else {
+                            continue;
+                        };
+                        if child.kind() == "emphasis_delimiter" {
+                            self.hide(child.byte_range(), node.byte_range());
+                        }
+                    }
+                    push_children(node, &mut stack);
+                }
+                "latex_block" => {
+                    self.latex(node);
+                }
+                "code_span" => {
+                    self.code_spans.push(node.byte_range());
+                    let mut content = node.byte_range();
+                    for index in 0..node.child_count() {
+                        let Some(child) = node.child(index) else {
+                            continue;
+                        };
+                        if child.kind() == "code_span_delimiter" {
+                            let delimiter = child.byte_range();
+                            if delimiter.start == content.start {
+                                content.start = delimiter.end;
+                            } else {
+                                content.end = content.end.min(delimiter.start);
+                            }
+                            self.hide(delimiter, node.byte_range());
+                        }
+                    }
+                    if content.start < content.end {
+                        let range = self.anchor_range(content);
+                        self.code.push(range);
+                    }
+                }
+                "inline_link" | "full_reference_link" | "collapsed_reference_link" => {
+                    let mut open_bracket = None;
+                    let mut close_bracket = None;
+                    for index in 0..node.child_count() {
+                        let Some(child) = node.child(index) else {
+                            continue;
+                        };
+                        match child.kind() {
+                            "[" if open_bracket.is_none() => open_bracket = Some(child),
+                            "]" => close_bracket = Some(child),
+                            _ => {}
+                        }
+                    }
+                    // A standalone link wrapping an image renders as an image
+                    // widget built from just the inner image markdown: the
+                    // markdown renderer degrades a link-wrapped image to
+                    // literal text (the preview pane has the same limit). The
+                    // image sits under a `link_text` node, not directly under
+                    // the link.
+                    let wrapped_image = (0..node.child_count())
+                        .filter_map(|index| node.child(index))
+                        .find_map(|child| {
+                            if child.kind() == "image" {
+                                Some(child)
+                            } else if child.kind() == "link_text" {
+                                (0..child.child_count())
+                                    .filter_map(|index| child.child(index))
+                                    .find(|grandchild| grandchild.kind() == "image")
+                            } else {
+                                None
+                            }
+                        });
+                    if let (Some(open), Some(close)) = (open_bracket, close_bracket)
+                        && open.end_byte() < close.start_byte()
+                    {
+                        let range = self.anchor_range(open.end_byte()..close.start_byte());
+                        self.link_text.push(range);
+                    }
+                    // A link with a destination and plain text becomes a
+                    // click target that opens it. Link text carrying its own
+                    // markup (`[**bold**](x)`) keeps the bracket-only
+                    // concealment below, which renders that markup, since the
+                    // click target draws its label as plain text.
+                    let destination = (node.kind() == "inline_link" && wrapped_image.is_none())
+                        .then(|| self.link_node_destination(node))
+                        .flatten();
+                    let plain_label = match (open_bracket, close_bracket) {
+                        (Some(open), Some(close)) => self
+                            .text
+                            .get(open.end_byte()..close.start_byte())
+                            .map(str::trim)
+                            .filter(|label| {
+                                !label.is_empty()
+                                    && !label
+                                        .contains(['*', '_', '`', '[', ']', '!', '<', '\\', '\n'])
+                            }),
+                        _ => None,
+                    };
+                    if let (Some(destination), Some(label)) = (destination, plain_label) {
+                        self.inline.push(InlineMarker {
+                            range: self.anchor_range(node.byte_range()),
+                            kind: InlineKind::Link {
+                                destination: LinkDestination::Markdown(SharedString::from(
+                                    destination,
+                                )),
+                                label: SharedString::from(label.to_string()),
+                            },
+                        });
+                        push_children(node, &mut stack);
+                        continue;
+                    }
+                    if let Some(open) = open_bracket {
+                        self.hide(open.byte_range(), node.byte_range());
+                    }
+                    if let Some(close) = close_bracket {
+                        self.hide(close.start_byte()..node.end_byte(), node.byte_range());
+                    }
+                    if let Some(image_node) = wrapped_image
+                        && self.is_alone_on_line(node)
+                    {
+                        let image_range = image_node.byte_range();
+                        let range = self
+                            .snapshot
+                            .anchor_before(MultiBufferOffset(image_range.start))
+                            ..self
+                                .snapshot
+                                .anchor_after(MultiBufferOffset(image_range.end));
+                        let kind = self.image_kind(image_node);
+                        self.blocks.push(BlockMarker {
+                            range,
+                            height_estimate: 8,
+                            kind,
+                            indent_columns: 0,
+                        });
+                    }
+                    push_children(node, &mut stack);
+                }
+                "uri_autolink" | "email_autolink" => {
+                    let range = node.byte_range();
+                    if range.len() < 2 {
+                        continue;
+                    }
+                    let inner = range.start + 1..range.end - 1;
+                    match self.text.get(inner.clone()).map(str::trim) {
+                        // `<https://..>` opens like any other link; the
+                        // angle brackets are its only syntax.
+                        Some(url) if node.kind() == "uri_autolink" && !url.is_empty() => {
+                            self.inline.push(InlineMarker {
+                                range: self.anchor_range(range.clone()),
+                                kind: InlineKind::Link {
+                                    destination: LinkDestination::Markdown(SharedString::from(
+                                        url.to_string(),
+                                    )),
+                                    label: SharedString::from(url.to_string()),
+                                },
+                            });
+                        }
+                        _ => {
+                            self.hide(range.start..range.start + 1, range.clone());
+                            self.hide(range.end - 1..range.end, range.clone());
+                        }
+                    }
+                }
+                "image" => {
+                    // `![[...]]` is an Obsidian embed, not a markdown image;
+                    // `embed_image_block` (via `scan_wikilinks`) renders it.
+                    if self
+                        .text
+                        .get(node.byte_range())
+                        .is_some_and(|text| text.starts_with("![["))
+                    {
+                        continue;
+                    }
+                    if self.is_alone_on_line(node) {
+                        self.image_block(node);
+                    } else if let Some(description) = (0..node.child_count())
+                        .filter_map(|index| node.child(index))
+                        .find(|child| child.kind() == "image_description")
+                    {
+                        // The image itself cannot render mid-line, but the
+                        // alt text can: conceal `![` and `](url)` like links.
+                        self.hide(
+                            node.start_byte()..description.start_byte(),
+                            node.byte_range(),
+                        );
+                        self.hide(description.end_byte()..node.end_byte(), node.byte_range());
+                    }
+                }
+                _ => push_children(node, &mut stack),
+            }
+        }
+    }
+
+    /// Conceal Obsidian-style wikilinks: `[[Note]]`, `[[Note|alias]]`, and
+    /// `[[Note#heading]]`. Zed's markdown grammar has no wikilink nodes, so
+    /// this scans the prose regions directly, skipping code spans; embeds
+    /// (`![[...]]`) are left raw.
+    fn scan_wikilinks(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            let mut search_from = 0;
+            while let Some(open_offset) = region_text[search_from..].find("[[") {
+                let open = search_from + open_offset;
+                let Some(close_offset) = region_text[open + 2..].find("]]") else {
+                    break;
+                };
+                let close = open + 2 + close_offset;
+                search_from = close + 2;
+
+                let inner = &region_text[open + 2..close];
+                if inner.is_empty() || inner.contains('\n') || inner.contains("[[") {
+                    continue;
+                }
+                let is_embed = region_text[..open].ends_with('!');
+                let start = region.start + open;
+                let end = region.start + close + 2;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                if is_embed {
+                    self.embed_block(start - 1, end, inner);
+                    continue;
+                }
+
+                // `[[target|alias]]` shows only the alias. The link text is
+                // also colored as a link for when the cursor reveals the raw
+                // `[[..]]`.
+                let (target, label, label_start) = match inner.find('|') {
+                    Some(pipe) => (&inner[..pipe], &inner[pipe + 1..], start + 2 + pipe + 1),
+                    None => (inner, inner, start + 2),
+                };
+                let range = self.anchor_range(label_start..end - 2);
+                self.link_text.push(range);
+                self.inline.push(InlineMarker {
+                    range: self.anchor_range(start..end),
+                    kind: InlineKind::Link {
+                        destination: LinkDestination::Wikilink(SharedString::from(
+                            target.trim().to_string(),
+                        )),
+                        label: SharedString::from(label.trim().to_string()),
+                    },
+                });
+            }
+        }
+        self.prose_regions = regions;
+    }
+
+    /// Renders an Obsidian embed as a block widget when it is the only
+    /// content on its line; inline embeds stay raw.
+    ///
+    /// A target that names an image (`![[photo.png]]`, with Obsidian's
+    /// `![[photo.png|640]]` width syntax) becomes an image block, resolved
+    /// like a regular markdown image destination — relative to the buffer's
+    /// directory. Anything else is a note transclusion (`![[Some Note]]`,
+    /// `![[Some Note#Part]]`), whose target is a note name resolved against
+    /// the whole project rather than a path.
+    fn embed_block(&mut self, embed_start: usize, embed_end: usize, inner: &str) {
+        let row = self
+            .snapshot
+            .offset_to_point(MultiBufferOffset(embed_start))
+            .row;
+        let line_start = self.snapshot.point_to_offset(Point::new(row, 0));
+        let line_end = self
+            .snapshot
+            .point_to_offset(Point::new(row, self.snapshot.line_len(MultiBufferRow(row))));
+        let line_text: String = self.snapshot.text_for_range(line_start..line_end).collect();
+        let embed_text = self.text.get(embed_start..embed_end).unwrap_or_default();
+        if line_text.trim() != embed_text.trim() {
+            return;
+        }
+
+        let (target, size) = match inner.split_once('|') {
+            Some((target, size)) => (target.trim(), Some(size)),
+            None => (inner.trim(), None),
+        };
+        let is_image = Path::new(target)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(is_image_extension);
+        if is_image {
+            let display_width = size
+                .map(|size| {
+                    size.chars()
+                        .take_while(|character| character.is_ascii_digit())
+                        .collect::<String>()
+                })
+                .and_then(|width| width.parse::<f32>().ok())
+                .filter(|width| *width > 0.);
+            self.push_block_rows(
+                row,
+                row,
+                8,
+                BlockRenderKind::Image {
+                    display_width,
+                    destination: Some(target.to_string()),
+                    alt: String::new(),
+                },
+            );
+            return;
+        }
+
+        let (target, section) = match target.split_once('#') {
+            Some((target, section)) => (target.trim(), Some(section.trim().to_string())),
+            None => (target, None),
+        };
+        // `![[#Heading]]`, an embed of the current note's own section, needs
+        // no resolution and is not handled here.
+        if target.is_empty() {
+            return;
+        }
+        self.push_block_rows(
+            row,
+            row,
+            6,
+            BlockRenderKind::Embed {
+                target: target.to_string(),
+                section,
+            },
+        );
+    }
+
+    /// Conceal pandoc-style citations: `[@key]`, `[-@key]`, and citation
+    /// groups like `[see @doe2020, p. 3; also @roe2021]`. The markdown
+    /// grammar has no citation nodes (it parses `[@key]` as a shortcut
+    /// link), so like wikilinks this scans the prose regions directly,
+    /// skipping code spans. Brackets that are really links (`[@key](url)`,
+    /// `[@key][label]`) are left to the link machinery, and brackets with no
+    /// valid `@key` are left raw.
+    fn scan_citations(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            let mut search_from = 0;
+            // Every `[...]` span seen, kept or not, so the bare pass below
+            // never claims a key inside a bracket construct (a rejected
+            // group, a link label, a wikilink).
+            let mut bracket_spans: Vec<Range<usize>> = Vec::new();
+            while let Some(open_offset) = region_text[search_from..].find('[') {
+                let open = search_from + open_offset;
+                search_from = open + 1;
+                let Some(close_offset) = region_text[open + 1..].find(']') else {
+                    break;
+                };
+                let close = open + 1 + close_offset;
+                bracket_spans.push(open..close + 1);
+                let inner = &region_text[open + 1..close];
+                if inner.is_empty() || inner.contains('\n') || inner.contains('[') {
+                    continue;
+                }
+                // A preceding `[`, `!`, or `]` makes this bracket part of a
+                // wikilink, image, or reference link's label instead.
+                if matches!(
+                    region_text[..open].chars().last(),
+                    Some('[') | Some('!') | Some(']')
+                ) {
+                    continue;
+                }
+                // `[...](url)` and `[...][label]` are links, not citations.
+                if matches!(
+                    region_text[close + 1..].chars().next(),
+                    Some('(') | Some('[')
+                ) {
+                    continue;
+                }
+                let keys = citation_keys(inner);
+                if keys.is_empty() {
+                    continue;
+                }
+                let start = region.start + open;
+                let end = region.start + close + 1;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+
+                let reveal = start..end;
+                self.hide(start..start + 1, reveal.clone());
+                self.hide(end - 1..end, reveal.clone());
+                self.citation_groups.push(self.anchor_range(start..end));
+                for key in keys {
+                    let range = self.anchor_range(start + 1 + key.start..start + 1 + key.end);
+                    self.citations.push(range);
+                }
+                search_from = close + 1;
+            }
+
+            // Pandoc also allows in-text citations with no brackets
+            // (`@hayashi2003 argues`), which is what accepting a bare `@`
+            // completion produces. `citation_keys`'s boundary rules already
+            // reject an email's or URL's infix `@`.
+            for key in citation_keys(region_text) {
+                if bracket_spans
+                    .iter()
+                    .any(|span| span.start < key.end && key.start < span.end)
+                {
+                    continue;
+                }
+                let start = region.start + key.start;
+                let end = region.start + key.end;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                self.bare_citations.push(self.anchor_range(start..end));
+            }
+        }
+        self.prose_regions = regions;
+    }
+
+    /// Conceal footnote references (`[^label]`), rendering each as a raised
+    /// chip carrying the label. The markdown grammar has no footnote nodes, so
+    /// like wikilinks this scans the prose regions directly, skipping code
+    /// spans.
+    ///
+    /// A definition (`[^label]: text` at the start of a line) is not a
+    /// reference: concealing its marker would leave a bare paragraph with no
+    /// sign of which footnote it defines, so it recedes like a link reference
+    /// definition instead of disappearing.
+    fn scan_footnotes(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            let mut search_from = 0;
+            while let Some(open_offset) = region_text[search_from..].find("[^") {
+                let open = search_from + open_offset;
+                search_from = open + 2;
+                let Some(close_offset) = region_text[open + 2..].find(']') else {
+                    break;
+                };
+                let close = open + 2 + close_offset;
+                let label = &region_text[open + 2..close];
+                if label.is_empty() || label.contains(char::is_whitespace) || label.contains('[') {
+                    continue;
+                }
+                let start = region.start + open;
+                let end = region.start + close + 1;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                search_from = close + 1;
+
+                let line_start = self.text[..start].rfind('\n').map_or(0, |index| index + 1);
+                let is_definition = self.text[line_start..start]
+                    .chars()
+                    .all(char::is_whitespace)
+                    && self.text[end..].starts_with(':');
+                if is_definition {
+                    let range = self.anchor_range(start..end + 1);
+                    self.definition_ranges.push(range);
+                    continue;
+                }
+
+                let range = self.anchor_range(start..end);
+                self.inline.push(InlineMarker {
+                    range,
+                    kind: InlineKind::Footnote {
+                        label: SharedString::from(label.to_string()),
+                    },
+                });
+            }
+        }
+        self.prose_regions = regions;
+    }
+
+    /// Conceal Obsidian's `==highlight==` marks, leaving the body painted with
+    /// a highlighter background. The markdown grammar has no highlight node,
+    /// so like wikilinks this scans the prose regions directly, skipping code
+    /// spans.
+    fn scan_highlights(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            let mut search_from = 0;
+            while let Some(open_offset) = region_text[search_from..].find("==") {
+                let open = search_from + open_offset;
+                search_from = open + 2;
+                let Some(close_offset) = region_text[open + 2..].find("==") else {
+                    break;
+                };
+                let close = open + 2 + close_offset;
+                let inner = &region_text[open + 2..close];
+                // Delimiters bind tightly, as emphasis does: without this,
+                // prose comparing two values ("a == b == c") reads as a mark.
+                if inner.is_empty()
+                    || inner.contains('\n')
+                    || inner.starts_with(char::is_whitespace)
+                    || inner.ends_with(char::is_whitespace)
+                {
+                    continue;
+                }
+                let start = region.start + open;
+                let end = region.start + close + 2;
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                search_from = close + 2;
+
+                let reveal = start..end;
+                self.hide(start..start + 2, reveal.clone());
+                self.hide(end - 2..end, reveal);
+                let range = self.anchor_range(start + 2..end - 2);
+                self.highlights.push(range);
+            }
+        }
+        self.prose_regions = regions;
+    }
+
+    /// Style Obsidian tags (`#tag`, `#area/topic`) as chips. A tag is the one
+    /// inline construct with no syntax to hide — the `#` is part of its name —
+    /// so it is only highlighted.
+    ///
+    /// A heading can never be mistaken for a tag: `walk_block_layer` claims
+    /// `atx_heading` without descending into it, so a heading's text never
+    /// becomes a prose region in the first place.
+    fn scan_tags(&mut self) {
+        let regions = std::mem::take(&mut self.prose_regions);
+        for region in &regions {
+            let Some(region_text) = self.text.get(region.clone()) else {
+                continue;
+            };
+            for (hash, _) in region_text.match_indices('#') {
+                // A tag has to open a word. This is what keeps a URL fragment
+                // (`example.com/#top`) and a wikilink's heading target
+                // (`[[Note#section]]`) from reading as tags.
+                let opens_word = match region_text[..hash].chars().last() {
+                    None => true,
+                    Some(character) => character.is_whitespace(),
+                };
+                if !opens_word {
+                    continue;
+                }
+                let body: String = region_text[hash + 1..]
+                    .chars()
+                    .take_while(|character| {
+                        character.is_alphanumeric() || matches!(character, '_' | '-' | '/')
+                    })
+                    .collect();
+                // Trailing separators belong to the prose, not the tag.
+                let body = body.trim_end_matches(['-', '/']);
+                // `#1` is an issue reference or a heading level; Obsidian
+                // likewise requires at least one non-numeric character.
+                if body.is_empty() || body.chars().all(|character| character.is_numeric()) {
+                    continue;
+                }
+                let start = region.start + hash;
+                let end = start + 1 + body.len();
+                if self
+                    .code_spans
+                    .iter()
+                    .any(|span| span.start < end && start < span.end)
+                {
+                    continue;
+                }
+                let range = self.anchor_range(start..end);
+                self.tags.push(range);
+            }
+        }
+        self.prose_regions = regions;
+    }
+
+    /// Whether this single-line node is the only content on its line.
+    fn is_alone_on_line(&self, node: tree_sitter::Node) -> bool {
+        if node.start_position().row != node.end_position().row {
+            return false;
+        }
+        let row = node.start_position().row as u32;
+        let line_start = self.snapshot.point_to_offset(Point::new(row, 0));
+        let line_end = self
+            .snapshot
+            .point_to_offset(Point::new(row, self.snapshot.line_len(MultiBufferRow(row))));
+        let line_text: String = self.snapshot.text_for_range(line_start..line_end).collect();
+        self.text
+            .get(node.byte_range())
+            .is_some_and(|node_text| line_text.trim() == node_text.trim())
+    }
+
+    /// Obsidian's image size syntax: `![alt|640](p)` or `![alt|640x480](p)`.
+    fn image_display_width(&self, image_node: tree_sitter::Node) -> Option<f32> {
+        let (_, size) = self.image_alt(image_node)?.rsplit_once('|')?;
+        let width: String = size.chars().take_while(|c| c.is_ascii_digit()).collect();
+        width.parse::<f32>().ok().filter(|width| *width > 0.)
+    }
+
+    fn image_alt(&self, image_node: tree_sitter::Node) -> Option<&str> {
+        let description = (0..image_node.child_count())
+            .filter_map(|index| image_node.child(index))
+            .find(|child| child.kind() == "image_description")?;
+        self.text.get(description.byte_range())
+    }
+
+    /// A link's destination as written, or `None` for a link without one
+    /// (`[text]()`).
+    fn link_node_destination(&self, link_node: tree_sitter::Node) -> Option<String> {
+        let destination = (0..link_node.child_count())
+            .filter_map(|index| link_node.child(index))
+            .find(|child| child.kind() == "link_destination")?;
+        self.text
+            .get(destination.byte_range())
+            .map(str::trim)
+            .filter(|destination| !destination.is_empty())
+            .map(|destination| destination.to_string())
+    }
+
+    fn image_destination(&self, image_node: tree_sitter::Node) -> Option<String> {
+        let destination = (0..image_node.child_count())
+            .filter_map(|index| image_node.child(index))
+            .find(|child| child.kind() == "link_destination")?;
+        self.text
+            .get(destination.byte_range())
+            .map(|text| text.to_string())
+    }
+
+    fn image_kind(&self, image_node: tree_sitter::Node) -> BlockRenderKind {
+        let alt = self
+            .image_alt(image_node)
+            .map(|alt| alt.rsplit_once('|').map_or(alt, |(base, _)| base))
+            .unwrap_or_default()
+            .to_string();
+        BlockRenderKind::Image {
+            display_width: self.image_display_width(image_node),
+            destination: self.image_destination(image_node),
+            alt,
+        }
+    }
+
+    /// Renders an image as a block widget when it is the only content on its
+    /// line; inline images are left as raw markdown.
+    fn image_block(&mut self, node: tree_sitter::Node) {
+        if self.is_alone_on_line(node) {
+            let row = node.start_position().row as u32;
+            let kind = self.image_kind(node);
+            self.push_block_rows(row, row, 8, kind);
+        }
+    }
+}
+
+/// Byte ranges (relative to a citation group's inner text, `@` included) of
+/// the valid pandoc citation keys it contains. An `@` only starts a key at an
+/// item boundary — the group start, after whitespace, `;`, or a `-` (author
+/// suppression) — so an email address in brackets does not read as a
+/// citation. Key syntax follows pandoc: a leading alphanumeric or `_`, then
+/// alphanumerics with internal punctuation.
+fn citation_keys(inner: &str) -> Vec<Range<usize>> {
+    let mut keys = Vec::new();
+    for (at, _) in inner.match_indices('@') {
+        let boundary = match inner[..at].chars().last() {
+            None => true,
+            Some(character) => character.is_whitespace() || character == ';' || character == '-',
+        };
+        if !boundary {
+            continue;
+        }
+        let after = &inner[at + 1..];
+        let mut length = 0;
+        for character in after.chars() {
+            let internal_punctuation = matches!(
+                character,
+                ':' | '.' | '#' | '$' | '%' | '&' | '-' | '+' | '?' | '<' | '>' | '~' | '/'
+            );
+            if character.is_ascii_alphanumeric() || character == '_' || internal_punctuation {
+                length += character.len_utf8();
+            } else {
+                break;
+            }
+        }
+        // Punctuation is only valid inside a key, not at its edges.
+        let key = after[..length].trim_end_matches(|character: char| {
+            !(character.is_ascii_alphanumeric() || character == '_')
+        });
+        if key.is_empty()
+            || !key
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_alphanumeric() || character == '_')
+        {
+            continue;
+        }
+        keys.push(at..at + 1 + key.len());
+    }
+    keys
+}
+
+/// Parses a callout's header line — `> [!type]`, `> [!type] Title`, with an
+/// optional `+`/`-` collapse suffix on the type — into its kind, title, and
+/// initial collapsed state. Returns `None` for an ordinary block quote, which
+/// keeps rendering as one.
+fn parse_callout_header(line: &str) -> Option<(CalloutKind, String, Option<bool>)> {
+    let rest = line.trim_start().strip_prefix('>')?.trim_start();
+    let (name, after) = rest.strip_prefix("[!")?.split_once(']')?;
+    // The fold character sits immediately after the `]`, so a title that
+    // merely opens with a dash (`> [!note] - like this`) is left alone.
+    let (collapse, title) = match after.strip_prefix('+') {
+        Some(title) => (Some(false), title),
+        None => match after.strip_prefix('-') {
+            Some(title) => (Some(true), title),
+            None => (None, after),
+        },
+    };
+    let name = name.trim();
+    // A type is one word. Without this, an ordinary quote that happens to
+    // open with a bracketed aside would be claimed as a callout.
+    if name.is_empty() || name.contains(char::is_whitespace) {
+        return None;
+    }
+    let kind = CalloutKind::from_name(name);
+    let title = title.trim();
+    let title = if title.is_empty() {
+        kind.default_title().to_string()
+    } else {
+        title.to_string()
+    };
+    Some((kind, title, collapse))
+}
+
+/// A callout's body: the block quote's `>` prefixes stripped, and its header
+/// line dropped, leaving markdown a widget can render. Lines with no `>` pass
+/// through unchanged, which is what carries the reference definitions
+/// `apply_decorations` appends past the quote's own text.
+fn callout_body(source: &str) -> String {
+    source
+        .lines()
+        .skip(1)
+        .map(|line| {
+            let trimmed = line.trim_start();
+            match trimmed.strip_prefix('>') {
+                Some(rest) => rest.strip_prefix(' ').unwrap_or(rest),
+                None => line,
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Flips a callout between expanded and collapsed, recording the choice on
+/// the addon so it survives the redraw and overrides the `+`/`-` the syntax
+/// asked for.
+fn toggle_callout(
+    editor: &WeakEntity<Editor>,
+    range: &Range<Anchor>,
+    collapsed: bool,
+    cx: &mut App,
+) {
+    editor
+        .update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let start = range.start.to_offset(&snapshot);
+            if let Some(addon) = editor.addon_mut::<LivePreviewAddon>() {
+                addon
+                    .callout_collapse
+                    .retain(|(existing, _)| existing.start.to_offset(&snapshot) != start);
+                addon.callout_collapse.push((range.clone(), !collapsed));
+            }
+            recompute(editor, cx);
+        })
+        .log_err();
+}
+
+fn push_children<'a>(node: tree_sitter::Node<'a>, stack: &mut Vec<tree_sitter::Node<'a>>) {
+    for index in (0..node.child_count()).rev() {
+        if let Some(child) = node.child(index) {
+            stack.push(child);
+        }
+    }
+}
+
+/// A heading line's plain title: `## References ##` → `References`.
+fn plain_heading_text(line: &str) -> String {
+    line.trim()
+        .trim_start_matches('#')
+        .trim_end_matches('#')
+        .trim()
+        .to_string()
+}
+
+fn is_references_heading(title: &str) -> bool {
+    matches!(
+        title.trim().to_ascii_lowercase().as_str(),
+        "references" | "bibliography" | "works cited" | "reference list"
+    )
+}
+
+/// Renders the note's citations in its CSL style (the frontmatter `csl:`
+/// key, else APA): every group whose keys all resolve becomes a concealed
+/// span drawn as the in-text form, and the reference-list heading, when the
+/// note has one, becomes a block that also lists the cited works. One pass
+/// renders both so numbered styles agree between marks and list.
+fn attach_citation_rendering(markers: &mut MarkerSet, editor: &Editor, cx: &mut App) {
+    if markers.citation_groups.is_empty() && markers.bare_citations.is_empty() {
+        return;
+    }
+    let snapshot = editor.buffer().read(cx).snapshot(cx);
+    let head_end = MultiBufferOffset(snapshot.len().0.min(FRONTMATTER_SCAN_BYTES));
+    let head: String = snapshot
+        .text_for_range(MultiBufferOffset(0)..head_end)
+        .collect();
+    let source = citations::document_style_source(&head);
+    let search_dirs = editor
+        .buffer()
+        .read(cx)
+        .as_singleton()
+        .map(|buffer| citations::style_search_dirs(buffer.read(cx), cx))
+        .unwrap_or_default();
+    let Some(fs) = editor
+        .project()
+        .map(|project| project.read(cx).fs().clone())
+    else {
+        return;
+    };
+    let Some(resolved) = citations::resolve_style(source.as_ref(), &search_dirs, fs, cx) else {
+        return;
+    };
+    let style = resolved.style;
+    let style_problem = resolved.problem;
+    let bibliography = Bibliography::global(cx);
+    let bibliography = bibliography.read(cx);
+
+    // Every group in document order, bracketed and bare alike.
+    let mut groups: Vec<(Range<Anchor>, bool)> = markers
+        .citation_groups
+        .iter()
+        .map(|range| (range.clone(), true))
+        .chain(
+            markers
+                .bare_citations
+                .iter()
+                .map(|range| (range.clone(), false)),
+        )
+        .collect();
+    groups.sort_by_key(|(range, _)| range.start.to_offset(&snapshot));
+
+    // A group renders when its keys all resolve and its syntax has a slot in
+    // the renderer; otherwise its chips stay as they are.
+    let parsed: Vec<(Range<Anchor>, Option<Vec<citation_group::Item>>)> = groups
+        .into_iter()
+        .map(|(range, bracketed)| {
+            let text: String = snapshot.text_for_range(range.clone()).collect();
+            let items = citation_group::parse(&text, bracketed).filter(|items| {
+                items
+                    .iter()
+                    .all(|item| bibliography.entry_for_rendering(&item.key).is_some())
+            });
+            (range, items)
+        })
+        .collect();
+    let cite_groups: Vec<Vec<citations::CiteItem<'_>>> = parsed
+        .iter()
+        .filter_map(|(_, items)| items.as_ref())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|item| {
+                    Some(citations::CiteItem {
+                        entry: bibliography.entry_for_rendering(&item.key)?,
+                        locator: item.locator.clone(),
+                        form: item.form,
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    if cite_groups.is_empty() {
+        return;
+    }
+    let rendered = citations::render_document(&cite_groups, &style);
+
+    let mut rendered_citations = rendered.citations.into_iter();
+    for (range, items) in &parsed {
+        if items.is_none() {
+            continue;
+        }
+        let Some(text) = rendered_citations.next() else {
+            break;
+        };
+        let start = range.start.to_offset(&snapshot);
+        let end = range.end.to_offset(&snapshot);
+        // The group's own bracket concealments would nest inside this one.
+        markers.inline.retain(|marker| {
+            let marker_start = marker.range.start.to_offset(&snapshot);
+            let marker_end = marker.range.end.to_offset(&snapshot);
+            !(start <= marker_start && marker_end <= end)
+        });
+        markers.inline.push(InlineMarker {
+            range: range.clone(),
+            kind: InlineKind::Citation {
+                rendered: SharedString::from(text),
+            },
+        });
+    }
+
+    let Some(heading) = markers.references_heading.clone() else {
+        return;
+    };
+    if rendered.bibliography.is_empty() {
+        return;
+    }
+    let items = rendered
+        .bibliography
+        .into_iter()
+        .map(|(key, text)| (SharedString::from(key), SharedString::from(text)))
+        .collect::<Vec<_>>();
+    let note = style_problem.map(|problem| ReferencesNote {
+        text: SharedString::from(problem.message),
+        link_label: SharedString::from(problem.link_label),
+        url: SharedString::from(problem.url),
+    });
+    if let Some(marker) = markers
+        .blocks
+        .iter_mut()
+        .find(|block| block.range == heading)
+    {
+        marker.height_estimate = 2 + items.len() as u32 * 3 + u32::from(note.is_some());
+        marker.kind = BlockRenderKind::References { items, note };
+    }
+}
+
+/// Reading a pandoc citation group into its items.
+mod citation_group {
+    pub struct Item {
+        pub key: String,
+        pub locator: Option<(citations::Locator, String)>,
+        pub form: citations::CiteForm,
+    }
+
+    /// `[@a, p. 3; -@b]` or a bare `@a`. `None` when any part is not
+    /// `[-]@key[, locator]`, e.g. a prefix like `[see @a]`, which the
+    /// renderer has no slot for.
+    pub fn parse(text: &str, bracketed: bool) -> Option<Vec<Item>> {
+        let inner = if bracketed {
+            text.strip_prefix('[')?.strip_suffix(']')?
+        } else {
+            text
+        };
+        let mut items = Vec::new();
+        for part in inner.split(';') {
+            let part = part.trim();
+            let (form, rest) = match part.strip_prefix('-') {
+                Some(rest) => (citations::CiteForm::YearOnly, rest),
+                None if bracketed => (citations::CiteForm::Normal, part),
+                None => (citations::CiteForm::Prose, part),
+            };
+            let rest = rest.strip_prefix('@')?;
+            let key_end = rest
+                .find(|character: char| {
+                    !(character.is_ascii_alphanumeric()
+                        || matches!(
+                            character,
+                            '_' | ':'
+                                | '.'
+                                | '#'
+                                | '$'
+                                | '%'
+                                | '&'
+                                | '-'
+                                | '+'
+                                | '?'
+                                | '<'
+                                | '>'
+                                | '~'
+                                | '/'
+                        ))
+                })
+                .unwrap_or(rest.len());
+            let key = rest[..key_end].trim_end_matches([
+                ':', '.', '#', '$', '%', '&', '+', '?', '<', '>', '~', '/', '-',
+            ]);
+            if key.is_empty() {
+                return None;
+            }
+            let locator = match citations::parse_cite_suffix(&rest[key.len()..]) {
+                citations::CiteSuffix::None => None,
+                citations::CiteSuffix::Locator(kind, value) => Some((kind, value)),
+                citations::CiteSuffix::Unsupported => return None,
+            };
+            items.push(Item {
+                key: key.to_string(),
+                locator,
+                form,
+            });
+        }
+        (!items.is_empty()).then_some(items)
+    }
+}
+
+/// How much of the buffer's head is scanned for a frontmatter `csl:` key.
+const FRONTMATTER_SCAN_BYTES: usize = 4096;
+
+fn heading_level(node: tree_sitter::Node) -> u32 {
+    for index in 0..node.child_count() {
+        if let Some(child) = node.child(index) {
+            match child.kind() {
+                "atx_h1_marker" => return 1,
+                "atx_h2_marker" => return 2,
+                "atx_h3_marker" => return 3,
+                "atx_h4_marker" => return 4,
+                "atx_h5_marker" => return 5,
+                "atx_h6_marker" => return 6,
+                _ => {}
+            }
+        }
+    }
+    6
+}
+
+#[cfg(test)]
+mod tests;
