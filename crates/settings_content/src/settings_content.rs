@@ -242,6 +242,12 @@ pub struct SettingsContent {
     /// The settings for the image viewer.
     pub image_viewer: Option<ImageViewerSettingsContent>,
 
+    /// The settings for Markdown live preview and writing.
+    pub markdown_live_preview: Option<MarkdownLivePreviewSettingsContent>,
+
+    /// The project bibliography used by Markdown citations.
+    pub citations: Option<CitationsSettingsContent>,
+
     /// The settings for the markdown preview.
     pub markdown_preview: Option<MarkdownPreviewSettingsContent>,
 
@@ -408,7 +414,7 @@ fallible_options::flattened_deserialize!(SettingsContent {
         call_hierarchy, command_palette, file_finder, git_panel, tabs, tab_bar, tab_switcher, status_bar, preview_tabs, agent,
         agent_servers, audio, auto_update, base_keymap, collaboration_panel, debugger, diagnostics,
         git,
-        global_lsp_settings, image_viewer, markdown_preview, repl, helix_mode, hide_mouse,
+        global_lsp_settings, image_viewer, markdown_live_preview, markdown_preview, citations, repl, helix_mode, hide_mouse,
         journal, log, line_indicator_format, language_models, copilot, outline_panel, project_panel,
         node, proxy, reduce_motion, server_url, credentials_url, session, telemetry, terminal,
         title_bar, vim_mode, calls, which_key, vim, modeline_lines, feature_flags,
@@ -1386,6 +1392,68 @@ pub struct MarkdownPreviewSettingsContent {
     ///
     /// Default: 800
     pub max_width: Option<PixelSetting>,
+}
+
+/// Typography for one Markdown heading level.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct MarkdownHeadingStyleSettingsContent {
+    /// Multiplier of the editor's base font size.
+    pub font_size: Option<f32>,
+    /// Font weight in CSS units from 100 to 900.
+    pub font_weight: Option<FontWeightContent>,
+}
+
+/// Typography for rendered Markdown headings.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct MarkdownHeadingStylesSettingsContent {
+    pub h1: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h2: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h3: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h4: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h5: Option<MarkdownHeadingStyleSettingsContent>,
+    pub h6: Option<MarkdownHeadingStyleSettingsContent>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Debug, JsonSchema, MergeFrom, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MarkdownQuoteBorderColor {
+    Accent,
+    #[default]
+    Text,
+    MutedText,
+    LineNumber,
+}
+
+/// The settings for Markdown live preview and writing.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct MarkdownLivePreviewSettingsContent {
+    /// Whether Markdown renders inline while editing.
+    pub enabled: Option<bool>,
+    /// Typography overrides for rendered headings.
+    pub heading_styles: Option<MarkdownHeadingStylesSettingsContent>,
+    /// Theme color role for block quote borders.
+    pub block_quote_border_color: Option<MarkdownQuoteBorderColor>,
+    /// Block quote border width in logical pixels.
+    pub block_quote_border_width: Option<f32>,
+    /// Gap between a block quote border and its text.
+    pub block_quote_gap: Option<f32>,
+    /// Spacing between block quote paragraphs.
+    pub block_quote_paragraph_spacing: Option<f32>,
+    /// Folder for attachments, relative to the note's folder.
+    pub attachments_folder: Option<String>,
+    /// Whether to show a word count for Markdown notes.
+    pub word_count: Option<bool>,
+}
+
+/// The project bibliography used by Markdown citations.
+#[with_fallible_options]
+#[derive(Clone, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, Default, PartialEq)]
+pub struct CitationsSettingsContent {
+    /// Path to the bibliography relative to the project root.
+    pub library: Option<String>,
 }
 
 /// The settings for the image viewer.
