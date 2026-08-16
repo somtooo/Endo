@@ -4,6 +4,7 @@ use super::{
     Highlights,
     inlay_map::{InlayBufferRows, InlayChunks, InlayEdit, InlayOffset, InlayPoint, InlaySnapshot},
 };
+use collections::HashMap;
 use gpui::{AnyElement, App, ElementId, HighlightStyle, Pixels, SharedString, Stateful, Window};
 use language::{Edit, HighlightId, LanguageAwareStyling, Point};
 use multi_buffer::{
@@ -145,11 +146,16 @@ impl FoldPoint {
         let mut offset = start.1.output.len;
         if !overshoot.is_zero() {
             let transform = item.expect("display point out of range");
-            assert!(transform.placeholder.is_none());
-            let end_inlay_offset = snapshot
-                .inlay_snapshot
-                .to_offset(InlayPoint(start.1.input.lines + overshoot));
-            offset += end_inlay_offset.0 - start.1.input.len;
+            // SUZURI: Wrapping can end inside a fold label; its displayed bytes
+            // have no corresponding offset in the hidden source text.
+            if transform.placeholder.is_some() {
+                offset += overshoot.column as usize;
+            } else {
+                let end_inlay_offset = snapshot
+                    .inlay_snapshot
+                    .to_offset(InlayPoint(start.1.input.lines + overshoot));
+                offset += end_inlay_offset.0 - start.1.input.len;
+            }
         }
         FoldOffset(offset)
     }
@@ -163,6 +169,19 @@ impl<'a> sum_tree::Dimension<'a, TransformSummary> for FoldPoint {
     fn add_summary(&mut self, summary: &'a TransformSummary, _: ()) {
         self.0 += &summary.output.lines;
     }
+}
+
+/// A rendering-only concealment: hides or replaces a range's display without
+/// registering a fold. Invisible to the gutter, fold persistence, and fold
+/// actions by construction.
+#[derive(Clone)]
+pub struct Concealment {
+    pub range: Range<Anchor>,
+    pub placeholder: FoldPlaceholder,
+    /// Distinguishes different renders at an identical range (e.g. a
+    /// checkbox's checked state); items whose (range, content_key) are
+    /// unchanged are reused without a resync.
+    pub content_key: u64,
 }
 
 pub(crate) struct FoldMapWriter<'a>(&'a mut FoldMap);
@@ -352,6 +371,111 @@ impl FoldMapWriter<'_> {
         let edits = self.0.sync(inlay_snapshot, edits);
         (self.0.snapshot.clone(), edits)
     }
+
+    /// Replaces the owner's entire concealment set. Items whose
+    /// (range, content_key) are unchanged are reused without a resync, so
+    /// callers can idempotently pass the full desired set on every update.
+    #[ztracing::instrument(skip_all)]
+    pub(crate) fn set_concealments(
+        &mut self,
+        owner: TypeId,
+        concealments: Vec<Concealment>,
+    ) -> (FoldSnapshot, Vec<FoldEdit>) {
+        let snapshot = self.0.snapshot.inlay_snapshot.clone();
+        let buffer = snapshot.buffer.clone();
+        let mut edits = Vec::new();
+
+        let mut existing: HashMap<(usize, usize), Fold> = HashMap::default();
+        let mut new_items: Vec<Fold> = Vec::new();
+        for item in self.0.snapshot.concealments.iter() {
+            if item.placeholder.type_tag == Some(owner) {
+                let start = item.range.start.to_offset(&buffer);
+                let end = item.range.end.to_offset(&buffer);
+                existing.insert((start.0, end.0), item.clone());
+            } else {
+                new_items.push(item.clone());
+            }
+        }
+
+        for mut concealment in concealments {
+            let range = concealment.range.start.to_offset(&buffer)
+                ..concealment.range.end.to_offset(&buffer);
+            if range.start >= range.end {
+                continue;
+            }
+            concealment.placeholder.type_tag = Some(owner);
+            match existing.remove(&(range.start.0, range.end.0)) {
+                Some(old)
+                    if self.0.concealment_content_keys.get(&old.id).copied()
+                        == Some(concealment.content_key) =>
+                {
+                    new_items.push(old);
+                }
+                old => {
+                    if let Some(old) = old {
+                        self.0.snapshot.fold_metadata_by_id.remove(&old.id);
+                        self.0.concealment_content_keys.remove(&old.id);
+                    }
+                    let fold_range = FoldRange(
+                        buffer.anchor_after(range.start)..buffer.anchor_before(range.end),
+                    );
+                    if buffer
+                        .anchor_range_to_buffer_anchor_range(fold_range.0.clone())
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let id = FoldId(post_inc(&mut self.0.next_fold_id.0));
+                    self.0.snapshot.fold_metadata_by_id.insert(
+                        id,
+                        FoldMetadata {
+                            range: fold_range.clone(),
+                            width: None,
+                        },
+                    );
+                    self.0
+                        .concealment_content_keys
+                        .insert(id, concealment.content_key);
+                    new_items.push(Fold {
+                        id,
+                        range: fold_range,
+                        placeholder: concealment.placeholder,
+                    });
+                    let inlay_range =
+                        snapshot.to_inlay_offset(range.start)..snapshot.to_inlay_offset(range.end);
+                    edits.push(InlayEdit {
+                        old: inlay_range.clone(),
+                        new: inlay_range,
+                    });
+                }
+            }
+        }
+
+        for (_, old) in existing {
+            let start = old.range.start.to_offset(&buffer);
+            let end = old.range.end.to_offset(&buffer);
+            self.0.snapshot.fold_metadata_by_id.remove(&old.id);
+            self.0.concealment_content_keys.remove(&old.id);
+            if end > start {
+                let inlay_range = snapshot.to_inlay_offset(start)..snapshot.to_inlay_offset(end);
+                edits.push(InlayEdit {
+                    old: inlay_range.clone(),
+                    new: inlay_range,
+                });
+            }
+        }
+
+        new_items.sort_unstable_by(|a, b| sum_tree::SeekTarget::cmp(&a.range, &b.range, &buffer));
+        let mut tree = SumTree::new(&buffer);
+        for item in new_items {
+            tree.push(item, &buffer);
+        }
+        self.0.snapshot.concealments = tree;
+
+        let edits = consolidate_inlay_edits(edits);
+        let edits = self.0.sync(snapshot, edits);
+        (self.0.snapshot.clone(), edits)
+    }
 }
 
 /// Decides where the fold indicators should be; also tracks parts of a source file that are currently folded.
@@ -360,6 +484,7 @@ impl FoldMapWriter<'_> {
 pub struct FoldMap {
     snapshot: FoldSnapshot,
     next_fold_id: FoldId,
+    concealment_content_keys: HashMap<FoldId, u64>,
 }
 
 impl FoldMap {
@@ -368,6 +493,7 @@ impl FoldMap {
         let this = Self {
             snapshot: FoldSnapshot {
                 folds: SumTree::new(&inlay_snapshot.buffer),
+                concealments: SumTree::new(&inlay_snapshot.buffer),
                 transforms: SumTree::from_item(
                     Transform {
                         summary: TransformSummary {
@@ -383,6 +509,7 @@ impl FoldMap {
                 fold_metadata_by_id: TreeMap::default(),
             },
             next_fold_id: FoldId::default(),
+            concealment_content_keys: HashMap::default(),
         };
         let snapshot = this.snapshot.clone();
         (this, snapshot)
@@ -522,21 +649,45 @@ impl FoldMap {
                     .snapshot
                     .folds
                     .cursor::<FoldRange>(&inlay_snapshot.buffer);
-                folds_cursor.seek(&inlay_snapshot.to_buffer_offset(edit.new.start), Bias::Left);
+                let edit_start = inlay_snapshot.to_buffer_offset(edit.new.start);
+                folds_cursor.seek(&edit_start, Bias::Left);
+                let mut concealments_cursor = self
+                    .snapshot
+                    .concealments
+                    .cursor::<FoldRange>(&inlay_snapshot.buffer);
+                concealments_cursor.seek(&edit_start, Bias::Left);
 
                 let mut folds = iter::from_fn({
                     let inlay_snapshot = &inlay_snapshot;
                     move || {
-                        let item = folds_cursor.item().map(|fold| {
+                        // Merge real folds and concealments in range order.
+                        let next_is_fold = match (folds_cursor.item(), concealments_cursor.item()) {
+                            (Some(fold), Some(concealment)) => sum_tree::SeekTarget::cmp(
+                                &fold.range,
+                                &concealment.range,
+                                &inlay_snapshot.buffer,
+                            )
+                            .is_le(),
+                            (Some(_), None) => true,
+                            (None, Some(_)) => false,
+                            (None, None) => true,
+                        };
+                        let active_cursor = if next_is_fold {
+                            &mut folds_cursor
+                        } else {
+                            &mut concealments_cursor
+                        };
+                        let item = active_cursor.item().map(|fold| {
                             let buffer_start = fold.range.start.to_offset(&inlay_snapshot.buffer);
                             let buffer_end = fold.range.end.to_offset(&inlay_snapshot.buffer);
                             (
                                 fold.clone(),
                                 inlay_snapshot.to_inlay_offset(buffer_start)
                                     ..inlay_snapshot.to_inlay_offset(buffer_end),
+                                !next_is_fold,
                             )
                         });
-                        folds_cursor.next();
+                        active_cursor.next();
                         item
                     }
                 })
@@ -544,20 +695,22 @@ impl FoldMap {
 
                 while folds
                     .peek()
-                    .is_some_and(|(_, fold_range)| fold_range.start < edit.new.end)
+                    .is_some_and(|(_, fold_range, _)| fold_range.start < edit.new.end)
                 {
-                    let (fold, mut fold_range) = folds.next().unwrap();
+                    let (fold, mut fold_range, mut is_concealment) = folds.next().unwrap();
                     let sum = new_transforms.summary();
 
                     assert!(fold_range.start.0 >= sum.input.len);
 
-                    while folds.peek().is_some_and(|(next_fold, next_fold_range)| {
+                    while folds.peek().is_some_and(|(next_fold, next_fold_range, _)| {
                         next_fold_range.start < fold_range.end
                             || (next_fold_range.start == fold_range.end
                                 && fold.placeholder.merge_adjacent
                                 && next_fold.placeholder.merge_adjacent)
                     }) {
-                        let (_, next_fold_range) = folds.next().unwrap();
+                        let (_, next_fold_range, next_is_concealment) = folds.next().unwrap();
+                        // A region containing a real fold is a fold.
+                        is_concealment &= next_is_concealment;
                         if next_fold_range.end > fold_range.end {
                             fold_range.end = next_fold_range.end;
                         }
@@ -577,6 +730,17 @@ impl FoldMap {
                             .collapsed_text
                             .clone()
                             .unwrap_or_else(|| ELLIPSIS.into());
+                        // SUZURI: Zed's display-to-buffer mapping assumes a fold occupies at
+                        // least one display column. A zero-width concealment makes the points
+                        // before and after the hidden text the same display point, and bias
+                        // then resolves past the concealed source: Vim's linewise `dd`, `yy`,
+                        // and `cc` lost a heading's hidden prefix. Keep concealments visually
+                        // empty (the renderer draws nothing) but never zero-width.
+                        let placeholder_text = if is_concealment && placeholder_text.is_empty() {
+                            SharedString::new_static("\u{200b}")
+                        } else {
+                            placeholder_text
+                        };
                         let chars_bitmap = placeholder_text
                             .char_indices()
                             .fold(0u128, |bitmap, (idx, _)| {
@@ -594,6 +758,7 @@ impl FoldMap {
                                 placeholder: Some(TransformPlaceholder {
                                     text: placeholder_text,
                                     chars: chars_bitmap,
+                                    is_concealment,
                                     renderer: ChunkRenderer {
                                         id: ChunkRendererId::Fold(fold.id),
                                         render: Arc::new(move |cx| {
@@ -751,6 +916,10 @@ pub struct FoldSnapshot {
     pub inlay_snapshot: InlaySnapshot,
     transforms: SumTree<Transform>,
     folds: SumTree<Fold>,
+    /// Rendering-only concealments; deliberately excluded from every fold
+    /// query so fold consumers (gutter, persistence, unfold actions) cannot
+    /// observe them.
+    concealments: SumTree<Fold>,
     fold_metadata_by_id: TreeMap<FoldId, FoldMetadata>,
     pub version: usize,
 }
@@ -955,7 +1124,30 @@ impl FoldSnapshot {
     {
         let buffer_offset = offset.to_offset(&self.inlay_snapshot.buffer);
         let inlay_offset = self.inlay_snapshot.to_inlay_offset(buffer_offset);
-        self.is_inlay_offset_folded(inlay_offset)
+        let (_, _, item) = self
+            .transforms
+            .find::<InlayOffset, _>((), &inlay_offset, Bias::Right);
+        item.is_some_and(|transform| {
+            transform
+                .placeholder
+                .as_ref()
+                .is_some_and(|placeholder| !placeholder.is_concealment)
+        })
+    }
+
+    // SUZURI: Source selections inside display-only concealments must retain their exact endpoints.
+    pub(crate) fn is_offset_concealed<T: ToOffset>(&self, offset: T) -> bool {
+        let buffer_offset = offset.to_offset(&self.inlay_snapshot.buffer);
+        let inlay_offset = self.inlay_snapshot.to_inlay_offset(buffer_offset);
+        let (_, _, item) = self
+            .transforms
+            .find::<InlayOffset, _>((), &inlay_offset, Bias::Right);
+        item.is_some_and(|transform| {
+            transform
+                .placeholder
+                .as_ref()
+                .is_some_and(|placeholder| placeholder.is_concealment)
+        })
     }
 
     #[ztracing::instrument(skip_all)]
@@ -971,7 +1163,11 @@ impl FoldSnapshot {
                     let buffer_point = self.inlay_snapshot.to_buffer_point(inlay_point);
                     if buffer_point.row != buffer_row.0 {
                         return false;
-                    } else if transform.placeholder.is_some() {
+                    } else if transform
+                        .placeholder
+                        .as_ref()
+                        .is_some_and(|placeholder| !placeholder.is_concealment)
+                    {
                         return true;
                     }
                 }
@@ -1261,6 +1457,10 @@ struct TransformPlaceholder {
     text: SharedString,
     chars: u128,
     renderer: ChunkRenderer,
+    /// True when produced by a concealment rather than a fold; excluded from
+    /// fold queries like `is_line_folded` so the gutter and cursor placement
+    /// treat concealed text as ordinary text.
+    is_concealment: bool,
 }
 
 impl Transform {
@@ -1628,6 +1828,14 @@ impl<'a> Iterator for FoldChunks<'a> {
                 self.transform_cursor.next();
             }
 
+            // A zero-width placeholder (e.g. a fold that conceals markdown
+            // syntax) contributes no display text; emitting an empty chunk
+            // would break downstream consumers that assume chunks are
+            // non-empty.
+            if placeholder.text.is_empty() {
+                return self.next();
+            }
+
             self.output_offset.0 += placeholder.text.len();
             return Some(Chunk {
                 text: &placeholder.text,
@@ -1831,6 +2039,30 @@ mod tests {
     use text::Patch;
     use util::RandomCharIter;
     use util::test::sample_text;
+
+    // SUZURI: Wrapping restored folds can request offsets inside their displayed placeholder.
+    #[gpui::test]
+    fn test_offset_inside_fold_placeholder(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_simple("before hidden after", cx);
+        let (_, inlay_snapshot) = InlayMap::new(buffer.read(cx).snapshot(cx));
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+        let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
+        let (snapshot, _) = writer.fold(vec![(
+            Point::new(0, 7)..Point::new(0, 13),
+            FoldPlaceholder {
+                collapsed_text: Some("aébc".into()),
+                ..FoldPlaceholder::test()
+            },
+        )]);
+        assert_eq!(snapshot.text(), "before aébc after");
+        for column in [7, 8, 10, 11, 12, 13] {
+            let point = FoldPoint::new(0, column);
+            let offset = point.to_offset(&snapshot);
+            assert_eq!(offset.0, MultiBufferOffset(column as usize));
+            assert_eq!(offset.to_point(&snapshot), point);
+        }
+    }
 
     #[gpui::test]
     fn test_basic_folds(cx: &mut gpui::App) {

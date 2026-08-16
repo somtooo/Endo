@@ -787,8 +787,67 @@ impl BufferSerialization {
     }
 }
 
+// SUZURI: begin. Editable previews reveal their source before a row-based motion is mapped
+// through their replacement rows. The addon decides which blocks; the editor only removes them,
+// so the reasoning stays out of vendor code. Editor motions reach this through the addon's own
+// `register_action` listeners; Vim's motions bypass editor actions and call these directly.
+pub enum RowMotion {
+    Vertical {
+        row_delta: i64,
+        display_lines: bool,
+        inclusive_selection: bool,
+    },
+    Linewise {
+        rows: u32,
+    },
+}
+
+impl Editor {
+    pub fn prepare_vertical_navigation(
+        &mut self,
+        row_delta: i64,
+        display_lines: bool,
+        inclusive_selection: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.reveal_blocks_before(
+            RowMotion::Vertical {
+                row_delta,
+                display_lines,
+                inclusive_selection,
+            },
+            cx,
+        );
+    }
+
+    pub fn prepare_linewise_edit(&mut self, rows: u32, cx: &mut Context<Self>) {
+        self.reveal_blocks_before(RowMotion::Linewise { rows }, cx);
+    }
+
+    fn reveal_blocks_before(&mut self, motion: RowMotion, cx: &mut Context<Self>) {
+        let mut reveal = HashSet::default();
+        for addon in self.addons.values() {
+            reveal.extend(addon.blocks_to_reveal_before(&motion, self, cx));
+        }
+        if !reveal.is_empty() {
+            self.remove_blocks(reveal, None, cx);
+        }
+    }
+}
+// SUZURI: end
+
 /// Addons allow storing per-editor state in other crates (e.g. Vim)
 pub trait Addon: 'static {
+    // SUZURI: See `RowMotion` above.
+    fn blocks_to_reveal_before(
+        &self,
+        _: &RowMotion,
+        _: &Editor,
+        _: &mut Context<Editor>,
+    ) -> Vec<CustomBlockId> {
+        Vec::new()
+    }
+
     fn extend_key_context(&self, _: &mut KeyContext, _: &App) {}
 
     fn render_buffer_header_controls(
@@ -3432,6 +3491,11 @@ impl Editor {
         current_line_highlight: Option<CurrentLineHighlight>,
     ) {
         self.current_line_highlight = current_line_highlight;
+    }
+
+    // SUZURI: Search navigation must not reveal Markdown heading syntax as if it were an edit.
+    pub fn selection_is_from_search(&self) -> bool {
+        self.last_selection_from_search
     }
 
     pub fn set_collapse_matches(&mut self, collapse_matches: bool) {
@@ -7585,6 +7649,67 @@ impl Editor {
         self.selection_drag_state = SelectionDragState::None;
     }
 
+    /// SUZURI: markdown live preview lets the reader drag an image widget to
+    /// another line, which means turning a pointer position into the row
+    /// boundary the image should land at. The position map that answers that
+    /// is private to the element, so expose just this much of it.
+    ///
+    /// Returns the boundary nearest the pointer, with half-line precision:
+    /// the upper half of a line maps to the boundary above it, the lower half
+    /// to the boundary below, so hovering a tall block widget targets the
+    /// seam the pointer is closest to rather than always the widget's own
+    /// line. A boundary of `b` means "lands above buffer row `b`", where `b`
+    /// may be one past the last row; `None` means the pointer is outside the
+    /// text area entirely.
+    pub fn buffer_row_boundary_at_position(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> Option<MultiBufferRow> {
+        let position_map = self.last_position_map.as_ref()?;
+        if !position_map.text_hitbox.bounds.contains(&position) {
+            return None;
+        }
+        let snapshot = &position_map.snapshot;
+        let buffer_max_row = snapshot.buffer_snapshot().max_point().row;
+        // The pointer's display row, kept fractional so the half-line test
+        // below can tell which side of a row's midline it is on.
+        // SUZURI: Image-drop boundaries use the same inverse geometry as text hit testing.
+        let pointer_row = snapshot.row_after_visual_offset(
+            position_map.scroll_position.y,
+            f64::from(
+                (position.y - position_map.text_hitbox.bounds.origin.y) / position_map.line_height,
+            ),
+        );
+        let max_display_row = snapshot.display_snapshot.max_point().row().0;
+        if pointer_row >= max_display_row as f64 + 1. {
+            return Some(MultiBufferRow(buffer_max_row + 1));
+        }
+        let display_row = (pointer_row.max(0.) as u32).min(max_display_row);
+        let row = snapshot
+            .display_point_to_point(DisplayPoint::new(DisplayRow(display_row), 0), Bias::Left)
+            .row;
+        // The buffer row's full display extent: a block widget spans many
+        // display rows, and the midline of that whole span is what divides
+        // "above it" from "below it".
+        let span_start = snapshot
+            .point_to_display_point(Point::new(row, 0), Bias::Left)
+            .row()
+            .0;
+        let span_end = if row >= buffer_max_row {
+            max_display_row + 1
+        } else {
+            snapshot
+                .point_to_display_point(Point::new(row + 1, 0), Bias::Left)
+                .row()
+                .0
+        };
+        if pointer_row < (span_start + span_end) as f64 / 2. {
+            Some(MultiBufferRow(row))
+        } else {
+            Some(MultiBufferRow(row + 1))
+        }
+    }
+
     pub fn duplicate(
         &mut self,
         upwards: bool,
@@ -9926,6 +10051,19 @@ impl Editor {
         cx.notify();
     }
 
+    // SUZURI: Native line typography must share row geometry with editor input and painting.
+    pub fn style_lines(
+        &mut self,
+        key: HighlightKey,
+        ranges: Vec<Range<Anchor>>,
+        style: display_map::LineStyle,
+        cx: &mut Context<Self>,
+    ) {
+        self.display_map
+            .update(cx, |map, cx| map.style_lines(key, ranges, style, cx));
+        cx.notify();
+    }
+
     pub fn text_highlights<'a>(
         &'a self,
         key: HighlightKey,
@@ -9993,9 +10131,14 @@ impl Editor {
     }
 
     pub fn clear_highlights(&mut self, key: HighlightKey, cx: &mut Context<Self>) {
-        let cleared = self
-            .display_map
-            .update(cx, |map, _| map.clear_highlights(key));
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
+        let cleared = self.display_map.update(cx, |map, cx| {
+            let cleared = map.clear_highlights(key);
+            if cleared {
+                map.refresh_wrap_line_font_scales(cx);
+            }
+            cleared
+        });
         if cleared {
             cx.notify();
         }
@@ -10006,9 +10149,14 @@ impl Editor {
         f: &mut dyn FnMut(&HighlightKey) -> bool,
         cx: &mut Context<Self>,
     ) {
-        let cleared = self
-            .display_map
-            .update(cx, |map, _| map.clear_highlights_with(f));
+        // SUZURI: Native line typography must share row geometry with editor input and painting.
+        let cleared = self.display_map.update(cx, |map, cx| {
+            let cleared = map.clear_highlights_with(f);
+            if cleared {
+                map.refresh_wrap_line_font_scales(cx);
+            }
+            cleared
+        });
         if cleared {
             cx.notify();
         }
@@ -11215,15 +11363,21 @@ impl Editor {
             .scroll_position(editor_snapshot)
             .y;
         if !line_height.is_zero() {
-            scroll_top =
-                window.pixel_snap_f64(scroll_top * f64::from(line_height)) / f64::from(line_height);
+            // SUZURI: Snap visual pixels, then return to the anchored logical scroll position.
+            scroll_top = editor_snapshot.row_for_visual_y(
+                window.pixel_snap_f64(
+                    editor_snapshot.visual_y_for_row(scroll_top) * f64::from(line_height),
+                ) / f64::from(line_height),
+            );
         }
 
         if source.row().as_f64() < scroll_top.floor() {
             return None;
         }
         let source_x = editor_snapshot.x_for_display_point(source, &text_layout_details);
-        let source_y = line_height * (source.row().as_f64() - scroll_top) as f32;
+        // SUZURI: Popovers and other pixel-position consumers must track styled row heights.
+        let source_y =
+            editor_snapshot.visual_viewport_y(source.row().as_f64(), scroll_top, line_height);
         Some(gpui::Point::new(source_x, source_y))
     }
 
