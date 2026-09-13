@@ -66,6 +66,94 @@ pub enum SidebarSide {
     Right,
 }
 
+/// How terminal cards should be displayed by default in the agent panel.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalCardDisplay {
+    /// Terminal cards are expanded by default.
+    #[default]
+    AlwaysExpanded,
+    /// Terminal cards expand while running and compact when complete.
+    Auto,
+    /// Terminal output is collapsed while the command remains visible.
+    AlwaysCollapsed,
+}
+
+impl<'de> Deserialize<'de> for TerminalCardDisplay {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct TerminalCardDisplayVisitor;
+
+        impl serde::de::Visitor<'_> for TerminalCardDisplayVisitor {
+            type Value = TerminalCardDisplay;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a terminal card display string or legacy boolean")
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                Ok(if value {
+                    TerminalCardDisplay::AlwaysExpanded
+                } else {
+                    TerminalCardDisplay::AlwaysCollapsed
+                })
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                match value {
+                    "auto" => Ok(TerminalCardDisplay::Auto),
+                    "always_expanded" => Ok(TerminalCardDisplay::AlwaysExpanded),
+                    "always_collapsed" => Ok(TerminalCardDisplay::AlwaysCollapsed),
+                    _ => Err(E::custom(format!("unknown terminal card display: {value}"))),
+                }
+            }
+        }
+
+        deserializer.deserialize_any(TerminalCardDisplayVisitor)
+    }
+}
+
+impl JsonSchema for TerminalCardDisplay {
+    fn schema_name() -> Cow<'static, str> {
+        "TerminalCardDisplay".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        json_schema!({
+            "oneOf": [
+                {
+                    "type": "string",
+                    "const": "always_expanded",
+                    "description": "Terminal cards are expanded by default."
+                },
+                {
+                    "type": "string",
+                    "const": "auto",
+                    "description": "Terminal cards expand while running and compact when complete."
+                },
+                {
+                    "type": "string",
+                    "const": "always_collapsed",
+                    "description": "Terminal output is collapsed while the command remains visible."
+                },
+                {
+                    "type": "boolean"
+                }
+            ]
+        })
+    }
+}
+
 /// How thinking blocks should be displayed by default in the agent panel.
 #[derive(
     Clone,
@@ -357,10 +445,13 @@ pub struct AgentSettingsContent {
     ///
     /// Default: true
     pub expand_edit_card: Option<bool>,
-    /// Whether to have terminal cards in the agent panel expanded, showing the whole command output.
+    /// How terminal cards should be displayed in the agent panel.
+    /// Auto expands cards while commands run and compacts them when complete.
+    /// Always Expanded shows commands and terminal output. Always Collapsed
+    /// keeps commands visible while collapsing terminal output.
     ///
-    /// Default: true
-    pub expand_terminal_card: Option<bool>,
+    /// Default: always_expanded
+    pub expand_terminal_card: Option<TerminalCardDisplay>,
     /// Command to automatically run when Zed creates a Terminal Thread shell in the agent panel.
     /// The command is sent to the shell as if typed, so it is interpreted by your
     /// configured shell (including on Windows and remote/WSL projects).
@@ -1156,6 +1247,37 @@ impl std::fmt::Display for ToolPermissionMode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_card_display_accepts_legacy_booleans() {
+        assert_eq!(
+            serde_json::from_str::<TerminalCardDisplay>("true")
+                .expect("legacy true should deserialize"),
+            TerminalCardDisplay::AlwaysExpanded
+        );
+        assert_eq!(
+            serde_json::from_str::<TerminalCardDisplay>("false")
+                .expect("legacy false should deserialize"),
+            TerminalCardDisplay::AlwaysCollapsed
+        );
+    }
+
+    #[test]
+    fn terminal_card_display_round_trips_canonical_strings() {
+        for (json, expected) in [
+            ("\"always_expanded\"", TerminalCardDisplay::AlwaysExpanded),
+            ("\"auto\"", TerminalCardDisplay::Auto),
+            ("\"always_collapsed\"", TerminalCardDisplay::AlwaysCollapsed),
+        ] {
+            let display =
+                serde_json::from_str::<TerminalCardDisplay>(json).expect("display should parse");
+            assert_eq!(display, expected);
+            assert_eq!(
+                serde_json::to_string(&display).expect("display should serialize"),
+                json
+            );
+        }
+    }
 
     #[test]
     fn agent_config_option_value_serializes_value_id_as_string() {
