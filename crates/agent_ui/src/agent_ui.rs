@@ -683,6 +683,7 @@ pub fn init(
     is_eval: bool,
     cx: &mut App,
 ) {
+    voice_input::init(cx);
     agent::ThreadStore::init_global(cx);
     prompt_store::init(cx);
 

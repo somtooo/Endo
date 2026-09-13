@@ -23,6 +23,7 @@ use editor::scroll::Autoscroll;
 use editor::{
     Editor, EditorEvent, EditorMode, MultiBuffer, PathKey, SelectionEffects, SizingBehavior,
 };
+use feature_flags::{FeatureFlagAppExt as _, VoiceInputFeatureFlag};
 use file_icons::FileIcons;
 use fs::Fs;
 use futures::FutureExt as _;
@@ -72,10 +73,14 @@ use util::{
     size::format_file_size,
     time::duration_alt_display,
 };
+use voice_input::{
+    VoiceInputEvent, VoiceInputModelDownloadState, VoiceInputRegistry, VoiceInputSession,
+    VoiceInputSessionId, VoiceInputState,
+};
 use workspace::{
     CollaboratorId, MultiWorkspace, NewTerminal, PathList, Workspace, path_link::sanitize_path_text,
 };
-use zed_actions::agent::{Chat, ToggleModelSelector};
+use zed_actions::agent::{Chat, ToggleModelSelector, ToggleVoiceInput};
 
 use super::config_options::ConfigOptionsView;
 use super::entry_view_state::EntryViewState;
@@ -4330,7 +4335,6 @@ pub(crate) mod tests {
     use agent_servers::FakeAcpAgentServer;
     use editor::MultiBufferOffset;
     use editor::actions::Paste;
-    use feature_flags::FeatureFlagAppExt as _;
     use fs::FakeFs;
     use gpui::{ClipboardItem, EventEmitter, TestAppContext, VisualTestContext, point, size};
     use parking_lot::Mutex;

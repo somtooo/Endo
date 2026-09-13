@@ -15,8 +15,8 @@ use agent_client_protocol::schema::v2 as acp_v2;
 use anyhow::{Result, anyhow};
 use base64::Engine as _;
 use editor::{
-    Addon, AnchorRangeExt, ContextMenuOptions, Editor, EditorElement, EditorEvent, EditorMode,
-    EditorStyle, Inlay, MultiBuffer, MultiBufferOffset, MultiBufferSnapshot, ToOffset,
+    Addon, Anchor, AnchorRangeExt, ContextMenuOptions, Editor, EditorElement, EditorEvent,
+    EditorMode, EditorStyle, Inlay, MultiBuffer, MultiBufferOffset, MultiBufferSnapshot, ToOffset,
     actions::{Copy, Cut, Paste},
     code_context_menus::CodeContextMenu,
     display_map::{CreaseId, CreaseSnapshot},
@@ -214,6 +214,9 @@ pub struct MessageEditor {
     local_commands: SharedLocalCommands,
     agent_id: AgentId,
     thread_store: Option<Entity<ThreadStore>>,
+    voice_input_anchor: Option<Anchor>,
+    voice_input_locked: bool,
+    voice_input_previous_read_only: Option<bool>,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
 }
@@ -259,6 +262,39 @@ fn command_input(command: &acp_v2::AvailableCommand) -> Option<&acp_v2::Availabl
 
 const COMMAND_HINT_INLAY_ID: InlayId = InlayId::Hint(0);
 
+fn normalize_voice_input_text(
+    text: &str,
+    previous_character: Option<char>,
+    next_character: Option<char>,
+) -> Option<String> {
+    let text = text.trim();
+    let first_character = text.chars().next()?;
+    let last_character = text.chars().next_back()?;
+    let mut normalized = String::with_capacity(text.len() + 2);
+
+    if previous_character.is_some_and(|character| !character.is_whitespace())
+        && !matches!(
+            first_character,
+            '.' | ',' | '!' | '?' | ':' | ';' | ')' | ']' | '}'
+        )
+    {
+        normalized.push(' ');
+    }
+    normalized.push_str(text);
+    if next_character.is_some_and(|character| {
+        !character.is_whitespace()
+            && !matches!(
+                character,
+                '.' | ',' | '!' | '?' | ':' | ';' | ')' | ']' | '}'
+            )
+    }) && !last_character.is_whitespace()
+    {
+        normalized.push(' ');
+    }
+
+    Some(normalized)
+}
+
 fn insert_mention_for_project_path(
     project_path: &ProjectPath,
     editor: &Entity<Editor>,
@@ -292,6 +328,9 @@ fn insert_mention_for_project_path(
     let content_len = mention_text.len();
 
     let text_anchor = editor.update(cx, |editor, cx| {
+        if editor.read_only(cx) {
+            return None;
+        }
         let buffer = editor.buffer().read(cx);
         let snapshot = buffer.snapshot(cx);
         let buffer_snapshot = snapshot.as_singleton()?;
@@ -409,6 +448,9 @@ fn insert_project_path_as_context(
     let workspace = workspace.upgrade()?;
 
     cx.update(move |window, cx| {
+        if editor.read(cx).read_only(cx) {
+            return None;
+        }
         let project = workspace.read(cx).project().clone();
         insert_mention_for_project_path(
             &project_path,
@@ -437,6 +479,9 @@ async fn insert_resolved_pasted_context_items(
     let mut path_mention_tasks = Vec::new();
 
     for item in items {
+        if editor.read_with(cx, |editor, cx| editor.read_only(cx)) {
+            break;
+        }
         match item {
             ResolvedPastedContextItem::Image(image, name) => {
                 crate::mention_set::insert_images_as_context(
@@ -630,6 +675,9 @@ impl MessageEditor {
             local_commands,
             agent_id,
             thread_store,
+            voice_input_anchor: None,
+            voice_input_locked: false,
+            voice_input_previous_read_only: None,
             _subscriptions: subscriptions,
             _parse_slash_command_task: Task::ready(()),
         }
@@ -983,6 +1031,9 @@ impl MessageEditor {
     }
 
     pub fn trigger_completion_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_insert_context(cx) {
+            return;
+        }
         self.insert_context_prefix("@", window, cx);
     }
 
@@ -992,6 +1043,9 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_insert_context(cx) {
+            return;
+        }
         let prefix = format!("@{}", context_keyword);
         self.insert_context_prefix(&prefix, window, cx);
     }
@@ -1003,6 +1057,9 @@ impl MessageEditor {
         cx.spawn_in(window, async move |_, cx| {
             editor
                 .update_in(cx, |editor, window, cx| {
+                    if editor.read_only(cx) {
+                        return;
+                    }
                     let menu_is_open =
                         editor.context_menu().borrow().as_ref().is_some_and(|menu| {
                             matches!(menu, CodeContextMenu::Completions(_)) && menu.visible()
@@ -1098,6 +1155,9 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_insert_context(cx) {
+            return;
+        }
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1374,6 +1434,9 @@ impl MessageEditor {
     }
 
     fn paste_raw(&mut self, _: &PasteRaw, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_insert_context(cx) {
+            return;
+        }
         let editor = self.editor.clone();
         window.defer(cx, move |window, cx| {
             editor.update(cx, |editor, cx| editor.paste(&Paste, window, cx));
@@ -1441,6 +1504,9 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_insert_context(cx) {
+            return;
+        }
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1469,6 +1535,9 @@ impl MessageEditor {
     }
 
     pub fn insert_branch_diff_crease(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_insert_context(cx) {
+            return;
+        }
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1494,6 +1563,9 @@ impl MessageEditor {
                     .ok_or_else(|| anyhow!("Could not determine default branch"))?;
 
                 cx.update(|window, cx| {
+                    if editor.read(cx).read_only(cx) {
+                        return;
+                    }
                     let mention_uri = MentionUri::GitDiff {
                         base_ref: base_ref.to_string(),
                     };
@@ -1560,6 +1632,9 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_insert_context(cx) {
+            return;
+        }
         let Some(workspace) = self.workspace.upgrade() else {
             return;
         };
@@ -1615,6 +1690,9 @@ impl MessageEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.can_insert_context(cx) {
+            return;
+        }
         let editor = self.editor.read(cx);
         let editor_buffer = editor.buffer().read(cx);
         let Some(buffer) = editor_buffer.as_singleton() else {
@@ -1648,7 +1726,7 @@ impl MessageEditor {
     }
 
     pub fn add_images_from_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.session_capabilities.read().supports_images() {
+        if !self.can_insert_context(cx) || !self.session_capabilities.read().supports_images() {
             return;
         }
 
@@ -1669,6 +1747,9 @@ impl MessageEditor {
                     Ok(Ok(Some(paths))) => paths,
                     _ => return Ok::<(), anyhow::Error>(()),
                 };
+                if editor.read_with(cx, |editor, cx| editor.read_only(cx)) {
+                    return Ok(());
+                }
 
                 let default_image_name: SharedString = "Image".into();
                 let images = cx
@@ -1699,8 +1780,15 @@ impl MessageEditor {
     }
 
     pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
+        let editor_read_only =
+            if let Some(previous_read_only) = &mut self.voice_input_previous_read_only {
+                *previous_read_only = read_only;
+                true
+            } else {
+                read_only
+            };
         self.editor.update(cx, |message_editor, cx| {
-            message_editor.set_read_only(read_only);
+            message_editor.set_read_only(editor_read_only);
             cx.notify()
         })
     }
@@ -1930,6 +2018,10 @@ impl MessageEditor {
         self.editor.read(cx).text(cx)
     }
 
+    fn can_insert_context(&self, cx: &App) -> bool {
+        !self.voice_input_locked && !self.editor.read(cx).read_only(cx)
+    }
+
     pub fn set_cursor_offset(
         &mut self,
         offset: usize,
@@ -1953,6 +2045,67 @@ impl MessageEditor {
         self.editor.update(cx, |editor, cx| {
             editor.insert(text, window, cx);
         });
+    }
+
+    pub fn begin_voice_input(&mut self, cx: &mut Context<Self>) {
+        self.voice_input_previous_read_only = Some(self.editor.read(cx).read_only(cx));
+        self.voice_input_locked = true;
+        self.editor.update(cx, |editor, cx| {
+            editor.set_read_only(true);
+            cx.notify();
+        });
+        let editor = self.editor.read(cx);
+        let snapshot = editor.buffer().read(cx).snapshot(cx);
+        let cursor_offset = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot);
+        self.voice_input_anchor = Some(snapshot.anchor_after(cursor_offset));
+    }
+
+    pub fn insert_voice_input_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        let Some(anchor) = self.voice_input_anchor else {
+            return;
+        };
+
+        let next_anchor = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let offset = anchor.to_offset(&snapshot).0;
+            let existing_text = snapshot.text();
+            let previous_character = existing_text
+                .get(..offset)
+                .and_then(|text| text.chars().next_back());
+            let next_character = existing_text
+                .get(offset..)
+                .and_then(|text| text.chars().next());
+            let mut normalized_text = text.to_owned();
+            LineEnding::normalize(&mut normalized_text);
+            let insertion =
+                normalize_voice_input_text(&normalized_text, previous_character, next_character)?;
+            let insertion_end = MultiBufferOffset(offset + insertion.len());
+            editor.buffer().update(cx, |buffer, cx| {
+                buffer.edit([(anchor..anchor, insertion)], None, cx)
+            });
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            Some(snapshot.anchor_after(insertion_end))
+        });
+
+        if let Some(next_anchor) = next_anchor {
+            self.voice_input_anchor = Some(next_anchor);
+            cx.notify();
+        }
+    }
+
+    pub fn end_voice_input(&mut self, cx: &mut Context<Self>) {
+        self.voice_input_anchor = None;
+        self.voice_input_locked = false;
+        if let Some(read_only) = self.voice_input_previous_read_only.take() {
+            self.editor.update(cx, |editor, cx| {
+                editor.set_read_only(read_only);
+                cx.notify();
+            });
+        }
     }
 
     pub fn set_placeholder_text(
@@ -2311,7 +2464,16 @@ fn find_matching_bracket(text: &str, open: char, close: char) -> Option<usize> {
 
 #[cfg(test)]
 mod tests {
-    use std::{ops::Range, path::Path, path::PathBuf, rc::Rc, sync::Arc};
+    use std::{
+        ops::Range,
+        path::Path,
+        path::PathBuf,
+        rc::Rc,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     use super::PromptLocalCommand;
     use acp_thread::MentionUri;
@@ -2345,9 +2507,190 @@ mod tests {
         conversation_view::tests::init_test,
         mention_set::insert_crease_for_mention,
         message_editor::{
-            Mention, MessageEditor, MessageEditorEvent, SessionCapabilities, parse_mention_links,
+            Mention, MessageEditor, MessageEditorEvent, SessionCapabilities,
+            normalize_voice_input_text, parse_mention_links,
         },
     };
+
+    struct MessageEditorObserver {
+        _subscription: gpui::Subscription,
+    }
+
+    #[test]
+    fn test_voice_input_text_boundary_normalization() {
+        assert_eq!(
+            normalize_voice_input_text("world", Some('o'), None),
+            Some(" world".to_string())
+        );
+        assert_eq!(
+            normalize_voice_input_text(".", Some('o'), None),
+            Some(".".to_string())
+        );
+        assert_eq!(
+            normalize_voice_input_text("hello", None, Some('w')),
+            Some("hello ".to_string())
+        );
+        assert_eq!(normalize_voice_input_text("  ", None, None), None);
+    }
+
+    #[gpui::test]
+    async fn test_offline_voice_input_inserts_final_text_after_existing_draft(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", json!({"file": ""})).await;
+        let project = Project::test(fs, [Path::new(path!("/project"))], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project.clone(), window, cx));
+        let workspace = multi_workspace.read_with(cx, |workspace, _| workspace.workspace().clone());
+        let message_editor = cx.update(|window, cx| {
+            cx.new(|cx| {
+                MessageEditor::new(
+                    workspace.downgrade(),
+                    project.downgrade(),
+                    None,
+                    Default::default(),
+                    "Test Agent".into(),
+                    "Test",
+                    EditorMode::AutoHeight {
+                        min_lines: 1,
+                        max_lines: None,
+                    },
+                    window,
+                    cx,
+                )
+            })
+        });
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("hello", window, cx);
+            editor.focus_handle(cx).focus(window, cx);
+            editor.begin_voice_input(cx);
+            assert_eq!(editor.text(cx), "hello");
+
+            editor.insert_voice_input_text("world", cx);
+            assert_eq!(editor.text(cx), "hello world");
+            assert!(editor.focus_handle(cx).is_focused(window));
+            editor.end_voice_input(cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_voice_input_notifies_draft_observers(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, cx) = setup_message_editor(cx).await;
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed_notifications = notifications.clone();
+        let _observer = cx.update(|_, cx| {
+            cx.new(|cx| {
+                let subscription = cx.observe(&message_editor, move |_, _, _| {
+                    observed_notifications.fetch_add(1, Ordering::Relaxed);
+                });
+                MessageEditorObserver {
+                    _subscription: subscription,
+                }
+            })
+        });
+
+        message_editor.update_in(cx, |editor, _, cx| {
+            editor.begin_voice_input(cx);
+            editor.insert_voice_input_text("spoken text", cx);
+            assert_eq!(editor.text(cx), "spoken text");
+        });
+        cx.run_until_parked();
+        assert!(notifications.load(Ordering::Relaxed) > 0);
+    }
+
+    #[gpui::test]
+    async fn test_voice_input_locks_editor_until_session_ends(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, cx) = setup_message_editor(cx).await;
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let observed_notifications = notifications.clone();
+        let _observer = cx.update(|_, cx| {
+            cx.new(|cx| {
+                let subscription = cx.observe(&message_editor, move |_, _, _| {
+                    observed_notifications.fetch_add(1, Ordering::Relaxed);
+                });
+                MessageEditorObserver {
+                    _subscription: subscription,
+                }
+            })
+        });
+
+        message_editor.update_in(cx, |editor, _, cx| {
+            assert!(!editor.editor.read(cx).read_only(cx));
+
+            editor.begin_voice_input(cx);
+            assert!(editor.editor.read(cx).read_only(cx));
+        });
+        cx.run_until_parked();
+        let notifications_before_transcript = notifications.load(Ordering::Relaxed);
+        message_editor.update_in(cx, |editor, _, cx| {
+            editor.insert_voice_input_text("spoken text", cx);
+            assert_eq!(editor.text(cx), "spoken text");
+            assert!(editor.editor.read(cx).read_only(cx));
+        });
+        cx.run_until_parked();
+        assert!(notifications.load(Ordering::Relaxed) > notifications_before_transcript);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_read_only(false, cx);
+            assert!(editor.editor.read(cx).read_only(cx));
+            editor.set_message(Vec::new(), window, cx);
+            assert!(editor.is_empty(cx));
+            assert!(editor.editor.read(cx).read_only(cx));
+            editor.insert_voice_input_text("new dictation", cx);
+            assert_eq!(editor.text(cx), "new dictation");
+            assert!(editor.editor.read(cx).read_only(cx));
+        });
+        message_editor.update_in(cx, |editor, _, cx| {
+            editor.end_voice_input(cx);
+            assert!(!editor.editor.read(cx).read_only(cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_voice_input_blocks_context_insertion(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, cx) = setup_message_editor(cx).await;
+        let skill = AvailableSkill {
+            name: "deploy".into(),
+            description: "Deploy the app".into(),
+            source: "".into(),
+            skill_file_path: PathBuf::from("/tmp/SKILL.md"),
+            warning: None,
+        };
+
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.begin_voice_input(cx);
+            editor.insert_skill_crease(&skill, window, cx);
+            editor.insert_selections(
+                AgentContextSelection::Terminal(vec!["terminal output".into()]),
+                window,
+                cx,
+            );
+            editor.insert_branch_diff_crease(window, cx);
+
+            assert!(editor.text(cx).is_empty());
+            assert!(editor.mention_set.read(cx).mentions().is_empty());
+            editor.end_voice_input(cx);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_voice_input_normalizes_crlf_before_advancing_anchor(cx: &mut TestAppContext) {
+        init_test(cx);
+        let (message_editor, cx) = setup_message_editor(cx).await;
+
+        message_editor.update_in(cx, |editor, _, cx| {
+            editor.begin_voice_input(cx);
+            editor.insert_voice_input_text("first\r\nline", cx);
+            editor.insert_voice_input_text("second", cx);
+
+            assert_eq!(editor.text(cx), "first\nline second");
+            editor.end_voice_input(cx);
+        });
+    }
 
     #[test]
     fn test_session_capabilities_keep_commands_and_skills_separate() {

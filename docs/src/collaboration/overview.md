@@ -46,3 +46,45 @@ To test your audio configuration, click **Test Audio** in the same section. This
 ```
 
 Set either value to `null` to use system defaults.
+
+### Voice Input {#voice-input}
+
+Voice input adds microphone dictation to the Agent Panel. It is disabled by
+default, and no model is selected or downloaded on a fresh install.
+
+To enable it:
+
+1. Open {#kb zed::OpenSettings} and select **AI**.
+2. Turn on **Voice Input**.
+3. Select a **Voice Input Model**. Zed downloads the selected model and shows
+   its progress in Settings. The microphone stays disabled until the model is
+   ready.
+
+Parakeet TDT v3 runs locally. Zed downloads its weights only after you select
+the model. Voice input is unavailable on Intel macOS.
+
+The model weights have a separate license from the `parakeet-rs` code:
+
+- [Parakeet TDT v3 ONNX weights](https://huggingface.co/istupakov/parakeet-tdt-0.6b-v3-onnx)
+  are converted from [NVIDIA's model](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
+  and use CC BY 4.0.
+
+Recorded audio is not sent to a transcription service.
+
+The Agent Panel mic icon uses the Accent theme color while listening and the
+Success theme color while transcribing. Zed locks the editor and attachment
+controls while recording. After you stop, it transcribes the recording and
+inserts the finalized text before unlocking the composer. Sending while
+recording waits for transcription to finish before sending the message.
+Recordings are limited to ten minutes.
+
+**JSON configuration:**
+
+```json [settings]
+{
+  "audio": {
+    "voice_input_enabled": true,
+    "voice_input_model": "parakeet_tdt_v3"
+  }
+}
+```

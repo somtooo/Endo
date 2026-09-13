@@ -28,6 +28,7 @@ use zed_actions::{
         AddSelectionCommentToThread, AddSelectionToThread, ConflictContent, LogoutAgent,
         OpenSettings, ReauthenticateAgent, ResetAgentZoom, ResetOnboarding,
         ResolveConflictedFilesWithAgent, ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
+        ToggleVoiceInput,
     },
     assistant::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
@@ -713,6 +714,21 @@ pub fn init(cx: &mut App) {
                      window,
                      cx| {
                         crate::selection_comments::selection_comment(workspace, action, window, cx);
+                    },
+                )
+                .register_action(
+                    |workspace: &mut Workspace, action: &ToggleVoiceInput, window, cx| {
+                        let Some(panel) = workspace.panel::<AgentPanel>(cx) else {
+                            return;
+                        };
+                        let Some(thread_view) = panel.read(cx).active_thread_view(cx) else {
+                            return;
+                        };
+
+                        workspace.focus_panel::<AgentPanel>(window, cx);
+                        let focus_handle = thread_view.read(cx).focus_handle(cx);
+                        window.focus(&focus_handle, cx);
+                        window.dispatch_action(action.boxed_clone(), cx);
                     },
                 )
                 .register_action(|workspace, _: &menu::Cancel, _window, cx| {
@@ -7015,13 +7031,14 @@ mod tests {
     use action_log::ActionLog;
     use agent_client_protocol::schema::v1 as acp;
     use anyhow::{Result, anyhow};
+    use command_palette_hooks::CommandPaletteFilter;
     use feature_flags::FeatureFlagAppExt;
     use fs::FakeFs;
     use gpui::{App, Modifiers, TestAppContext, UpdateGlobal, VisualTestContext, px, size};
     use parking_lot::Mutex;
     use project::{Project, WorktreePaths};
     use settings::{SettingsStore, WorkingDirectory};
-    use std::any::Any;
+    use std::any::{Any, TypeId};
 
     use serde_json::json;
     use std::path::{Path, PathBuf};
@@ -14190,6 +14207,26 @@ mod tests {
         });
 
         (workspace, panel, cx)
+    }
+
+    #[gpui::test]
+    async fn toggle_voice_input_is_available_to_the_command_palette(cx: &mut TestAppContext) {
+        let (_workspace, _panel, mut cx) = setup_workspace_panel(cx).await;
+        cx.run_until_parked();
+
+        let toggle_voice_input_is_available = cx.update(|window, cx| {
+            let available_actions = window.available_actions(cx);
+            let Some(toggle_voice_input) = available_actions
+                .iter()
+                .find(|action| action.as_any().type_id() == TypeId::of::<ToggleVoiceInput>())
+            else {
+                return false;
+            };
+
+            !CommandPaletteFilter::try_global(cx)
+                .is_some_and(|filter| filter.is_hidden(toggle_voice_input.as_ref()))
+        });
+        assert!(toggle_voice_input_is_available);
     }
 
     /// Reproduces the retained-thread reset race:

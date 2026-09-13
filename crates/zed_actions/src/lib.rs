@@ -591,6 +591,8 @@ pub mod agent {
             /// Toggles the language model selector dropdown.
             #[action(deprecated_aliases = ["assistant::ToggleModelSelector", "assistant2::ToggleModelSelector"])]
             ToggleModelSelector,
+            /// Starts or stops voice input in the active agent conversation.
+            ToggleVoiceInput,
             /// Triggers re-authentication on Gemini
             ReauthenticateAgent,
             /// Logs out of the current external agent

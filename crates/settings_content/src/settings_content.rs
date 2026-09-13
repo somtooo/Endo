@@ -570,6 +570,33 @@ pub struct AudioSettingsContent {
     /// Select specific input audio device.
     #[serde(rename = "experimental.input_audio_device")]
     pub input_audio_device: Option<AudioInputDeviceName>,
+    /// Whether voice input is enabled in the Agent Panel.
+    pub voice_input_enabled: Option<bool>,
+    /// Local speech model to use for voice input.
+    pub voice_input_model: Option<VoiceInputModel>,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    Serialize,
+    Deserialize,
+    JsonSchema,
+    MergeFrom,
+    strum::VariantArray,
+    strum::VariantNames,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum VoiceInputModel {
+    #[default]
+    #[strum(serialize = "No model")]
+    None,
+    #[strum(serialize = "Parakeet TDT v3 (offline, 670 MB, CC BY 4.0)")]
+    ParakeetTdtV3,
 }
 
 #[derive(Clone, Default, Debug, Serialize, Deserialize, JsonSchema, MergeFrom, PartialEq, Eq)]

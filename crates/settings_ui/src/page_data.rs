@@ -2,12 +2,13 @@ use gpui::{Action as _, App};
 use itertools::Itertools as _;
 use settings::{
     AudioInputDeviceName, AudioOutputDeviceName, EditPredictionDataCollectionChoice,
-    LanguageSettingsContent, SemanticTokens, SettingsContent,
+    LanguageSettingsContent, SemanticTokens, SettingsContent, VoiceInputModel,
 };
 use std::sync::{Arc, OnceLock};
 use strum::{EnumMessage, IntoDiscriminant as _, VariantArray};
 use theme::SystemAppearance;
 use ui::IntoElement;
+use voice_input::{VoiceInputModelDownloadState, VoiceInputRegistry};
 
 use crate::{
     ActionLink, DynamicItem, PROJECT, SettingField, SettingItem, SettingsFieldMetadata,
@@ -75,7 +76,7 @@ pub(crate) fn settings_data(cx: &App) -> Vec<SettingsPage> {
         debugger_page(),
         terminal_page(),
         version_control_page(),
-        collaboration_page(),
+        collaboration_page(cx),
         ai_page(cx),
         network_page(),
         developer_page(cx),
@@ -8707,7 +8708,7 @@ fn version_control_page() -> SettingsPage {
     }
 }
 
-fn collaboration_page() -> SettingsPage {
+fn collaboration_page(_cx: &App) -> SettingsPage {
     fn calls_section() -> [SettingsPageItem; 3] {
         [
             SettingsPageItem::SectionHeader("Calls"),
@@ -8810,6 +8811,121 @@ fn collaboration_page() -> SettingsPage {
         title: "Collaboration",
         items: concat_sections![calls_section(), audio_settings()],
     }
+}
+
+pub(super) fn voice_input_model_status_item(
+    status: VoiceInputModelDownloadState,
+) -> Option<SettingsPageItem> {
+    let (title, description, button_text, retry, model) = match status {
+        VoiceInputModelDownloadState::Downloading {
+            model,
+            downloaded_bytes,
+            total_bytes,
+        } => {
+            let percentage = downloaded_bytes
+                .saturating_mul(100)
+                .checked_div(total_bytes)
+                .unwrap_or_default();
+            (
+                format!("Downloading {}", voice_input_model_label(model)),
+                format!("{percentage}% downloaded"),
+                "Cancel",
+                false,
+                model,
+            )
+        }
+        VoiceInputModelDownloadState::Loading { .. } => return None,
+        VoiceInputModelDownloadState::Failed { model, message } => (
+            format!("Could not prepare {}", voice_input_model_label(model)),
+            message.to_string(),
+            "Retry",
+            true,
+            model,
+        ),
+        VoiceInputModelDownloadState::Downloaded { .. } => return None,
+        VoiceInputModelDownloadState::Ready { .. } => return None,
+    };
+
+    Some(SettingsPageItem::ActionLink(ActionLink {
+        title: title.into(),
+        description: Some(description.into()),
+        button_text: button_text.into(),
+        on_click: Arc::new(move |_settings_window, _window, cx| {
+            if let Some(registry) = VoiceInputRegistry::try_global(cx) {
+                registry.update(cx, |registry, cx| {
+                    if retry {
+                        registry.retry_model_download(model, cx);
+                    } else {
+                        registry.cancel_model_download(model, cx);
+                    }
+                });
+            }
+        }),
+        files: USER,
+    }))
+}
+
+pub(super) fn voice_input_model_label(model: VoiceInputModel) -> &'static str {
+    match model {
+        VoiceInputModel::None => "no model",
+        VoiceInputModel::ParakeetTdtV3 => "Parakeet TDT v3",
+    }
+}
+
+fn voice_input_section() -> Vec<SettingsPageItem> {
+    if !voice_input::is_supported_on_this_platform() {
+        return Vec::new();
+    }
+
+    vec![
+        SettingsPageItem::SectionHeader("Voice Input"),
+        SettingsPageItem::SettingItem(SettingItem {
+            title: "Voice Input",
+            description: "Enable microphone dictation in the Agent Panel.",
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some("audio.voice_input_enabled"),
+                pick: |settings_content| {
+                    settings_content
+                        .audio
+                        .as_ref()?
+                        .voice_input_enabled
+                        .as_ref()
+                },
+                write: |settings_content, value, _| {
+                    settings_content
+                        .audio
+                        .get_or_insert_default()
+                        .voice_input_enabled = value;
+                },
+            }),
+            metadata: None,
+            files: USER,
+        }),
+        SettingsPageItem::SettingItem(SettingItem {
+            title: "Voice Input Model",
+            description: "Choose a local transcription model. Selecting a model downloads it.",
+            field: Box::new(SettingField {
+                organization_override: None,
+                json_path: Some("audio.voice_input_model"),
+                pick: |settings_content| {
+                    settings_content.audio.as_ref()?.voice_input_model.as_ref()
+                },
+                write: |settings_content, value, _| {
+                    settings_content
+                        .audio
+                        .get_or_insert_default()
+                        .voice_input_model = value;
+                },
+            }),
+            metadata: Some(Box::new(SettingsFieldMetadata {
+                should_do_titlecase: Some(false),
+                ..Default::default()
+            })),
+            files: USER,
+        }),
+        SettingsPageItem::VoiceInputModelStatus,
+    ]
 }
 
 fn ai_page(cx: &App) -> SettingsPage {
@@ -9487,6 +9603,7 @@ fn ai_page(cx: &App) -> SettingsPage {
             @vec,
             general_section(),
             agent_configuration_section(cx),
+            voice_input_section(),
             edit_prediction_language_settings_section(),
             edit_prediction_display_sub_section(),
         )
@@ -11559,6 +11676,85 @@ fn write_helix_mode_inner(settings: &mut SettingsContent, value: Option<bool>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[gpui::test]
+    fn voice_input_settings_are_in_the_ai_section(cx: &mut App) {
+        let collaboration_page = collaboration_page(cx);
+        let ai_page = ai_page(cx);
+        let voice_input_supported = voice_input::is_supported_on_this_platform();
+
+        assert!(!collaboration_page.items.iter().any(|item| {
+            matches!(
+                item,
+                SettingsPageItem::SettingItem(SettingItem {
+                    title: "Voice Input" | "Voice Input Model",
+                    ..
+                }) | SettingsPageItem::VoiceInputModelStatus
+            )
+        }));
+        assert_eq!(
+            ai_page
+                .items
+                .iter()
+                .any(|item| matches!(item, SettingsPageItem::VoiceInputModelStatus)),
+            voice_input_supported
+        );
+        assert_eq!(
+            ai_page
+                .items
+                .iter()
+                .any(|item| matches!(item, SettingsPageItem::SectionHeader("Voice Input"))),
+            voice_input_supported
+        );
+        let voice_input_setting = ai_page.items.iter().find_map(|item| match item {
+            SettingsPageItem::SettingItem(setting) if setting.title == "Voice Input" => {
+                Some(setting)
+            }
+            _ => None,
+        });
+        assert_eq!(voice_input_setting.is_some(), voice_input_supported);
+        let voice_input_model_setting = ai_page.items.iter().find_map(|item| match item {
+            SettingsPageItem::SettingItem(setting) if setting.title == "Voice Input Model" => {
+                Some(setting)
+            }
+            _ => None,
+        });
+        assert_eq!(voice_input_model_setting.is_some(), voice_input_supported);
+        if let Some(setting) = voice_input_model_setting {
+            assert_eq!(
+                setting
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.should_do_titlecase),
+                Some(false)
+            );
+        }
+    }
+
+    #[test]
+    fn voice_model_status_rows_only_appear_when_an_action_is_available() {
+        assert!(
+            voice_input_model_status_item(VoiceInputModelDownloadState::Downloading {
+                model: VoiceInputModel::ParakeetTdtV3,
+                downloaded_bytes: 1,
+                total_bytes: 3,
+            })
+            .is_some()
+        );
+        assert!(
+            voice_input_model_status_item(VoiceInputModelDownloadState::Failed {
+                model: VoiceInputModel::ParakeetTdtV3,
+                message: "download failed".into(),
+            })
+            .is_some()
+        );
+        assert!(
+            voice_input_model_status_item(VoiceInputModelDownloadState::Ready {
+                model: VoiceInputModel::ParakeetTdtV3,
+            })
+            .is_none()
+        );
+    }
 
     #[test]
     fn test_write_vim_helix_mode() {

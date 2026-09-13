@@ -8,6 +8,18 @@ impl FeatureFlag for NotebookFeatureFlag {
 }
 register_feature_flag!(NotebookFeatureFlag);
 
+pub struct VoiceInputFeatureFlag;
+
+impl FeatureFlag for VoiceInputFeatureFlag {
+    const NAME: &'static str = "voice-input";
+    type Value = PresenceFlag;
+
+    fn enabled_for_all() -> bool {
+        true
+    }
+}
+register_feature_flag!(VoiceInputFeatureFlag);
+
 pub struct PanicFeatureFlag;
 
 impl FeatureFlag for PanicFeatureFlag {

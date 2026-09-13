@@ -23,7 +23,8 @@ use release_channel::ReleaseChannel;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use settings::{
-    IntoGpui, Settings, SettingsContent, SettingsStore, initial_project_settings_content,
+    IntoGpui, Settings, SettingsContent, SettingsStore, VoiceInputModel,
+    initial_project_settings_content,
 };
 use std::{
     any::{Any, TypeId, type_name},
@@ -44,6 +45,7 @@ use ui::{
 };
 
 use util::{ResultExt as _, paths::PathStyle, rel_path::RelPath};
+use voice_input::{VoiceInputModelDownloadState, VoiceInputRegistry};
 use workspace::{
     AppState, MultiWorkspace, OpenOptions, OpenVisible, Workspace, WorkspaceSettings,
     client_side_decorations,
@@ -552,6 +554,7 @@ fn init_renderers(cx: &mut App) {
         .add_basic_renderer::<bool>(render_toggle_button)
         .add_basic_renderer::<String>(render_text_field)
         .add_basic_renderer::<SharedString>(render_text_field)
+        .add_basic_renderer::<VoiceInputModel>(render_dropdown)
         .add_basic_renderer::<settings::SaturatingBool>(render_toggle_button)
         .add_basic_renderer::<settings::CursorShape>(render_dropdown)
         .add_basic_renderer::<settings::RestoreOnStartupBehavior>(render_dropdown)
@@ -1014,6 +1017,7 @@ pub struct SettingsWindow {
     /// mouse, where `focus_visible` styling would otherwise be suppressed).
     pub(crate) external_agent_add_focus_handle: FocusHandle,
     skill_creator_page: Option<(Entity<pages::SkillCreatorPage>, Subscription)>,
+    _voice_input_subscription: Option<Subscription>,
 }
 
 struct SearchDocument {
@@ -1091,6 +1095,7 @@ enum SettingsPageItem {
     SubPageLink(SubPageLink),
     DynamicItem(DynamicItem),
     ActionLink(ActionLink),
+    VoiceInputModelStatus,
 }
 
 impl std::fmt::Debug for SettingsPageItem {
@@ -1109,6 +1114,7 @@ impl std::fmt::Debug for SettingsPageItem {
             SettingsPageItem::ActionLink(action_link) => {
                 write!(f, "ActionLink({})", action_link.title)
             }
+            SettingsPageItem::VoiceInputModelStatus => write!(f, "VoiceInputModelStatus"),
         }
     }
 }
@@ -1400,6 +1406,67 @@ impl SettingsPageItem {
                 )
                 .when(bottom_border, |this| this.child(Divider::horizontal()))
                 .into_any_element(),
+            SettingsPageItem::VoiceInputModelStatus => VoiceInputRegistry::try_read_global(cx)
+                .and_then(|registry| registry.model_download_state().cloned())
+                .map(|status| {
+                    if let Some(status_item) =
+                        page_data::voice_input_model_status_item(status.clone())
+                    {
+                        return status_item.render(
+                            settings_window,
+                            item_index,
+                            bottom_border,
+                            extra_bottom_padding,
+                            window,
+                            cx,
+                        );
+                    }
+
+                    let (title, description) = match status {
+                        VoiceInputModelDownloadState::Loading { model } => (
+                            format!("Preparing {}", page_data::voice_input_model_label(model)),
+                            "Preparing the model for the next voice session.".to_string(),
+                        ),
+                        VoiceInputModelDownloadState::Downloaded { model } => (
+                            format!("{} downloaded", page_data::voice_input_model_label(model)),
+                            "Turn on Voice Input to prepare the model.".to_string(),
+                        ),
+                        VoiceInputModelDownloadState::Ready { model } => (
+                            format!("{} ready", page_data::voice_input_model_label(model)),
+                            "Ready to transcribe speech locally.".to_string(),
+                        ),
+                        VoiceInputModelDownloadState::Downloading { .. }
+                        | VoiceInputModelDownloadState::Failed { .. } => {
+                            return div().into_any_element();
+                        }
+                    };
+
+                    v_flex()
+                        .group("setting-item")
+                        .px_8()
+                        .child(
+                            h_flex()
+                                .id("voice-input-model-status")
+                                .w_full()
+                                .min_w_0()
+                                .map(apply_padding)
+                                .child(
+                                    v_flex()
+                                        .relative()
+                                        .w_full()
+                                        .max_w_1_2()
+                                        .child(Label::new(title))
+                                        .child(
+                                            Label::new(description)
+                                                .size(LabelSize::Small)
+                                                .color(Color::Muted),
+                                        ),
+                                ),
+                        )
+                        .when(bottom_border, |this| this.child(Divider::horizontal()))
+                        .into_any_element()
+                })
+                .unwrap_or_else(|| div().into_any_element()),
         }
     }
 }
@@ -1979,6 +2046,9 @@ impl SettingsWindow {
         };
 
         let list_state = gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0)).measure_all();
+        list_state.set_scroll_handler(|_, _, _| {});
+        let voice_input_subscription = VoiceInputRegistry::try_global(cx)
+            .map(|registry| cx.observe(&registry, |_, _, cx| cx.notify()));
 
         let mut this = Self {
             title_bar,
@@ -2036,6 +2106,7 @@ impl SettingsWindow {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            _voice_input_subscription: voice_input_subscription,
         };
 
         this.fetch_files(window, cx);
@@ -2240,6 +2311,13 @@ impl SettingsWindow {
                     }
                     SettingsPageItem::ActionLink(ActionLink { files, .. }) => {
                         if !files.contains(current_file) {
+                            page_filter[index] = false;
+                        } else {
+                            any_found_since_last_header = true;
+                        }
+                    }
+                    SettingsPageItem::VoiceInputModelStatus => {
+                        if !USER.contains(current_file) {
                             page_filter[index] = false;
                         } else {
                             any_found_since_last_header = true;
@@ -2493,6 +2571,14 @@ impl SettingsWindow {
                             key_index,
                             action_link.title.as_ref(),
                         );
+                    }
+                    SettingsPageItem::VoiceInputModelStatus => {
+                        const TITLE: &str = "Voice Input Model Status";
+                        documents.push(SearchDocument {
+                            id: key_index,
+                            words: split_into_words(&[page.title, TITLE]),
+                        });
+                        push_candidates(&mut fuzzy_match_candidates, key_index, TITLE);
                     }
                 }
                 push_candidates(&mut fuzzy_match_candidates, key_index, page.title);
@@ -5508,6 +5594,7 @@ pub mod test {
                 custom_agent_form: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
+                _voice_input_subscription: None,
             }
         }
     }
@@ -5648,6 +5735,7 @@ pub mod test {
             custom_agent_form: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
+            _voice_input_subscription: None,
         };
 
         settings_window.build_filter_table();

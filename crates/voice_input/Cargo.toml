@@ -1,0 +1,40 @@
+[package]
+name = "voice_input"
+version = "0.1.0"
+edition.workspace = true
+publish.workspace = true
+license = "GPL-3.0-or-later"
+
+[lints]
+workspace = true
+
+[lib]
+path = "src/voice_input.rs"
+doctest = false
+
+[dependencies]
+async-lock.workspace = true
+anyhow.workspace = true
+async-fs.workspace = true
+async-channel.workspace = true
+async-trait.workspace = true
+audio.workspace = true
+collections.workspace = true
+futures.workspace = true
+gpui.workspace = true
+http_client.workspace = true
+log.workspace = true
+parking_lot.workspace = true
+paths.workspace = true
+rodio.workspace = true
+sha2.workspace = true
+settings.workspace = true
+smol.workspace = true
+
+[target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
+parakeet-rs.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+http_client = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true

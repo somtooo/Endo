@@ -1004,6 +1004,9 @@ pub(crate) async fn insert_images_as_context(
     }
 
     for (image, name) in images {
+        if editor.read_with(cx, |editor, cx| editor.read_only(cx)) {
+            break;
+        }
         let mention_uri = MentionUri::PastedImage {
             name: name.to_string(),
         };

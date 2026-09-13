@@ -53,7 +53,9 @@ use language_model::{
 };
 use notifications::status_toast::StatusToast;
 use project::ResolvedPath;
-use settings::{TerminalCardDisplay, update_settings_file, update_settings_file_with_completion};
+use settings::{
+    SettingsStore, TerminalCardDisplay, update_settings_file, update_settings_file_with_completion,
+};
 use ui::{
     ButtonLike, CalloutBorderPosition, Checkbox, ScrollableHandle, SpinnerLabel, SpinnerVariant,
     SplitButton, SplitButtonStyle, Tab, ToggleState,
@@ -145,6 +147,37 @@ impl ThreadRecovery {
 struct ThreadFeedbackState {
     feedback: Option<ThreadFeedback>,
     comments_editor: Option<Entity<Editor>>,
+}
+
+#[derive(Clone, Copy)]
+enum VoiceInputPendingSend {
+    Normal,
+    Immediate,
+}
+
+#[derive(Default)]
+struct ThreadVoiceInput {
+    session: Option<VoiceInputSession>,
+    pending_send: Option<VoiceInputPendingSend>,
+    event_task: Option<Task<()>>,
+}
+
+impl ThreadVoiceInput {
+    fn state(&self) -> VoiceInputState {
+        visible_voice_input_state(self.session.as_ref().map(VoiceInputSession::state))
+    }
+
+    fn locks_editor(&self) -> bool {
+        self.session.is_some()
+    }
+}
+
+fn visible_voice_input_state(session_state: Option<VoiceInputState>) -> VoiceInputState {
+    match session_state {
+        Some(VoiceInputState::Idle) => VoiceInputState::Stopping,
+        Some(state) => state,
+        None => VoiceInputState::Idle,
+    }
 }
 
 impl ThreadFeedbackState {
@@ -858,6 +891,7 @@ pub struct ThreadView {
     _save_task: Option<Task<()>>,
     _draft_resolve_task: Option<Task<()>>,
     _sandbox_status_refresh_task: Option<Task<()>>,
+    voice_input: ThreadVoiceInput,
     pub hovered_edited_file_buttons: Option<usize>,
     pub current_submission: Option<SubmissionId>,
     revealed_unsettled_submissions: HashSet<SubmissionId>,
@@ -1104,6 +1138,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        voice_input::init(cx);
         let session_id = thread.read(cx).session_id().clone();
         let parent_session_id = thread.read(cx).parent_session_id().cloned();
 
@@ -1318,6 +1353,17 @@ impl ThreadView {
                 .ok();
             }));
         }));
+        let voice_input_registry = VoiceInputRegistry::global(cx);
+        subscriptions.push(cx.observe(&voice_input_registry, |_, _, cx| cx.notify()));
+        subscriptions.push(cx.observe_global::<SettingsStore>(|this, cx| {
+            if !voice_input::is_enabled(cx) {
+                this.cancel_voice_input(cx);
+            }
+            cx.notify();
+        }));
+        subscriptions.push(cx.on_release(|this, cx| {
+            this.release_voice_input(cx);
+        }));
 
         let current_submission = thread.read(cx).latest_submission_id();
         // Submissions that were already in flight when this view was built have had
@@ -1382,6 +1428,7 @@ impl ThreadView {
             _save_task: None,
             _draft_resolve_task: None,
             _sandbox_status_refresh_task: None,
+            voice_input: ThreadVoiceInput::default(),
             hovered_edited_file_buttons: None,
             current_submission,
             revealed_unsettled_submissions,
@@ -1490,7 +1537,7 @@ impl ThreadView {
             MessageEditorEvent::Send => self.send(window, cx),
             MessageEditorEvent::SendImmediately => self.interrupt_and_send(window, cx),
             MessageEditorEvent::Cancel => {
-                if !self.close_thread_search(window, cx) {
+                if !self.close_thread_search(window, cx) && !self.cancel_voice_input(cx) {
                     self.cancel_generation(cx);
                 }
             }
@@ -1539,6 +1586,201 @@ impl ThreadView {
             });
             workspace.toggle_status_toast(toast, cx);
         });
+    }
+
+    fn show_voice_input_error(&self, message: impl Into<SharedString>, cx: &mut Context<Self>) {
+        let Some(workspace) = self.workspace.upgrade() else {
+            return;
+        };
+        workspace.update(cx, |workspace, cx| {
+            let toast = StatusToast::new(message, cx, |this, _cx| {
+                this.icon(
+                    Icon::new(IconName::Warning)
+                        .size(IconSize::Small)
+                        .color(Color::Warning),
+                )
+                .dismiss_button(true)
+            });
+            workspace.toggle_status_toast(toast, cx);
+        });
+    }
+
+    fn toggle_voice_input(
+        &mut self,
+        _: &ToggleVoiceInput,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !cx.has_flag::<VoiceInputFeatureFlag>() {
+            return;
+        }
+        if !voice_input::is_enabled(cx) {
+            return;
+        }
+
+        match self.voice_input.state() {
+            VoiceInputState::Idle => self.start_voice_input(window, cx),
+            VoiceInputState::Starting | VoiceInputState::Listening => {
+                self.request_voice_input_finish(None, cx);
+            }
+            VoiceInputState::Transcribing | VoiceInputState::Stopping => {}
+        }
+    }
+
+    fn start_voice_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !voice_input::is_enabled(cx) {
+            return;
+        }
+        let session = match VoiceInputSession::start(cx) {
+            Ok(session) => session,
+            Err(error) => {
+                self.show_voice_input_error(error.to_string(), cx);
+                return;
+            }
+        };
+        let session_id = session.id();
+        let events = session.events();
+        self.message_editor
+            .update(cx, |editor, cx| editor.begin_voice_input(cx));
+        self.voice_input.session = Some(session);
+        self.voice_input.pending_send = None;
+        self.voice_input.event_task = Some(window.spawn(cx, {
+            let this = cx.weak_entity();
+            async move |cx| {
+                while let Ok(event) = events.recv().await {
+                    let is_terminal = this
+                        .update_in(cx, |this, window, cx| {
+                            this.handle_voice_input_event(session_id, event, window, cx)
+                        })
+                        .unwrap_or(true);
+                    if is_terminal {
+                        break;
+                    }
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn request_voice_input_finish(
+        &mut self,
+        pending_send: Option<VoiceInputPendingSend>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let state = self.voice_input.state();
+        if state == VoiceInputState::Idle {
+            return false;
+        }
+        if let Some(pending_send) = pending_send {
+            self.voice_input.pending_send = Some(pending_send);
+        }
+        if matches!(
+            state,
+            VoiceInputState::Starting | VoiceInputState::Listening
+        ) {
+            if let Some(session) = self.voice_input.session.as_mut() {
+                session.finish();
+            }
+            cx.notify();
+        }
+        true
+    }
+
+    fn cancel_voice_input(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.voice_input.state() == VoiceInputState::Idle {
+            return false;
+        }
+        if let Some(session) = self.voice_input.session.as_mut() {
+            session.cancel();
+        }
+        self.voice_input.session.take();
+        self.voice_input.event_task.take();
+        self.voice_input.pending_send = None;
+        self.message_editor
+            .update(cx, |editor, cx| editor.end_voice_input(cx));
+        cx.notify();
+        true
+    }
+
+    fn release_voice_input(&mut self, cx: &mut App) {
+        if let Some(session) = self.voice_input.session.as_mut() {
+            session.cancel();
+        }
+        self.voice_input.session.take();
+        self.voice_input.event_task.take();
+        self.message_editor
+            .update(cx, |editor, cx| editor.end_voice_input(cx));
+    }
+
+    fn handle_voice_input_event(
+        &mut self,
+        session_id: VoiceInputSessionId,
+        event: VoiceInputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self
+            .voice_input
+            .session
+            .as_ref()
+            .is_none_or(|session| session.id() != session_id)
+        {
+            return true;
+        }
+
+        match event {
+            VoiceInputEvent::StateChanged(_) => {
+                cx.notify();
+                false
+            }
+            VoiceInputEvent::Final(text) => {
+                self.message_editor.update(cx, |editor, cx| {
+                    editor.insert_voice_input_text(&text, cx);
+                });
+                false
+            }
+            VoiceInputEvent::Failed(message) => {
+                self.complete_voice_input(session_id, None, window, cx);
+                self.show_voice_input_error(message, cx);
+                true
+            }
+            VoiceInputEvent::Finished => {
+                self.complete_voice_input(session_id, self.voice_input.pending_send, window, cx);
+                true
+            }
+            VoiceInputEvent::Cancelled => {
+                self.complete_voice_input(session_id, None, window, cx);
+                true
+            }
+        }
+    }
+
+    fn complete_voice_input(
+        &mut self,
+        session_id: VoiceInputSessionId,
+        pending_send: Option<VoiceInputPendingSend>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .voice_input
+            .session
+            .as_ref()
+            .is_none_or(|session| session.id() != session_id)
+        {
+            return;
+        }
+        self.message_editor
+            .update(cx, |editor, cx| editor.end_voice_input(cx));
+        self.voice_input.session.take();
+        self.voice_input.pending_send = None;
+        cx.notify();
+
+        match pending_send {
+            Some(VoiceInputPendingSend::Normal) => self.send(window, cx),
+            Some(VoiceInputPendingSend::Immediate) => self.interrupt_and_send(window, cx),
+            None => {}
+        }
     }
 
     pub(crate) fn as_native_connection(
@@ -2262,6 +2504,9 @@ impl ThreadView {
     }
 
     pub fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.request_voice_input_finish(Some(VoiceInputPendingSend::Normal), cx) {
+            return;
+        }
         if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
             self.handle_thread_error(
                 anyhow!(
@@ -2627,6 +2872,9 @@ impl ThreadView {
     }
 
     pub fn interrupt_and_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.request_voice_input_finish(Some(VoiceInputPendingSend::Immediate), cx) {
+            return;
+        }
         if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
             self.handle_thread_error(
                 anyhow!(
@@ -3240,6 +3488,9 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.voice_input.locks_editor() {
+            return false;
+        }
         if self.message_editor.read(cx).editor().read(cx).read_only(cx) {
             self.handle_thread_error(
                 anyhow!("Discard the unsupported draft before moving a queued message into the composer."),
@@ -5519,6 +5770,7 @@ impl ThreadView {
 
         let focus_handle = self.message_editor.focus_handle(cx);
         let editor_bg_color = cx.theme().colors().editor_background;
+        let voice_input_locked = self.voice_input.locks_editor();
 
         let editor_expanded = self.editor_expanded;
         let (expand_icon, expand_tooltip) = if editor_expanded {
@@ -5628,7 +5880,7 @@ impl ThreadView {
                                     .min_w_0()
                                     .flex_wrap()
                                     .gap_0p5()
-                                    .child(self.render_add_context_button(cx))
+                                    .child(self.render_add_context_button(voice_input_locked, cx))
                                     .child(self.render_follow_toggle(cx))
                                     .children(self.render_fast_mode_control(cx))
                                     .children(self.render_thinking_control(cx)),
@@ -5648,6 +5900,7 @@ impl ThreadView {
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
                                     })
+                                    .children(self.render_voice_input_button(cx))
                                     .child(self.render_send_button(cx)),
                             ),
                     ),
@@ -6650,8 +6903,12 @@ impl ThreadView {
         let is_editor_empty = message_editor.is_empty(cx);
         let focus_handle = message_editor.focus_handle(cx);
 
-        let is_generating = self.thread.read(cx).status() == ThreadStatus::Generating;
-        let is_unconfirmed = self.thread.read(cx).status() == ThreadStatus::Unconfirmed;
+        let thread_status = self.thread.read(cx).status();
+        let is_generating = thread_status == ThreadStatus::Generating;
+        let is_unconfirmed = thread_status == ThreadStatus::Unconfirmed;
+        let voice_input_state = self.voice_input.state();
+        let is_voice_input_active = voice_input_state != VoiceInputState::Idle;
+        let is_voice_input_send_pending = self.voice_input.pending_send.is_some();
 
         if self.is_loading_contents {
             div()
@@ -6660,7 +6917,7 @@ impl ThreadView {
                 .tooltip(Tooltip::text("Loading Added Context…"))
                 .child(loading_contents_spinner(IconSize::default()))
                 .into_any_element()
-        } else if (is_generating || is_unconfirmed) && is_editor_empty {
+        } else if (is_generating || is_unconfirmed) && is_editor_empty && !is_voice_input_active {
             IconButton::new("stop-generation", IconName::Stop)
                 .icon_color(Color::Error)
                 .style(ButtonStyle::Tinted(TintColor::Error))
@@ -6686,14 +6943,18 @@ impl ThreadView {
             IconButton::new("send-message", send_icon)
                 .style(ButtonStyle::Filled)
                 .map(|this| {
-                    if is_editor_empty && !is_generating {
+                    if is_voice_input_send_pending {
+                        this.disabled(true).icon_color(Color::Muted)
+                    } else if is_editor_empty && !is_generating && !is_voice_input_active {
                         this.disabled(true).icon_color(Color::Muted)
                     } else {
                         this.icon_color(Color::Accent)
                     }
                 })
                 .tooltip(move |_window, cx| {
-                    if is_editor_empty && !is_generating {
+                    if is_voice_input_active {
+                        Tooltip::for_action("Finalize Voice Input and Send", &Chat, cx)
+                    } else if is_editor_empty && !is_generating {
                         Tooltip::for_action("Type to Send", &Chat, cx)
                     } else if is_generating {
                         let focus_handle = focus_handle.clone();
@@ -6735,7 +6996,88 @@ impl ThreadView {
         }
     }
 
-    fn render_add_context_button(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_voice_input_button(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !cx.has_flag::<VoiceInputFeatureFlag>() {
+            return None;
+        }
+
+        let state = self.voice_input.state();
+        let registry = VoiceInputRegistry::read_global(cx);
+        let voice_input_enabled = voice_input::is_enabled(cx);
+        let session_active_elsewhere =
+            state == VoiceInputState::Idle && registry.active_session().is_some();
+        let provider_available = registry.has_available_provider(cx);
+        let unavailable = state == VoiceInputState::Idle
+            && (!voice_input_enabled || !provider_available || session_active_elsewhere);
+        let unavailable_label = if voice_input::is_supported_on_this_platform() {
+            match registry.model_download_state() {
+                Some(VoiceInputModelDownloadState::Downloading { .. }) => {
+                    "Downloading Voice Input Model"
+                }
+                Some(VoiceInputModelDownloadState::Loading { .. }) => "Preparing Voice Input Model",
+                Some(VoiceInputModelDownloadState::Downloaded { .. }) => {
+                    "Enable Voice Input in Audio Settings"
+                }
+                Some(VoiceInputModelDownloadState::Failed { .. }) => {
+                    "Retry Voice Input Model in Audio Settings"
+                }
+                Some(VoiceInputModelDownloadState::Ready { .. }) | None => {
+                    "Select a Local Voice Input Model in Audio Settings"
+                }
+            }
+        } else {
+            "Voice Input Is Not Available on Intel macOS"
+        };
+        let (icon, label, icon_color) = match state {
+            VoiceInputState::Idle if !voice_input_enabled => {
+                (IconName::MicMute, unavailable_label, Color::Muted)
+            }
+            VoiceInputState::Idle if session_active_elsewhere => (
+                IconName::MicMute,
+                "Voice Input Is Active in Another Conversation",
+                Color::Muted,
+            ),
+            VoiceInputState::Idle if !provider_available => {
+                (IconName::MicMute, unavailable_label, Color::Muted)
+            }
+            VoiceInputState::Idle => (IconName::Mic, "Start Voice Input", Color::Muted),
+            VoiceInputState::Starting => (IconName::Mic, "Starting Voice Input", Color::Accent),
+            VoiceInputState::Listening => (
+                IconName::Mic,
+                "Stop and Finalize Voice Input",
+                Color::Accent,
+            ),
+            VoiceInputState::Transcribing => {
+                (IconName::Mic, "Transcribing Voice Input", Color::Success)
+            }
+            VoiceInputState::Stopping => (IconName::Mic, "Finalizing Voice Input", Color::Success),
+        };
+
+        Some(
+            IconButton::new("toggle-voice-input", icon)
+                .icon_size(IconSize::Small)
+                .icon_color(icon_color)
+                .toggle_state(state != VoiceInputState::Idle)
+                .disabled(
+                    unavailable
+                        || matches!(
+                            state,
+                            VoiceInputState::Transcribing | VoiceInputState::Stopping
+                        ),
+                )
+                .tooltip(move |_window, cx| Tooltip::for_action(label, &ToggleVoiceInput, cx))
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_voice_input(&ToggleVoiceInput, window, cx);
+                }))
+                .into_any_element(),
+        )
+    }
+
+    fn render_add_context_button(
+        &mut self,
+        disabled: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let focus_handle = self.message_editor.focus_handle(cx);
         let weak_self = cx.weak_entity();
 
@@ -6743,7 +7085,8 @@ impl ThreadView {
             .trigger_with_tooltip(
                 IconButton::new("add-context", IconName::Plus)
                     .icon_size(IconSize::Small)
-                    .icon_color(Color::Muted),
+                    .icon_color(Color::Muted)
+                    .disabled(disabled),
                 {
                     move |_window, cx| {
                         Tooltip::for_action_in(
@@ -13964,6 +14307,9 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.voice_input.locks_editor() {
+            return;
+        }
         let menu_handle = self.add_context_menu_handle.clone();
         window.defer(cx, move |window, cx| {
             menu_handle.toggle(window, cx);
@@ -14207,6 +14553,10 @@ impl Render for ThreadView {
             .on_action(cx.listener(Self::keep_all))
             .on_action(cx.listener(Self::reject_all))
             .on_action(cx.listener(Self::undo_last_reject))
+            .on_action(cx.listener(|this, action: &ToggleVoiceInput, window, cx| {
+                this.toggle_voice_input(action, window, cx);
+                cx.stop_propagation();
+            }))
             .on_action(cx.listener(Self::allow_always))
             .on_action(cx.listener(Self::allow_once))
             .on_action(cx.listener(Self::reject_once))
@@ -14891,6 +15241,15 @@ mod tests {
 
         scroll_handle.set_offset(gpui::point(px(0.), px(-10.)));
         assert_ne!(manual_scroll_signal.generation(), drag_generation);
+    }
+
+    #[test]
+    fn voice_input_remains_active_until_its_terminal_event_is_consumed() {
+        assert_eq!(
+            visible_voice_input_state(Some(VoiceInputState::Idle)),
+            VoiceInputState::Stopping
+        );
+        assert_eq!(visible_voice_input_state(None), VoiceInputState::Idle);
     }
 
     #[test]

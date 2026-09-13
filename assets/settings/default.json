@@ -650,6 +650,8 @@
     // `null` means use system default.
     // Any unrecognized input device will fall back to system default.
     "experimental.input_audio_device": null,
+    "voice_input_enabled": false,
+    "voice_input_model": "none",
   },
   // Scrollbar related settings
   "scrollbar": {
