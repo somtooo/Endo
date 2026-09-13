@@ -9111,8 +9111,8 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
-                title: "Expand Terminal Card",
-                description: "Whether to have terminal cards in the agent panel expanded, showing the whole command output.",
+                title: "Terminal Card Display",
+                description: "How terminal cards are displayed. 'Auto' expands while a command runs, then compacts it when complete. 'Always Expanded' shows the command and terminal output. 'Always Collapsed' keeps the command visible and collapses terminal output.",
                 field: Box::new(SettingField {
                     organization_override: None,
                     json_path: Some("agent.expand_terminal_card"),

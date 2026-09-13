@@ -29,6 +29,7 @@ pub struct TerminalToolHeader {
     on_toggle_expand: Option<ClickHandler>,
     on_stop: Option<ClickHandler>,
     command_slot: Option<AnyElement>,
+    compact: bool,
 }
 
 impl TerminalToolHeader {
@@ -52,6 +53,7 @@ impl TerminalToolHeader {
             on_toggle_expand: None,
             on_stop: None,
             command_slot: None,
+            compact: false,
         }
     }
 
@@ -101,6 +103,11 @@ impl TerminalToolHeader {
         self.command_slot = Some(element.into_any_element());
         self
     }
+
+    pub fn compact(mut self, compact: bool) -> Self {
+        self.compact = compact;
+        self
+    }
 }
 
 impl RenderOnce for TerminalToolHeader {
@@ -123,6 +130,7 @@ impl RenderOnce for TerminalToolHeader {
             on_toggle_expand,
             on_stop,
             command_slot,
+            compact,
         } = self;
 
         let child_id = |name: &str| format!("terminal-tool-{name}-{id}");
@@ -138,17 +146,29 @@ impl RenderOnce for TerminalToolHeader {
             .pt_1()
             .pl_1p5()
             .pr_1()
+            .when(compact, |header| header.pb_1())
             .flex_none()
             .gap_1()
             .justify_between()
             .rounded_t_md()
+            .when(compact, |header| {
+                header.child(
+                    Icon::new(IconName::ToolTerminal)
+                        .size(IconSize::Small)
+                        .color(Color::Muted),
+                )
+            })
             .child(
                 div().w_full().min_w_0().overflow_hidden().child(
-                    Label::new(working_dir)
-                        .buffer_font(cx)
-                        .size(LabelSize::XSmall)
-                        .color(Color::Muted)
-                        .truncate_start(),
+                    Label::new(if compact {
+                        "Run Command".into()
+                    } else {
+                        working_dir
+                    })
+                    .buffer_font(cx)
+                    .size(LabelSize::XSmall)
+                    .color(Color::Muted)
+                    .truncate_start(),
                 ),
             )
             .child(
@@ -248,7 +268,7 @@ impl RenderOnce for TerminalToolHeader {
             .text_xs()
             .bg(header_bg)
             .child(header_row)
-            .children(command_slot)
+            .when(!compact, |header| header.children(command_slot))
     }
 }
 
@@ -329,6 +349,17 @@ impl Component for TerminalToolHeader {
                 .into_any_element()
         };
 
+        let compact_card = |header: TerminalToolHeader| {
+            v_flex()
+                .w_full()
+                .border_1()
+                .border_color(cx.theme().colors().border.opacity(0.6))
+                .rounded_md()
+                .overflow_hidden()
+                .child(header)
+                .into_any_element()
+        };
+
         let sandbox_warning = || TerminalSandboxWarning {
             title: "Ran without sandbox".into(),
             detail: "Unsandboxed execution is allowed for the rest of this thread.".into(),
@@ -362,6 +393,18 @@ impl Component for TerminalToolHeader {
                             false,
                         )
                         .elapsed(Duration::from_secs(83)),
+                    ),
+                ),
+                single_example(
+                    "Finished (compact)",
+                    compact_card(
+                        TerminalToolHeader::new(
+                            "compact",
+                            "preview-terminal-header-group-compact",
+                            working_dir,
+                            false,
+                        )
+                        .compact(true),
                     ),
                 ),
                 single_example(

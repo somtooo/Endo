@@ -1,6 +1,6 @@
 use std::{ops::Range, sync::Arc};
 
-use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall};
+use acp_thread::{AcpThread, AgentThreadEntry, AssistantMessageChunk, ToolCall, ToolCallStatus};
 use agent::ThreadStore;
 use agent_client_protocol::schema::v2 as acp_v2;
 use agent_settings::AgentSettings;
@@ -17,7 +17,7 @@ use language::language_settings::SoftWrap;
 use multi_buffer::MultiBuffer;
 use project::{AgentId, Project, project_settings::DiagnosticSeverity};
 use rope::Point;
-use settings::{Settings as _, ThinkingBlockDisplay};
+use settings::{Settings as _, TerminalCardDisplay, ThinkingBlockDisplay};
 use terminal_view::TerminalView;
 use theme_settings::ThemeSettings;
 use ui::{Context, TextSize};
@@ -53,6 +53,13 @@ enum ToolCallSync {
     Materialize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TerminalCardPresentation {
+    Expanded,
+    OutputCollapsed,
+    Compact,
+}
+
 pub struct EntryViewState {
     workspace: WeakEntity<Workspace>,
     project: WeakEntity<Project>,
@@ -67,6 +74,7 @@ pub struct EntryViewState {
     expanded_tool_calls: HashSet<acp_v2::ToolCallId>,
     /// Subagent cards shown for an ACP parent's outgoing session messages.
     expanded_session_message_cards: HashSet<acp_v2::MessageId>,
+    user_expanded_terminal_tool_calls: HashSet<acp_v2::ToolCallId>,
 }
 
 impl EntryViewState {
@@ -90,6 +98,7 @@ impl EntryViewState {
             expanded_compactions: HashSet::default(),
             expanded_tool_calls: HashSet::default(),
             expanded_session_message_cards: HashSet::default(),
+            user_expanded_terminal_tool_calls: HashSet::default(),
         }
     }
 
@@ -123,6 +132,73 @@ impl EntryViewState {
         if !self.expanded_session_message_cards.remove(message_id) {
             self.expanded_session_message_cards
                 .insert(message_id.clone());
+        }
+    }
+
+    pub(crate) fn toggle_terminal_tool_call_expansion(
+        &mut self,
+        tool_call_id: &acp_v2::ToolCallId,
+        display: TerminalCardDisplay,
+        presentation: TerminalCardPresentation,
+    ) {
+        match presentation {
+            TerminalCardPresentation::Compact => {
+                self.expanded_tool_calls.insert(tool_call_id.clone());
+                self.user_expanded_terminal_tool_calls
+                    .insert(tool_call_id.clone());
+            }
+            TerminalCardPresentation::Expanded => {
+                self.expanded_tool_calls.remove(tool_call_id);
+                self.user_expanded_terminal_tool_calls.remove(tool_call_id);
+            }
+            TerminalCardPresentation::OutputCollapsed => {
+                self.expanded_tool_calls.insert(tool_call_id.clone());
+                if display == TerminalCardDisplay::Auto {
+                    self.user_expanded_terminal_tool_calls
+                        .insert(tool_call_id.clone());
+                }
+            }
+        }
+    }
+
+    pub(crate) fn expand_terminal_tool_call(&mut self, tool_call_id: acp_v2::ToolCallId) {
+        self.expanded_tool_calls.insert(tool_call_id.clone());
+        self.user_expanded_terminal_tool_calls.insert(tool_call_id);
+    }
+
+    pub(crate) fn collapse_terminal_tool_call(&mut self, tool_call_id: &acp_v2::ToolCallId) {
+        self.expanded_tool_calls.remove(tool_call_id);
+        self.user_expanded_terminal_tool_calls.remove(tool_call_id);
+    }
+
+    pub(crate) fn terminal_card_presentation(
+        &self,
+        tool_call_id: &acp_v2::ToolCallId,
+        display: TerminalCardDisplay,
+        status: &ToolCallStatus,
+        has_output: bool,
+        terminal_is_focused: bool,
+    ) -> TerminalCardPresentation {
+        let can_auto_compact = display == TerminalCardDisplay::Auto
+            && has_output
+            && matches!(
+                status,
+                ToolCallStatus::Completed
+                    | ToolCallStatus::Failed
+                    | ToolCallStatus::Rejected
+                    | ToolCallStatus::Canceled
+            )
+            && !terminal_is_focused
+            && !self
+                .user_expanded_terminal_tool_calls
+                .contains(tool_call_id);
+
+        if can_auto_compact {
+            TerminalCardPresentation::Compact
+        } else if self.expanded_tool_calls.contains(tool_call_id) {
+            TerminalCardPresentation::Expanded
+        } else {
+            TerminalCardPresentation::OutputCollapsed
         }
     }
 
@@ -931,19 +1007,21 @@ mod tests {
     use std::rc::Rc;
     use std::sync::Arc;
 
-    use acp_thread::{AgentConnection, StubAgentConnection};
+    use acp_thread::{AgentConnection, StubAgentConnection, ToolCallStatus};
     use agent_client_protocol::schema::{v1 as acp_v1, v2 as acp_v2};
     use buffer_diff::{DiffHunkStatus, DiffHunkStatusKind};
     use editor::RowInfo;
     use fs::FakeFs;
-    use gpui::{AppContext as _, TestAppContext};
+    use gpui::{AppContext as _, TestAppContext, WeakEntity};
     use parking_lot::RwLock;
 
-    use crate::entry_view_state::{Entry, EntryViewEvent, EntryViewState, ToolCallSync, ViewEvent};
+    use crate::entry_view_state::{
+        Entry, EntryViewEvent, EntryViewState, TerminalCardPresentation, ToolCallSync, ViewEvent,
+    };
     use crate::message_editor::SessionCapabilities;
     use multi_buffer::MultiBufferRow;
     use pretty_assertions::assert_matches;
-    use project::Project;
+    use project::{AgentId, Project};
     use serde_json::json;
     use settings::SettingsStore;
     use util::path;
@@ -964,6 +1042,260 @@ mod tests {
         assert_eq!(reindex_after_removal(5, &(2..4)), Some(3));
         // An empty removal range leaves indices untouched.
         assert_eq!(reindex_after_removal(3, &(2..2)), Some(3));
+    }
+
+    fn terminal_entry_view_state() -> EntryViewState {
+        EntryViewState::new(
+            WeakEntity::new_invalid(),
+            WeakEntity::new_invalid(),
+            None,
+            Arc::new(RwLock::new(SessionCapabilities::default())),
+            AgentId("test".into()),
+        )
+    }
+
+    #[test]
+    fn test_auto_terminal_compacts_after_execution_finishes() {
+        let mut state = terminal_entry_view_state();
+        let tool_call_id = acp_v2::ToolCallId::new("terminal");
+        state.expand_tool_call(tool_call_id.clone());
+
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::Auto,
+                &ToolCallStatus::InProgress,
+                false,
+                false,
+            ),
+            TerminalCardPresentation::Expanded
+        );
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::Auto,
+                &ToolCallStatus::Completed,
+                true,
+                false,
+            ),
+            TerminalCardPresentation::Compact
+        );
+    }
+
+    #[test]
+    fn test_collapsed_running_auto_terminal_compacts_when_finished() {
+        let mut state = terminal_entry_view_state();
+        let tool_call_id = acp_v2::ToolCallId::new("terminal");
+        state.expand_tool_call(tool_call_id.clone());
+        state.toggle_terminal_tool_call_expansion(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            TerminalCardPresentation::Expanded,
+        );
+
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::Auto,
+                &ToolCallStatus::Completed,
+                true,
+                false,
+            ),
+            TerminalCardPresentation::Compact
+        );
+    }
+
+    #[test]
+    fn test_finished_auto_terminal_toggles_between_compact_and_expanded() {
+        let mut state = terminal_entry_view_state();
+        let tool_call_id = acp_v2::ToolCallId::new("terminal");
+        state.expand_tool_call(tool_call_id.clone());
+        let presentation = state.terminal_card_presentation(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            &ToolCallStatus::Completed,
+            true,
+            false,
+        );
+
+        state.toggle_terminal_tool_call_expansion(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            presentation,
+        );
+        let presentation = state.terminal_card_presentation(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            &ToolCallStatus::Completed,
+            true,
+            false,
+        );
+        assert_eq!(presentation, TerminalCardPresentation::Expanded);
+        state.toggle_terminal_tool_call_expansion(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            presentation,
+        );
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::Auto,
+                &ToolCallStatus::Completed,
+                true,
+                false,
+            ),
+            TerminalCardPresentation::Compact
+        );
+    }
+
+    #[test]
+    fn test_reexpanded_running_auto_terminal_stays_expanded_when_finished() {
+        let mut state = terminal_entry_view_state();
+        let tool_call_id = acp_v2::ToolCallId::new("terminal");
+        state.expand_tool_call(tool_call_id.clone());
+        let running_presentation = state.terminal_card_presentation(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            &ToolCallStatus::InProgress,
+            false,
+            false,
+        );
+        state.toggle_terminal_tool_call_expansion(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            running_presentation,
+        );
+        let collapsed_presentation = state.terminal_card_presentation(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            &ToolCallStatus::InProgress,
+            false,
+            false,
+        );
+        assert_eq!(
+            collapsed_presentation,
+            TerminalCardPresentation::OutputCollapsed
+        );
+        state.toggle_terminal_tool_call_expansion(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            collapsed_presentation,
+        );
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::Auto,
+                &ToolCallStatus::Completed,
+                true,
+                false,
+            ),
+            TerminalCardPresentation::Expanded
+        );
+    }
+
+    #[test]
+    fn test_authorization_keeps_terminal_command_expanded() {
+        let mut state = terminal_entry_view_state();
+        let tool_call_id = acp_v2::ToolCallId::new("terminal");
+        state.expand_tool_call(tool_call_id.clone());
+        let status = ToolCallStatus::WaitingForConfirmation;
+
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::Auto,
+                &status,
+                true,
+                false,
+            ),
+            TerminalCardPresentation::Expanded
+        );
+    }
+
+    #[test]
+    fn test_focused_auto_terminal_stays_expanded_when_execution_finishes() {
+        let mut state = terminal_entry_view_state();
+        let tool_call_id = acp_v2::ToolCallId::new("terminal");
+        state.expand_tool_call(tool_call_id.clone());
+
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::Auto,
+                &ToolCallStatus::Completed,
+                true,
+                true,
+            ),
+            TerminalCardPresentation::Expanded
+        );
+    }
+
+    #[test]
+    fn test_background_terminal_clears_manual_expansion() {
+        let mut state = terminal_entry_view_state();
+        let tool_call_id = acp_v2::ToolCallId::new("terminal");
+        state.expand_tool_call(tool_call_id.clone());
+        state.toggle_terminal_tool_call_expansion(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            TerminalCardPresentation::Expanded,
+        );
+        state.toggle_terminal_tool_call_expansion(
+            &tool_call_id,
+            settings::TerminalCardDisplay::Auto,
+            TerminalCardPresentation::OutputCollapsed,
+        );
+        state.collapse_terminal_tool_call(&tool_call_id);
+
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::Auto,
+                &ToolCallStatus::InProgress,
+                false,
+                false,
+            ),
+            TerminalCardPresentation::OutputCollapsed
+        );
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::Auto,
+                &ToolCallStatus::Completed,
+                true,
+                false,
+            ),
+            TerminalCardPresentation::Compact
+        );
+    }
+
+    #[test]
+    fn test_always_collapsed_terminal_toggles_only_its_output() {
+        let mut state = terminal_entry_view_state();
+        let tool_call_id = acp_v2::ToolCallId::new("terminal");
+        let presentation = state.terminal_card_presentation(
+            &tool_call_id,
+            settings::TerminalCardDisplay::AlwaysCollapsed,
+            &ToolCallStatus::Completed,
+            true,
+            false,
+        );
+        assert_eq!(presentation, TerminalCardPresentation::OutputCollapsed);
+        state.toggle_terminal_tool_call_expansion(
+            &tool_call_id,
+            settings::TerminalCardDisplay::AlwaysCollapsed,
+            presentation,
+        );
+        assert_eq!(
+            state.terminal_card_presentation(
+                &tool_call_id,
+                settings::TerminalCardDisplay::AlwaysCollapsed,
+                &ToolCallStatus::Completed,
+                true,
+                false,
+            ),
+            TerminalCardPresentation::Expanded
+        );
     }
 
     #[gpui::test]
