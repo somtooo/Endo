@@ -25,9 +25,9 @@ use serde::{Deserialize, Serialize};
 use zed_actions::{
     DecreaseBufferFontSize, IncreaseBufferFontSize, ResetBufferFontSize,
     agent::{
-        AddSelectionToThread, ConflictContent, LogoutAgent, OpenSettings, ReauthenticateAgent,
-        ResetAgentZoom, ResetOnboarding, ResolveConflictedFilesWithAgent,
-        ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
+        AddSelectionCommentToThread, AddSelectionToThread, ConflictContent, LogoutAgent,
+        OpenSettings, ReauthenticateAgent, ResetAgentZoom, ResetOnboarding,
+        ResolveConflictedFilesWithAgent, ResolveConflictsWithAgent, ReviewBranchDiff, SelectAgent,
     },
     assistant::{
         FocusAgent, ManageSkills, OpenGlobalAgentsMdRules, OpenProjectAgentsMdRules, Toggle,
@@ -705,6 +705,14 @@ pub fn init(cx: &mut App) {
                                 }
                             });
                         });
+                    },
+                )
+                .register_action(
+                    |workspace: &mut Workspace,
+                     action: &AddSelectionCommentToThread,
+                     window,
+                     cx| {
+                        crate::selection_comments::selection_comment(workspace, action, window, cx);
                     },
                 )
                 .register_action(|workspace, _: &menu::Cancel, _window, cx| {
