@@ -243,6 +243,7 @@ pub struct AgentSettings {
     pub expand_terminal_card: TerminalCardDisplay,
     pub terminal_init_command: Option<String>,
     pub thinking_display: ThinkingBlockDisplay,
+    pub anchor_response_to_user_message: bool,
     pub cancel_generation_on_terminal_stop: bool,
     pub use_modifier_to_send: bool,
     pub message_editor_min_lines: usize,
@@ -839,6 +840,7 @@ impl Settings for AgentSettings {
                 .terminal_init_command
                 .filter(|command| !command.trim().is_empty()),
             thinking_display: agent.thinking_display.unwrap(),
+            anchor_response_to_user_message: agent.anchor_response_to_user_message.unwrap(),
             cancel_generation_on_terminal_stop: agent.cancel_generation_on_terminal_stop.unwrap(),
             use_modifier_to_send: agent.use_modifier_to_send.unwrap(),
             message_editor_min_lines: agent.message_editor_min_lines.unwrap(),
