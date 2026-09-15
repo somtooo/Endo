@@ -598,6 +598,8 @@ pub mod agent {
             /// Add the current selection as context for threads in the agent panel.
             #[action(deprecated_aliases = ["assistant::QuoteSelection", "agent::QuoteSelection"])]
             AddSelectionToThread,
+            /// Select code, write a review comment in place, and queue it into the agent thread draft.
+            AddSelectionCommentToThread,
             /// Resets the agent panel zoom levels (agent UI and buffer font sizes).
             ResetAgentZoom,
             /// Pastes clipboard content without any formatting.
