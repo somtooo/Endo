@@ -6,7 +6,11 @@ use crate::{
     thread_metadata_store::{ThreadId, ThreadMetadataStore},
 };
 use agent_client_protocol::schema::v2 as acp_v2;
-use std::{cell::RefCell, path::Path};
+use std::{
+    cell::{Cell, RefCell},
+    path::Path,
+    rc::Rc,
+};
 
 use acp_thread::{
     Elicitation, ElicitationEntryId, ElicitationStatus, ForegroundActivity, OutputTokensUpdate,
@@ -35,8 +39,12 @@ use crate::unicode_confusables;
 
 use db::kvp::KeyValueStore;
 use gpui::List;
+use gpui::ScrollDelta;
+use gpui::ScrollEvent;
 use gpui::Stateful;
 use gpui::TaskExt;
+use gpui::TouchPhase;
+use gpui::canvas;
 use heapless::Vec as ArrayVec;
 use itertools::Itertools;
 use language_model::{
@@ -47,8 +55,8 @@ use notifications::status_toast::StatusToast;
 use project::ResolvedPath;
 use settings::{TerminalCardDisplay, update_settings_file, update_settings_file_with_completion};
 use ui::{
-    ButtonLike, CalloutBorderPosition, Checkbox, SpinnerLabel, SpinnerVariant, SplitButton,
-    SplitButtonStyle, Tab, ToggleState,
+    ButtonLike, CalloutBorderPosition, Checkbox, ScrollableHandle, SpinnerLabel, SpinnerVariant,
+    SplitButton, SplitButtonStyle, Tab, ToggleState,
 };
 use url::Url;
 use util::markdown::source_position_from_fragment;
@@ -77,6 +85,7 @@ pub(super) fn subagent_label(thread: &AcpThread) -> SharedString {
 pub(crate) const UNSETTLED_SUBMISSION_REVEAL_DELAY: Duration = Duration::from_secs(1);
 
 const DATA_RETENTION_LEARN_MORE_URL: &str = "https://support.claude.com/en/articles/15425996-data-retention-practices-for-mythos-class-models";
+const PIXELS_PER_USER_MESSAGE_SCROLL: f32 = 40.0;
 
 pub(super) struct ThreadRecovery {
     pub session_id: acp_v2::SessionId,
@@ -731,6 +740,67 @@ impl PermissionSelection {
     }
 }
 
+#[derive(Clone, Default)]
+struct ManualScrollSignal(Rc<Cell<u64>>);
+
+impl ManualScrollSignal {
+    fn generation(&self) -> u64 {
+        self.0.get()
+    }
+
+    fn notify(&self) {
+        self.0.set(self.0.get().wrapping_add(1));
+    }
+}
+
+#[derive(Clone)]
+pub(super) struct ConversationScrollHandle {
+    list_state: ListState,
+    manual_scroll_signal: ManualScrollSignal,
+}
+
+impl ScrollableHandle for ConversationScrollHandle {
+    fn max_offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.list_state.max_offset_for_scrollbar()
+    }
+
+    fn set_offset(&self, point: gpui::Point<gpui::Pixels>) {
+        self.manual_scroll_signal.notify();
+        self.list_state.set_offset_from_scrollbar(point);
+    }
+
+    fn offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.list_state.scroll_px_offset_for_scrollbar()
+    }
+
+    fn viewport(&self) -> gpui::Bounds<gpui::Pixels> {
+        self.list_state.viewport_bounds()
+    }
+
+    fn drag_started(&self) {
+        self.manual_scroll_signal.notify();
+        self.list_state.scrollbar_drag_started();
+    }
+
+    fn drag_ended(&self) {
+        self.list_state.scrollbar_drag_ended();
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResponseAnchorPhase {
+    Following,
+    Anchored,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResponseAnchor {
+    user_message_index: usize,
+    target_index: usize,
+    phase: ResponseAnchorPhase,
+    manual_scroll_generation: u64,
+}
+
 pub struct ThreadView {
     pub(crate) root_thread_id: ThreadId,
     pub session_id: acp_v2::SessionId,
@@ -759,6 +829,9 @@ pub struct ThreadView {
     pub last_token_limit_telemetry: Option<acp_thread::TokenUsageRatio>,
     thread_feedback: ThreadFeedbackState,
     pub list_state: ListState,
+    response_anchor: Option<ResponseAnchor>,
+    manual_scroll_signal: ManualScrollSignal,
+    user_message_scroll_delta: f32,
     pub session_capabilities: SharedSessionCapabilities,
     pub expanded_tool_call_raw_inputs: HashSet<acp_v2::ToolCallId>,
     collapsed_sandbox_authorization_details: HashSet<acp_v2::ToolCallId>,
@@ -1285,6 +1358,9 @@ impl ThreadView {
             token_limit_callout_dismissed: false,
             last_token_limit_telemetry: None,
             thread_feedback: Default::default(),
+            response_anchor: None,
+            manual_scroll_signal: ManualScrollSignal::default(),
+            user_message_scroll_delta: 0.0,
             expanded_tool_call_raw_inputs: HashSet::default(),
             collapsed_sandbox_authorization_details: HashSet::default(),
             collapsed_sandbox_network_details: HashSet::default(),
@@ -1334,10 +1410,12 @@ impl ThreadView {
         this.sync_editor_mode(cx);
         this.sync_existing_elicitation_states(window, cx);
         let list_state_for_scroll = this.list_state.clone();
+        let manual_scroll_signal = this.manual_scroll_signal.clone();
         let thread_view = cx.entity().downgrade();
 
         this.list_state
             .set_scroll_handler(move |_event, _window, cx| {
+                manual_scroll_signal.notify();
                 let list_state = list_state_for_scroll.clone();
                 let thread_view = thread_view.clone();
                 // N.B. We must defer because the scroll handler is called while the
@@ -1345,14 +1423,16 @@ impl ThreadView {
                 // directly would panic from a double borrow.
                 cx.defer(move |cx| {
                     let scroll_top = list_state.logical_scroll_top();
-                    let _ = thread_view.update(cx, |this, cx| {
-                        if let Some(thread) = this.as_native_thread(cx) {
-                            thread.update(cx, |thread, _cx| {
-                                thread.set_ui_scroll_position(Some(scroll_top));
-                            });
-                        }
-                        this.schedule_save(cx);
-                    });
+                    thread_view
+                        .update(cx, |this, cx| {
+                            if let Some(thread) = this.as_native_thread(cx) {
+                                thread.update(cx, |thread, _cx| {
+                                    thread.set_ui_scroll_position(Some(scroll_top));
+                                });
+                            }
+                            this.schedule_save(cx);
+                        })
+                        .log_err();
                 });
             });
 
@@ -4661,11 +4741,7 @@ impl ThreadView {
                                     ),
                                 )
                                 .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.list_state.scroll_to(ListOffset {
-                                        item_ix: entry_ix,
-                                        offset_in_item: px(0.0),
-                                    });
-                                    cx.notify();
+                                    this.scroll_to_entry(entry_ix, cx);
                                 }))
                         },
                     )),
@@ -4761,11 +4837,7 @@ impl ThreadView {
                             .color(Color::Default),
                     )
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.list_state.scroll_to(ListOffset {
-                            item_ix: entry_ix,
-                            offset_in_item: px(0.0),
-                        });
-                        cx.notify();
+                        this.scroll_to_entry(entry_ix, cx);
                     })),
             );
 
@@ -7272,6 +7344,30 @@ fn sandbox_network_rows(network: &SandboxNetPolicy) -> Vec<SandboxRow> {
 }
 
 impl ThreadView {
+    pub(super) fn conversation_scroll_handle(&self) -> ConversationScrollHandle {
+        ConversationScrollHandle {
+            list_state: self.list_state.clone(),
+            manual_scroll_signal: self.manual_scroll_signal.clone(),
+        }
+    }
+
+    fn render_response_anchor_observer(cx: &mut Context<Self>) -> impl IntoElement {
+        let thread_view = cx.entity().downgrade();
+        canvas(
+            move |_bounds, window, cx| {
+                window.defer(cx, move |_window, cx| {
+                    thread_view
+                        .update(cx, |this, cx| {
+                            this.update_response_anchor_after_layout(cx);
+                        })
+                        .log_err();
+                });
+            },
+            |_, _, _, _| {},
+        )
+        .size_0()
+    }
+
     fn render_entries(&mut self, cx: &mut Context<Self>) -> List {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let centered_container = move |content: AnyElement| {
@@ -7289,12 +7385,29 @@ impl ThreadView {
                 let entries = this.thread.read(cx).entries();
                 if let Some(entry) = entries.get(index) {
                     let rendered = this.render_entry(index, entries.len(), entry, window, cx);
-                    centered_container(rendered.into_any_element()).into_any_element()
+                    let observe_response_anchor = this.response_anchor.is_some_and(|anchor| {
+                        anchor.phase == ResponseAnchorPhase::Anchored
+                            && anchor.target_index == index
+                    });
+                    centered_container(rendered.into_any_element())
+                        .when(observe_response_anchor, |this| {
+                            this.child(Self::render_response_anchor_observer(cx))
+                        })
+                        .on_scroll(cx.listener(Self::handle_user_message_scroll))
+                        .into_any_element()
                 } else if this.generating_indicator_in_list {
                     let confirmation = this.thread.read(cx).is_waiting_for_confirmation()
                         || this.has_pending_request_elicitation(cx);
                     let rendered = this.render_generating(confirmation, cx);
-                    centered_container(rendered.into_any_element()).into_any_element()
+                    let observe_response_anchor = this
+                        .response_anchor
+                        .is_some_and(|anchor| anchor.phase == ResponseAnchorPhase::Following);
+                    centered_container(rendered.into_any_element())
+                        .when(observe_response_anchor, |this| {
+                            this.child(Self::render_response_anchor_observer(cx))
+                        })
+                        .on_scroll(cx.listener(Self::handle_user_message_scroll))
+                        .into_any_element()
                 } else {
                     Empty.into_any()
                 }
@@ -8188,6 +8301,146 @@ impl ThreadView {
             .unwrap_or_default()
     }
 
+    pub(super) fn begin_response_anchor(
+        &mut self,
+        user_message_index: usize,
+        cx: &mut Context<Self>,
+    ) {
+        self.response_anchor = None;
+        if !AgentSettings::get_global(cx).anchor_response_to_user_message {
+            return;
+        }
+
+        self.response_anchor = Some(ResponseAnchor {
+            user_message_index,
+            target_index: user_message_index,
+            phase: ResponseAnchorPhase::Following,
+            manual_scroll_generation: self.manual_scroll_signal.generation(),
+        });
+        self.list_state.set_follow_mode(gpui::FollowMode::Tail);
+        self.list_state.scroll_to_end();
+        cx.notify();
+    }
+
+    pub(super) fn cancel_response_anchor(&mut self) {
+        self.response_anchor = None;
+    }
+
+    fn take_manual_scroll_ownership(&mut self) {
+        if self.response_anchor.take().is_some() {
+            self.manual_scroll_signal.notify();
+        }
+    }
+
+    fn update_response_anchor_after_layout(&mut self, cx: &mut Context<Self>) {
+        if self.thread.read(cx).status() == ThreadStatus::Idle {
+            self.response_anchor = None;
+            return;
+        }
+
+        let Some(mut response_anchor) = self.response_anchor else {
+            return;
+        };
+        if response_anchor.manual_scroll_generation != self.manual_scroll_signal.generation() {
+            self.response_anchor = None;
+            return;
+        }
+        if response_anchor.phase == ResponseAnchorPhase::Following
+            && !self.list_state.is_following_tail()
+        {
+            self.response_anchor = None;
+            return;
+        }
+
+        let viewport_bounds = self.list_state.viewport_bounds();
+        if viewport_bounds.size.height <= px(0.0) {
+            return;
+        }
+        if response_anchor.target_index == response_anchor.user_message_index {
+            let user_message_size = self
+                .list_state
+                .size_for_item(response_anchor.user_message_index);
+            let user_message_is_above_viewport = self
+                .list_state
+                .item_is_above_viewport(response_anchor.user_message_index)
+                == Some(true);
+            let should_anchor_response = match user_message_size {
+                Some(size) => size.height > viewport_bounds.size.height,
+                None => user_message_is_above_viewport,
+            };
+
+            if should_anchor_response {
+                let entries = self.thread.read(cx).entries();
+                if let Some(response_index) = entries
+                    .iter()
+                    .enumerate()
+                    .skip(response_anchor.user_message_index.saturating_add(1))
+                    .take_while(|(_, entry)| !matches!(entry, AgentThreadEntry::UserMessage(_)))
+                    .find_map(|(index, entry)| {
+                        matches!(entry, AgentThreadEntry::AssistantMessage(_)).then_some(index)
+                    })
+                {
+                    response_anchor.target_index = response_index;
+                    self.response_anchor = Some(response_anchor);
+                    cx.notify();
+                }
+                return;
+            }
+
+            if user_message_size.is_none() {
+                return;
+            }
+        }
+
+        let target_bounds = self
+            .list_state
+            .bounds_for_item(response_anchor.target_index);
+        let target_is_above_viewport = self
+            .list_state
+            .item_is_above_viewport(response_anchor.target_index)
+            == Some(true);
+        let target_reached_viewport_top = target_bounds
+            .is_some_and(|bounds| bounds.top() <= viewport_bounds.top())
+            || target_is_above_viewport;
+
+        if target_reached_viewport_top {
+            let target_is_at_viewport_top =
+                target_bounds.is_some_and(|bounds| bounds.top() == viewport_bounds.top());
+            if response_anchor.phase == ResponseAnchorPhase::Following || !target_is_at_viewport_top
+            {
+                response_anchor.phase = ResponseAnchorPhase::Anchored;
+                self.response_anchor = Some(response_anchor);
+                self.list_state.scroll_to(ListOffset {
+                    item_ix: response_anchor.target_index,
+                    offset_in_item: px(0.0),
+                });
+                cx.notify();
+            }
+        } else if response_anchor.phase == ResponseAnchorPhase::Anchored
+            && target_bounds.is_some_and(|bounds| bounds.top() > viewport_bounds.top())
+        {
+            response_anchor.phase = ResponseAnchorPhase::Following;
+            self.response_anchor = Some(response_anchor);
+            self.list_state.set_follow_mode(gpui::FollowMode::Tail);
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn scroll_to_entry(&mut self, entry_index: usize, cx: &mut Context<Self>) {
+        self.take_manual_scroll_ownership();
+        self.list_state.scroll_to(ListOffset {
+            item_ix: entry_index,
+            offset_in_item: px(0.0),
+        });
+        cx.notify();
+    }
+
+    fn scroll_by(&mut self, distance: Pixels, cx: &mut Context<Self>) {
+        self.take_manual_scroll_ownership();
+        self.list_state.scroll_by(distance);
+        cx.notify();
+    }
+
     pub(crate) fn scroll_to_user_message_index(
         &mut self,
         user_message_index: Option<usize>,
@@ -8201,31 +8454,20 @@ impl ThreadView {
 
         // Scroll to the provided user message, or fall back to the most recent one.
         // (Fallback: if no user message exists, scroll to the bottom.)
-        if let Some(ix) = user_message_index.or_else(|| {
+        if let Some(index) = user_message_index.or_else(|| {
             entries
                 .iter()
                 .rposition(|entry| thread.is_user_authored_scroll_target(entry))
         }) {
-            self.list_state.scroll_to(ListOffset {
-                item_ix: ix,
-                offset_in_item: px(0.0),
-            });
-            cx.notify();
+            self.scroll_to_entry(index, cx);
         } else {
             self.scroll_to_end(cx);
         }
     }
 
     pub fn scroll_to_end(&mut self, cx: &mut Context<Self>) {
+        self.take_manual_scroll_ownership();
         self.list_state.scroll_to_end();
-        cx.notify();
-    }
-
-    pub(crate) fn scroll_to_entry(&mut self, entry_ix: usize, cx: &mut Context<Self>) {
-        self.list_state.scroll_to(ListOffset {
-            item_ix: entry_ix,
-            offset_in_item: px(0.),
-        });
         cx.notify();
     }
 
@@ -8247,8 +8489,7 @@ impl ThreadView {
     }
 
     pub(crate) fn scroll_to_top(&mut self, cx: &mut Context<Self>) {
-        self.list_state.scroll_to(ListOffset::default());
-        cx.notify();
+        self.scroll_to_entry(0, cx);
     }
 
     fn scroll_output_page_up(
@@ -8258,8 +8499,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let page_height = self.list_state.viewport_bounds().size.height;
-        self.list_state.scroll_by(-page_height * 0.9);
-        cx.notify();
+        self.scroll_by(-page_height * 0.9, cx);
     }
 
     fn scroll_output_page_down(
@@ -8269,8 +8509,7 @@ impl ThreadView {
         cx: &mut Context<Self>,
     ) {
         let page_height = self.list_state.viewport_bounds().size.height;
-        self.list_state.scroll_by(page_height * 0.9);
-        cx.notify();
+        self.scroll_by(page_height * 0.9, cx);
     }
 
     fn scroll_output_line_up(
@@ -8279,8 +8518,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.list_state.scroll_by(-window.line_height() * 3.);
-        cx.notify();
+        self.scroll_by(-window.line_height() * 3., cx);
     }
 
     fn scroll_output_line_down(
@@ -8289,8 +8527,7 @@ impl ThreadView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.list_state.scroll_by(window.line_height() * 3.);
-        cx.notify();
+        self.scroll_by(window.line_height() * 3., cx);
     }
 
     fn scroll_output_to_top(
@@ -8317,6 +8554,11 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.scroll_to_previous_user_message(cx);
+    }
+
+    fn scroll_to_previous_user_message(&mut self, cx: &mut Context<Self>) -> bool {
+        self.take_manual_scroll_ownership();
         let thread = self.thread.read(cx);
         let entries = thread.entries();
         let current_ix = self.list_state.logical_scroll_top().item_ix;
@@ -8325,11 +8567,10 @@ impl ThreadView {
                 .get(i)
                 .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
         }) {
-            self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
-                offset_in_item: px(0.),
-            });
-            cx.notify();
+            self.scroll_to_entry(target_ix, cx);
+            true
+        } else {
+            false
         }
     }
 
@@ -8339,6 +8580,11 @@ impl ThreadView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.scroll_to_next_user_message(cx);
+    }
+
+    fn scroll_to_next_user_message(&mut self, cx: &mut Context<Self>) -> bool {
+        self.take_manual_scroll_ownership();
         let thread = self.thread.read(cx);
         let entries = thread.entries();
         let current_ix = self.list_state.logical_scroll_top().item_ix;
@@ -8347,12 +8593,77 @@ impl ThreadView {
                 .get(i)
                 .is_some_and(|entry| thread.is_user_authored_scroll_target(entry))
         }) {
-            self.list_state.scroll_to(ListOffset {
-                item_ix: target_ix,
-                offset_in_item: px(0.),
-            });
-            cx.notify();
+            self.scroll_to_entry(target_ix, cx);
+            true
+        } else {
+            false
         }
+    }
+
+    fn handle_user_message_scroll(
+        &mut self,
+        event: &ScrollEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !event.modifiers.alt {
+            self.user_message_scroll_delta = 0.0;
+            return;
+        }
+
+        if matches!(event.touch_phase, TouchPhase::Ended | TouchPhase::Cancelled) {
+            self.user_message_scroll_delta = 0.0;
+            return;
+        }
+        if event.touch_phase == TouchPhase::Started {
+            self.user_message_scroll_delta = 0.0;
+        }
+
+        let steps = match event.delta {
+            ScrollDelta::Lines(lines) => {
+                self.user_message_scroll_delta = 0.0;
+                if lines.y > 0.0 {
+                    1
+                } else if lines.y < 0.0 {
+                    -1
+                } else {
+                    return;
+                }
+            }
+            ScrollDelta::Pixels(pixels) => {
+                let delta = f32::from(pixels.y);
+                if delta == 0.0 {
+                    return;
+                }
+                if self.user_message_scroll_delta != 0.0
+                    && self.user_message_scroll_delta.signum() != delta.signum()
+                {
+                    self.user_message_scroll_delta = 0.0;
+                }
+                self.user_message_scroll_delta += delta;
+                let steps = (self.user_message_scroll_delta / PIXELS_PER_USER_MESSAGE_SCROLL)
+                    .trunc() as i32;
+                self.user_message_scroll_delta -= steps as f32 * PIXELS_PER_USER_MESSAGE_SCROLL;
+                steps
+            }
+        };
+
+        self.take_manual_scroll_ownership();
+        if steps > 0 {
+            for _ in 0..steps {
+                if !self.scroll_to_previous_user_message(cx) {
+                    break;
+                }
+            }
+        } else {
+            for _ in steps..0 {
+                if !self.scroll_to_next_user_message(cx) {
+                    break;
+                }
+            }
+        }
+
+        cx.stop_propagation();
     }
 
     fn refresh_thread_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -8436,13 +8747,9 @@ impl ThreadView {
                     cx.defer(move |cx| {
                         view.update(cx, |this, cx| {
                             this.expand_auto_compacted_terminal_tool_call(entry_ix, cx);
-                            this.list_state.scroll_to(gpui::ListOffset {
-                                item_ix: entry_ix,
-                                offset_in_item: gpui::px(0.),
-                            });
-                            cx.notify();
+                            this.scroll_to_entry(entry_ix, cx);
                         })
-                        .ok();
+                        .log_err();
                     });
                 });
             let search_bar = cx.new(|cx| {
@@ -13779,7 +14086,7 @@ impl Render for ThreadView {
         self.sync_local_commands(cx);
 
         let has_messages = self.has_visible_conversation(cx);
-        let list_state = self.list_state.clone();
+        let scroll_handle = self.conversation_scroll_handle();
 
         let conversation = v_flex()
             .when(self.resumed_without_history, |this| {
@@ -13790,7 +14097,7 @@ impl Render for ThreadView {
                     this.flex_1()
                         .size_full()
                         .child(self.render_entries(cx))
-                        .vertical_scrollbar_for(&list_state, window, cx)
+                        .vertical_scrollbar_for(&scroll_handle, window, cx)
                         .into_any()
                 } else {
                     this.into_any()
@@ -14568,6 +14875,22 @@ mod tests {
         acp_v2::AvailableCommand::Command(acp_v2::Command::new(name, "").meta(
             acp_thread::meta_with_command_category(acp_thread::CommandCategory::Mcp),
         ))
+    }
+
+    #[test]
+    fn test_scrollbar_input_signals_manual_scroll_ownership() {
+        let manual_scroll_signal = ManualScrollSignal::default();
+        let scroll_handle = ConversationScrollHandle {
+            list_state: ListState::new(0, gpui::ListAlignment::Top, px(0.)),
+            manual_scroll_signal: manual_scroll_signal.clone(),
+        };
+        let initial_generation = manual_scroll_signal.generation();
+        scroll_handle.drag_started();
+        let drag_generation = manual_scroll_signal.generation();
+        assert_ne!(drag_generation, initial_generation);
+
+        scroll_handle.set_offset(gpui::point(px(0.), px(-10.)));
+        assert_ne!(manual_scroll_signal.generation(), drag_generation);
     }
 
     #[test]

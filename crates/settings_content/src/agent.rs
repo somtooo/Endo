@@ -463,6 +463,11 @@ pub struct AgentSettingsContent {
     ///
     /// Default: automatic
     pub thinking_display: Option<ThinkingBlockDisplay>,
+    /// Whether to follow an agent response until its user message reaches the top of the
+    /// conversation, then keep that message anchored while the response continues.
+    ///
+    /// Default: true
+    pub anchor_response_to_user_message: Option<bool>,
     /// Whether clicking the stop button on a running terminal tool should also cancel the agent's generation.
     /// Note that this only applies to the stop button, not to ctrl+c inside the terminal.
     ///
