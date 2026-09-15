@@ -6,13 +6,14 @@ use crate::{
     actions::{Format, FormatSelections},
     selections_collection::SelectionsCollection,
 };
+use feature_flags::{FeatureFlagAppExt as _, SelectionCommentFeatureFlag};
 use gpui::prelude::FluentBuilder;
 use gpui::{Context, DismissEvent, Entity, Focusable as _, Pixels, Point, Subscription, Window};
 use project::DisableAiSettings;
 use std::ops::Range;
 use text::PointUtf16;
 use workspace::OpenInTerminal;
-use zed_actions::agent::AddSelectionToThread;
+use zed_actions::agent::{AddSelectionCommentToThread, AddSelectionToThread};
 use zed_actions::preview::{
     markdown::OpenPreview as OpenMarkdownPreview, svg::OpenPreview as OpenSvgPreview,
 };
@@ -243,7 +244,8 @@ pub fn deploy_context_menu(
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("svg"))
             });
 
-        ui::ContextMenu::build(window, cx, |menu, _window, _cx| {
+        ui::ContextMenu::build(window, cx, |menu, _window, cx| {
+            let selection_comments_enabled = cx.has_flag::<SelectionCommentFeatureFlag>();
             let builder = menu
                 .on_blur_subscription(Subscription::new(|| {}))
                 .when(run_to_cursor, |builder| {
@@ -293,6 +295,12 @@ pub fn deploy_context_menu(
                 )
                 .when(!disable_ai && has_selections, |this| {
                     this.action("Add to Agent Thread", Box::new(AddSelectionToThread))
+                })
+                .when(!disable_ai && selection_comments_enabled, |this| {
+                    this.action(
+                        "Add Selection Comment To Thread",
+                        Box::new(AddSelectionCommentToThread),
+                    )
                 })
                 .separator()
                 .action("Cut", Box::new(Cut))
