@@ -75,6 +75,7 @@ mod markdown_actions;
 mod navigation;
 mod rewrap;
 mod selection;
+mod selection_comments;
 
 pub(crate) use actions::*;
 pub use clipboard::ClipboardSelection;
@@ -132,6 +133,8 @@ pub use multi_buffer::{
     MultiBufferOffset, MultiBufferOffsetUtf16, MultiBufferSnapshot, PathKey, RowInfo, ToOffset,
     ToPoint,
 };
+use selection_comments::SelectionCommentOverlay;
+pub use selection_comments::{SelectionCommentCallback, SelectionCommentEvent};
 pub use split::{DiffStyleControls, SplittableEditor, ToggleSplitDiff};
 pub use split_editor_view::SplitEditorView;
 pub use text::Bias;
@@ -1172,6 +1175,18 @@ pub struct Editor {
     stored_review_comments: Vec<(DiffHunkKey, Vec<StoredReviewComment>)>,
     /// Counter for generating unique comment IDs.
     next_review_comment_id: usize,
+    /// Active selection comment overlays for review feedback queued into the agent draft.
+    /// Unlike pending_inline_input there can be many at once, and confirmed
+    /// overlays stay visible until the agent message is sent.
+    pub(crate) selection_comment_overlays: Vec<SelectionCommentOverlay>,
+    /// Counter for generating unique selection comment IDs.
+    next_selection_comment_id: usize,
+    /// Whether this editor is the prompt input of a selection comment block.
+    /// Used to scope keybindings such as confirming with Cmd+Enter.
+    pub(crate) selection_comment_input: bool,
+    /// Whether the selection comment prompt sends with the modifier key.
+    /// Mirrors the agent Use Modifier To Send setting for the prompt input.
+    pub(crate) selection_comment_modifier_send: bool,
     hovered_diff_hunk_row: Option<DisplayRow>,
     pull_diagnostics_task: Task<()>,
     in_project_search: bool,
@@ -2546,6 +2561,10 @@ impl Editor {
             diff_review_overlays: Vec::new(),
             stored_review_comments: Vec::new(),
             next_review_comment_id: 0,
+            selection_comment_overlays: Vec::new(),
+            next_selection_comment_id: 0,
+            selection_comment_input: false,
+            selection_comment_modifier_send: false,
             hovered_diff_hunk_row: None,
             _subscriptions: (!is_minimap)
                 .then(|| {
@@ -2816,6 +2835,12 @@ impl Editor {
         }
         if self.pending_inline_input.is_some() {
             key_context.add("inline_input");
+        }
+        if self.selection_comment_input {
+            key_context.add("selection_comment_input");
+        }
+        if self.selection_comment_input && self.selection_comment_modifier_send {
+            key_context.add("selection_comment_modifier_send");
         }
 
         if let Some(snippet_stack) = self.snippet_stack.last() {
@@ -3589,6 +3614,7 @@ impl Editor {
 
         dismissed |= self.take_rename(false, window, cx).is_some();
         dismissed |= self.take_inline_input(window, cx).is_some();
+        dismissed |= self.cancel_focused_selection_comment(window, cx);
         dismissed |= self.hide_blame_popover(true, cx);
         dismissed |= hide_hover(self, cx);
         dismissed |= self.hide_signature_help(cx, SignatureHelpHiddenBy::Escape);
