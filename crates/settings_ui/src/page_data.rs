@@ -9187,6 +9187,29 @@ fn ai_page(cx: &App) -> SettingsPage {
                 files: USER,
             }),
             SettingsPageItem::SettingItem(SettingItem {
+                title: "Anchor Response To User Message",
+                description: "Whether to follow an agent response until its user message reaches the top of the conversation, then keep that message anchored while the response continues.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("agent.anchor_response_to_user_message"),
+                    pick: |settings_content| {
+                        settings_content
+                            .agent
+                            .as_ref()?
+                            .anchor_response_to_user_message
+                            .as_ref()
+                    },
+                    write: |settings_content, value, _| {
+                        settings_content
+                            .agent
+                            .get_or_insert_default()
+                            .anchor_response_to_user_message = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
                 title: "Cancel Generation On Terminal Stop",
                 description: "Whether clicking the stop button on a running terminal tool should also cancel the agent's generation. Note that this only applies to the stop button, not to ctrl+c inside the terminal.",
                 field: Box::new(SettingField {
