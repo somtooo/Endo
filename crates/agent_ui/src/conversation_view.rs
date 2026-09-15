@@ -1969,6 +1969,9 @@ impl ConversationView {
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
                         active.sync_reported_activity(cx);
+                        if thread.read(cx).status() == ThreadStatus::Idle {
+                            active.cancel_response_anchor();
+                        }
                         active.sync_generating_indicator(cx);
                     });
                 }
@@ -2004,6 +2007,12 @@ impl ConversationView {
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
                         active.sync_generating_indicator(cx);
+                        if matches!(
+                            thread.read(cx).entries().get(index),
+                            Some(AgentThreadEntry::UserMessage(_))
+                        ) {
+                            active.begin_response_anchor(index, cx);
+                        }
                     });
                 }
             }
@@ -2035,6 +2044,7 @@ impl ConversationView {
                     entry_view_state.update(cx, |view_state, _cx| view_state.remove(range.clone()));
                     list_state.splice(range.clone(), 0);
                     active.update(cx, |active, cx| {
+                        active.cancel_response_anchor();
                         active.sync_editor_mode(cx);
                     });
                 }
@@ -2077,6 +2087,11 @@ impl ConversationView {
                 if thread.read(cx).activity_generation() != *activity_generation
                     || thread.read(cx).foreground_activity() != ForegroundActivity::Idle
                 {
+                    if !is_subagent && let Some(active) = self.root_thread_view() {
+                        active.update(cx, |active, _cx| {
+                            active.message_queue.absorb_stale_generation_stopped();
+                        });
+                    }
                     return;
                 }
                 if let Some(active) = self.thread_view(&session_id) {
@@ -2084,6 +2099,7 @@ impl ConversationView {
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
                     active.update(cx, |active, cx| {
                         if !is_generating {
+                            active.cancel_response_anchor();
                             if thread.read(cx).uses_reported_activity() {
                                 active.sync_follow_agent_state(cx);
                             }
@@ -2201,6 +2217,7 @@ impl ConversationView {
                 let error = ThreadError::Refusal;
                 if let Some(active) = self.thread_view(&session_id) {
                     active.update(cx, |active, cx| {
+                        active.cancel_response_anchor();
                         active.handle_thread_error(error, cx);
                         active.thread_retry_status.take();
                     });
@@ -2218,6 +2235,7 @@ impl ConversationView {
                         matches!(thread.read(cx).status(), ThreadStatus::Generating);
                     active.update(cx, |active, cx| {
                         if !is_generating {
+                            active.cancel_response_anchor();
                             active.thread_retry_status.take();
                             if active.list_state.is_following_tail() {
                                 active.list_state.scroll_to_end();
@@ -11287,6 +11305,895 @@ pub(crate) mod tests {
         });
     }
 
+    async fn setup_message_navigation_test<'a>(
+        prompts: &[&str],
+        cx: &'a mut TestAppContext,
+    ) -> (
+        Entity<ConversationView>,
+        StubAgentConnection,
+        Entity<ThreadView>,
+        Vec<usize>,
+        &'a mut VisualTestContext,
+    ) {
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        let thread =
+            active_thread(&conversation_view, cx).read_with(cx, |view, _cx| view.thread.clone());
+
+        for prompt in prompts {
+            connection.set_next_prompt_updates(vec![acp_v1::SessionUpdate::AgentMessageChunk(
+                acp_v1::ContentChunk::new(format!("Response to {prompt}\n").repeat(10).into()),
+            )]);
+            thread
+                .update(cx, |thread, cx| thread.send_raw(prompt, cx))
+                .await
+                .expect("sending the prompt should succeed");
+            cx.run_until_parked();
+        }
+
+        let thread_view = active_thread(&conversation_view, cx);
+        let user_message_indices = thread_view.read_with(cx, |view, cx| {
+            view.thread
+                .read(cx)
+                .entries()
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| {
+                    matches!(entry, AgentThreadEntry::UserMessage(_)).then_some(index)
+                })
+                .collect()
+        });
+
+        (
+            conversation_view,
+            connection,
+            thread_view,
+            user_message_indices,
+            cx,
+        )
+    }
+
+    async fn setup_active_response_anchor_test(
+        cx: &mut TestAppContext,
+    ) -> (
+        Entity<ConversationView>,
+        StubAgentConnection,
+        Entity<ThreadView>,
+        acp_v2::SessionId,
+        usize,
+        &mut VisualTestContext,
+    ) {
+        let (conversation_view, connection, thread_view, _, cx) =
+            setup_message_navigation_test(&["Earlier prompt"], cx).await;
+
+        connection.set_next_prompt_updates(Vec::new());
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Current prompt", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let (session_id, user_message_index) = thread_view.read_with(cx, |view, cx| {
+            let thread = view.thread.read(cx);
+            let user_message_index = thread
+                .entries()
+                .iter()
+                .rposition(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                .expect("the current prompt should be present");
+            (thread.session_id().clone(), user_message_index)
+        });
+
+        (
+            conversation_view,
+            connection,
+            thread_view,
+            session_id,
+            user_message_index,
+            cx,
+        )
+    }
+
+    fn send_thread_update(
+        connection: &StubAgentConnection,
+        session_id: &acp_v2::SessionId,
+        update: acp_v1::SessionUpdate,
+        cx: &mut VisualTestContext,
+    ) {
+        cx.update(|_, cx| {
+            connection.send_update(session_id.clone(), update, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn send_response_chunk(
+        connection: &StubAgentConnection,
+        session_id: &acp_v2::SessionId,
+        text: impl Into<String>,
+        cx: &mut VisualTestContext,
+    ) {
+        send_thread_update(
+            connection,
+            session_id,
+            acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(text.into().into())),
+            cx,
+        );
+    }
+
+    fn latest_assistant_message_index(
+        thread_view: &Entity<ThreadView>,
+        cx: &VisualTestContext,
+    ) -> usize {
+        thread_view.read_with(cx, |view, cx| {
+            view.thread
+                .read(cx)
+                .entries()
+                .iter()
+                .rposition(|entry| matches!(entry, AgentThreadEntry::AssistantMessage(_)))
+                .expect("the response should be present")
+        })
+    }
+
+    fn assistant_message_after_user_message(
+        thread_view: &Entity<ThreadView>,
+        user_message_index: usize,
+        cx: &VisualTestContext,
+    ) -> usize {
+        thread_view.read_with(cx, |view, cx| {
+            view.thread
+                .read(cx)
+                .entries()
+                .iter()
+                .enumerate()
+                .skip(user_message_index.saturating_add(1))
+                .take_while(|(_, entry)| !matches!(entry, AgentThreadEntry::UserMessage(_)))
+                .find_map(|(index, entry)| {
+                    matches!(entry, AgentThreadEntry::AssistantMessage(_)).then_some(index)
+                })
+                .expect("the user message should have an assistant response")
+        })
+    }
+
+    fn draw_thread_view(
+        thread_view: &Entity<ThreadView>,
+        height: Pixels,
+        cx: &mut VisualTestContext,
+    ) {
+        // Markdown in thread entries is parsed lazily on first layout, so an
+        // extra frame lets newly rendered entries report their measured sizes.
+        for _ in 0..2 {
+            cx.run_until_parked();
+            cx.draw(point(px(0.0), px(0.0)), size(px(800.0), height), |_, _| {
+                thread_view.clone().into_any_element()
+            });
+        }
+    }
+
+    fn advance_streaming_response(cx: &mut VisualTestContext) {
+        for _ in 0..20 {
+            cx.executor().advance_clock(Duration::from_millis(20));
+            cx.run_until_parked();
+        }
+    }
+
+    fn grow_response_past_anchor(
+        connection: &StubAgentConnection,
+        session_id: &acp_v2::SessionId,
+        thread_view: &Entity<ThreadView>,
+        cx: &mut VisualTestContext,
+    ) {
+        draw_thread_view(thread_view, px(500.0), cx);
+        send_response_chunk(connection, session_id, "Beginning of the response", cx);
+        send_response_chunk(
+            connection,
+            session_id,
+            "\n\nA longer response paragraph.".repeat(20),
+            cx,
+        );
+        advance_streaming_response(cx);
+        draw_thread_view(thread_view, px(500.0), cx);
+        draw_thread_view(thread_view, px(500.0), cx);
+    }
+
+    fn assert_entry_at_top(
+        thread_view: &Entity<ThreadView>,
+        entry_index: usize,
+        cx: &VisualTestContext,
+    ) {
+        thread_view.read_with(cx, |view, _cx| {
+            let scroll_top = view.list_state.logical_scroll_top();
+            assert_eq!(
+                scroll_top.item_ix, entry_index,
+                "the expected entry should be at the top"
+            );
+            assert_eq!(
+                scroll_top.offset_in_item,
+                px(0.0),
+                "the entry should not be partially scrolled"
+            );
+            let entry_bounds = view
+                .list_state
+                .bounds_for_item(entry_index)
+                .expect("the expected entry should be rendered");
+            assert_eq!(
+                entry_bounds.top(),
+                view.list_state.viewport_bounds().top(),
+                "the rendered entry should align with the viewport top"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_response_follows_until_user_message_reaches_top(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+
+        draw_thread_view(&thread_view, px(500.0), cx);
+        let initial_user_message_top = thread_view.read_with(cx, |view, _cx| {
+            view.list_state
+                .bounds_for_item(user_message_index)
+                .expect("the current prompt should be rendered")
+                .top()
+        });
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    "Beginning of the response".into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        draw_thread_view(&thread_view, px(500.0), cx);
+        let moving_user_message_top = thread_view.read_with(cx, |view, _cx| {
+            assert!(
+                view.list_state.is_following_tail(),
+                "the conversation should retain Zed's tail following before the threshold"
+            );
+            view.list_state
+                .bounds_for_item(user_message_index)
+                .expect("the current prompt should remain rendered")
+                .top()
+        });
+        assert!(
+            moving_user_message_top < initial_user_message_top,
+            "the rendered user message should move upward as the response grows"
+        );
+
+        cx.update(|_, cx| {
+            connection.send_update(
+                session_id.clone(),
+                acp_v1::SessionUpdate::AgentMessageChunk(acp_v1::ContentChunk::new(
+                    "\n\nA longer response paragraph.".repeat(20).into(),
+                )),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        advance_streaming_response(cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        assert_entry_at_top(&thread_view, user_message_index, cx);
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(
+                !view.list_state.is_following_tail(),
+                "tail following should stop after the user message reaches the top"
+            );
+        });
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_response_reanchors_after_automatic_thinking_collapse(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        send_thread_update(
+            &connection,
+            &session_id,
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                "Thinking begins".into(),
+            )),
+            cx,
+        );
+        send_thread_update(
+            &connection,
+            &session_id,
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                "\n\nA longer thought paragraph.".repeat(200).into(),
+            )),
+            cx,
+        );
+        advance_streaming_response(cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+        assert_entry_at_top(&thread_view, user_message_index, cx);
+
+        send_response_chunk(&connection, &session_id, "Beginning of the response", cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        thread_view.read_with(cx, |view, _cx| {
+            let user_message_bounds = view
+                .list_state
+                .bounds_for_item(user_message_index)
+                .expect("the user message should remain visible");
+            assert!(
+                user_message_bounds.top() > view.list_state.viewport_bounds().top(),
+                "collapsing the thinking block should move the user message below the top"
+            );
+            assert!(
+                view.list_state.is_following_tail(),
+                "the conversation should resume tail following after layout contracts"
+            );
+        });
+
+        send_response_chunk(
+            &connection,
+            &session_id,
+            "\n\nA longer response paragraph.".repeat(20),
+            cx,
+        );
+        advance_streaming_response(cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        assert_entry_at_top(&thread_view, user_message_index, cx);
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(
+                !view.list_state.is_following_tail(),
+                "the response should anchor again when it reaches the top"
+            );
+        });
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_long_user_message_hidden_by_initial_response_anchors_at_response_start(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection.clone()), cx).await;
+        connection.set_next_prompt_updates(Vec::new());
+
+        let prompt = (1..=30)
+            .map(|line_number| format!("Prompt line {line_number}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text(&prompt, window, cx);
+        });
+        let thread_view = active_thread(&conversation_view, cx);
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        let (session_id, user_message_index) = thread_view.read_with(cx, |view, cx| {
+            let thread = view.thread.read(cx);
+            let user_message_index = thread
+                .entries()
+                .iter()
+                .position(|entry| matches!(entry, AgentThreadEntry::UserMessage(_)))
+                .expect("the prompt should be present");
+            (thread.session_id().clone(), user_message_index)
+        });
+
+        send_response_chunk(&connection, &session_id, "Beginning of the response", cx);
+        send_response_chunk(
+            &connection,
+            &session_id,
+            "\n\nA longer response paragraph.".repeat(200),
+            cx,
+        );
+        advance_streaming_response(cx);
+        draw_thread_view(&thread_view, px(250.0), cx);
+        thread_view.read_with(cx, |view, _cx| {
+            assert_eq!(
+                view.list_state.item_is_above_viewport(user_message_index),
+                Some(true),
+                "the initial response should push the prompt above the viewport"
+            );
+        });
+
+        let response_index = latest_assistant_message_index(&thread_view, cx);
+        draw_thread_view(&thread_view, px(250.0), cx);
+        draw_thread_view(&thread_view, px(250.0), cx);
+        assert_entry_at_top(&thread_view, response_index, cx);
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_short_response_finishes_without_anchoring(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+
+        draw_thread_view(&thread_view, px(500.0), cx);
+        send_response_chunk(&connection, &session_id, "A short response", cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        thread_view.read_with(cx, |view, _cx| {
+            let user_message_bounds = view
+                .list_state
+                .bounds_for_item(user_message_index)
+                .expect("the user message should remain visible");
+            assert!(
+                user_message_bounds.top() > view.list_state.viewport_bounds().top(),
+                "a short response should stop before the user message reaches the top"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_manual_scroll_cancels_response_anchor(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, _, cx) =
+            setup_active_response_anchor_test(cx).await;
+
+        draw_thread_view(&thread_view, px(500.0), cx);
+        send_response_chunk(&connection, &session_id, "Beginning of the response", cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        let list_state = thread_view.read_with(cx, |view, _cx| view.list_state.clone());
+        let response_index = latest_assistant_message_index(&thread_view, cx);
+        let response_bounds = list_state
+            .bounds_for_item(response_index)
+            .expect("the response should be rendered");
+        cx.simulate_event(gpui::ScrollEvent {
+            position: response_bounds
+                .intersect(&list_state.viewport_bounds())
+                .center(),
+            delta: gpui::ScrollDelta::Lines(point(0.0, 1.0)),
+            ..Default::default()
+        });
+        let manual_position = list_state.logical_scroll_top();
+
+        send_response_chunk(
+            &connection,
+            &session_id,
+            "\n\nA longer response paragraph.".repeat(20),
+            cx,
+        );
+        advance_streaming_response(cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        let scroll_top = list_state.logical_scroll_top();
+        assert_eq!(scroll_top.item_ix, manual_position.item_ix);
+        assert_eq!(scroll_top.offset_in_item, manual_position.offset_in_item);
+        assert!(
+            !list_state.is_following_tail(),
+            "response growth should not reclaim control after manual scrolling"
+        );
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_manual_scroll_after_anchoring_retains_control(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+        grow_response_past_anchor(&connection, &session_id, &thread_view, cx);
+        assert_entry_at_top(&thread_view, user_message_index, cx);
+
+        let list_state = thread_view.read_with(cx, |view, _cx| view.list_state.clone());
+        let response_index = latest_assistant_message_index(&thread_view, cx);
+        let response_bounds = list_state
+            .bounds_for_item(response_index)
+            .expect("the response should be rendered");
+        cx.simulate_event(gpui::ScrollEvent {
+            position: response_bounds
+                .intersect(&list_state.viewport_bounds())
+                .center(),
+            delta: gpui::ScrollDelta::Lines(point(0.0, -3.0)),
+            ..Default::default()
+        });
+        let manual_position = list_state.logical_scroll_top();
+
+        send_response_chunk(
+            &connection,
+            &session_id,
+            "\n\nMore response content after manual scrolling",
+            cx,
+        );
+        advance_streaming_response(cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        let scroll_top = list_state.logical_scroll_top();
+        assert_eq!(scroll_top.item_ix, manual_position.item_ix);
+        assert_eq!(scroll_top.offset_in_item, manual_position.offset_in_item);
+        assert!(
+            !list_state.is_following_tail(),
+            "response growth should not reclaim control after manual scrolling"
+        );
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_scrollbar_movement_after_anchoring_retains_control(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+        grow_response_past_anchor(&connection, &session_id, &thread_view, cx);
+        assert_entry_at_top(&thread_view, user_message_index, cx);
+
+        let scroll_handle =
+            thread_view.read_with(cx, |view, _cx| view.conversation_scroll_handle());
+        ui::ScrollableHandle::set_offset(&scroll_handle, point(px(0.), px(0.)));
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        send_response_chunk(
+            &connection,
+            &session_id,
+            "\n\nMore response content after scrollbar navigation",
+            cx,
+        );
+        advance_streaming_response(cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        thread_view.read_with(cx, |view, _cx| {
+            let scroll_top = view.list_state.logical_scroll_top();
+            assert_eq!(scroll_top.item_ix, 0);
+            assert_eq!(scroll_top.offset_in_item, px(0.));
+            assert!(
+                !view.list_state.is_following_tail(),
+                "response growth should not reclaim control after scrollbar navigation"
+            );
+        });
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_scroll_to_bottom_keeps_following_current_response(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+        thread_view.update(cx, |view, cx| view.scroll_to_end(cx));
+
+        grow_response_past_anchor(&connection, &session_id, &thread_view, cx);
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(
+                view.list_state.is_following_tail(),
+                "explicit bottom navigation should retain tail following"
+            );
+            assert_ne!(
+                view.list_state.logical_scroll_top().item_ix,
+                user_message_index,
+                "explicit bottom navigation should cancel the pending response anchor"
+            );
+        });
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_new_user_message_starts_new_response_anchor_cycle(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+        grow_response_past_anchor(&connection, &session_id, &thread_view, cx);
+        assert_entry_at_top(&thread_view, user_message_index, cx);
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+
+        connection.set_next_prompt_updates(Vec::new());
+        message_editor(&conversation_view, cx).update_in(cx, |editor, window, cx| {
+            editor.set_text("Follow-up prompt", window, cx);
+        });
+        thread_view.update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+        draw_thread_view(&thread_view, px(500.0), cx);
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(
+                view.list_state.is_following_tail(),
+                "a follow-up prompt should restore Zed's tail-following cycle"
+            );
+        });
+
+        let session_id =
+            thread_view.read_with(cx, |view, cx| view.thread.read(cx).session_id().clone());
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_disabling_response_anchor_preserves_tail_following(cx: &mut TestAppContext) {
+        init_test(cx);
+        cx.update(|cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    anchor_response_to_user_message: false,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+        grow_response_past_anchor(&connection, &session_id, &thread_view, cx);
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(view.list_state.is_following_tail());
+            assert_ne!(
+                view.list_state.logical_scroll_top().item_ix,
+                user_message_index,
+                "the disabled setting should not pin the user message"
+            );
+        });
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_disabled_replacement_turn_discards_previous_response_anchor(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, _session_id, _, cx) =
+            setup_active_response_anchor_test(cx).await;
+        cx.update(|_window, cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    anchor_response_to_user_message: false,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
+
+        let thread = thread_view.read_with(cx, |view, _cx| view.thread.clone());
+        let replacement_request =
+            thread.update(cx, |thread, cx| thread.send_raw("Replacement prompt", cx));
+        cx.run_until_parked();
+        let session_id = thread.read_with(cx, |thread, _cx| thread.session_id().clone());
+        grow_response_past_anchor(&connection, &session_id, &thread_view, cx);
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(
+                view.list_state.is_following_tail(),
+                "a disabled replacement turn must not retain the previous turn's anchor"
+            );
+        });
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        replacement_request
+            .await
+            .expect("the replacement request should complete");
+    }
+
+    #[gpui::test]
+    async fn test_alt_scroll_navigates_between_user_messages(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, _connection, thread_view, user_message_indices, cx) =
+            setup_message_navigation_test(&["Prompt 1", "Prompt 2", "Prompt 3"], cx).await;
+        let [first_user_message, second_user_message, third_user_message] =
+            user_message_indices.as_slice()
+        else {
+            panic!("expected three user messages");
+        };
+        let second_response =
+            assistant_message_after_user_message(&thread_view, *second_user_message, cx);
+
+        let list_state = thread_view.read_with(cx, |view, _cx| view.list_state.clone());
+        list_state.scroll_to(ListOffset {
+            item_ix: *second_user_message,
+            offset_in_item: px(0.0),
+        });
+        draw_thread_view(&thread_view, px(350.0), cx);
+        let response_bounds = list_state
+            .bounds_for_item(second_response)
+            .expect("the second response should be rendered");
+        cx.simulate_event(gpui::ScrollEvent {
+            position: response_bounds
+                .intersect(&list_state.viewport_bounds())
+                .center(),
+            delta: gpui::ScrollDelta::Lines(point(0.0, 1.0)),
+            modifiers: gpui::Modifiers::alt(),
+            ..Default::default()
+        });
+        draw_thread_view(&thread_view, px(350.0), cx);
+        assert_entry_at_top(&thread_view, *first_user_message, cx);
+
+        list_state.scroll_to(ListOffset {
+            item_ix: *second_user_message,
+            offset_in_item: px(0.0),
+        });
+        draw_thread_view(&thread_view, px(350.0), cx);
+        let response_bounds = list_state
+            .bounds_for_item(second_response)
+            .expect("the second response should be rendered");
+        cx.simulate_event(gpui::ScrollEvent {
+            position: response_bounds
+                .intersect(&list_state.viewport_bounds())
+                .center(),
+            delta: gpui::ScrollDelta::Lines(point(0.0, -1.0)),
+            modifiers: gpui::Modifiers::alt(),
+            ..Default::default()
+        });
+        draw_thread_view(&thread_view, px(350.0), cx);
+        assert_entry_at_top(&thread_view, *third_user_message, cx);
+    }
+
+    #[gpui::test]
+    async fn test_alt_trackpad_scroll_accumulates_before_navigating(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, _connection, thread_view, user_message_indices, cx) =
+            setup_message_navigation_test(&["Prompt 1", "Prompt 2", "Prompt 3"], cx).await;
+        let [first_user_message, second_user_message, _] = user_message_indices.as_slice() else {
+            panic!("expected three user messages");
+        };
+        let second_response =
+            assistant_message_after_user_message(&thread_view, *second_user_message, cx);
+
+        let list_state = thread_view.read_with(cx, |view, _cx| view.list_state.clone());
+        list_state.scroll_to(ListOffset {
+            item_ix: *second_user_message,
+            offset_in_item: px(0.0),
+        });
+        draw_thread_view(&thread_view, px(350.0), cx);
+        let response_bounds = list_state
+            .bounds_for_item(second_response)
+            .expect("the second response should be rendered");
+        let scroll_event = gpui::ScrollEvent {
+            position: response_bounds
+                .intersect(&list_state.viewport_bounds())
+                .center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(20.0))),
+            modifiers: gpui::Modifiers::alt(),
+            ..Default::default()
+        };
+
+        cx.simulate_event(scroll_event.clone());
+        assert_entry_at_top(&thread_view, *second_user_message, cx);
+
+        draw_thread_view(&thread_view, px(350.0), cx);
+        cx.simulate_event(scroll_event);
+        draw_thread_view(&thread_view, px(350.0), cx);
+        assert_entry_at_top(&thread_view, *first_user_message, cx);
+    }
+
+    #[gpui::test]
+    async fn test_horizontal_alt_scroll_does_not_navigate_messages(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, _connection, thread_view, user_message_indices, cx) =
+            setup_message_navigation_test(&["Prompt 1", "Prompt 2", "Prompt 3"], cx).await;
+        let [_, second_user_message, _] = user_message_indices.as_slice() else {
+            panic!("expected three user messages");
+        };
+        let second_response =
+            assistant_message_after_user_message(&thread_view, *second_user_message, cx);
+
+        let list_state = thread_view.read_with(cx, |view, _cx| view.list_state.clone());
+        list_state.scroll_to(ListOffset {
+            item_ix: *second_user_message,
+            offset_in_item: px(0.0),
+        });
+        draw_thread_view(&thread_view, px(350.0), cx);
+        let response_bounds = list_state
+            .bounds_for_item(second_response)
+            .expect("the second response should be rendered");
+        cx.simulate_event(gpui::ScrollEvent {
+            position: response_bounds
+                .intersect(&list_state.viewport_bounds())
+                .center(),
+            delta: gpui::ScrollDelta::Lines(point(1.0, 0.0)),
+            modifiers: gpui::Modifiers::alt(),
+            ..Default::default()
+        });
+
+        draw_thread_view(&thread_view, px(350.0), cx);
+        assert_entry_at_top(&thread_view, *second_user_message, cx);
+    }
+
+    #[gpui::test]
+    async fn test_alt_trackpad_input_cancels_response_anchor_before_navigation(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+        draw_thread_view(&thread_view, px(500.0), cx);
+        let previous_response_index = latest_assistant_message_index(&thread_view, cx);
+        let list_state = thread_view.read_with(cx, |view, _cx| view.list_state.clone());
+        let response_bounds = list_state
+            .bounds_for_item(previous_response_index)
+            .expect("the previous response should be rendered");
+
+        cx.simulate_event(gpui::ScrollEvent {
+            position: response_bounds
+                .intersect(&list_state.viewport_bounds())
+                .center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.0), px(20.0))),
+            modifiers: gpui::Modifiers::alt(),
+            ..Default::default()
+        });
+        grow_response_past_anchor(&connection, &session_id, &thread_view, cx);
+
+        thread_view.read_with(cx, |view, _cx| {
+            assert!(view.list_state.is_following_tail());
+            assert_ne!(
+                view.list_state.logical_scroll_top().item_ix,
+                user_message_index,
+                "accepted Alt-trackpad input should surrender automatic anchoring immediately"
+            );
+        });
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_horizontal_alt_scroll_preserves_response_anchor(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+        draw_thread_view(&thread_view, px(500.0), cx);
+        let previous_response_index = latest_assistant_message_index(&thread_view, cx);
+        let list_state = thread_view.read_with(cx, |view, _cx| view.list_state.clone());
+        let response_bounds = list_state
+            .bounds_for_item(previous_response_index)
+            .expect("the previous response should be rendered");
+
+        cx.simulate_event(gpui::ScrollEvent {
+            position: response_bounds
+                .intersect(&list_state.viewport_bounds())
+                .center(),
+            delta: gpui::ScrollDelta::Lines(point(1.0, 0.0)),
+            modifiers: gpui::Modifiers::alt(),
+            ..Default::default()
+        });
+        grow_response_past_anchor(&connection, &session_id, &thread_view, cx);
+
+        assert_entry_at_top(&thread_view, user_message_index, cx);
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+    }
+
     #[gpui::test]
     async fn test_scroll_to_most_recent_user_prompt(cx: &mut TestAppContext) {
         init_test(cx);
@@ -15292,10 +16199,17 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
-    async fn test_stale_stop_does_not_disable_follow_tail_during_regenerate(
-        cx: &mut TestAppContext,
-    ) {
+    async fn test_stale_stop_does_not_affect_newer_turn(cx: &mut TestAppContext) {
         init_test(cx);
+        cx.update(|cx| {
+            AgentSettings::override_global(
+                AgentSettings {
+                    anchor_response_to_user_message: false,
+                    ..AgentSettings::get_global(cx).clone()
+                },
+                cx,
+            );
+        });
 
         let connection = StubAgentConnection::new();
 
@@ -15333,6 +16247,16 @@ pub(crate) mod tests {
         user_message_editor.update_in(cx, |_editor, window, cx| {
             window.dispatch_action(Box::new(Chat), cx);
         });
+        active_thread(&conversation_view, cx).update_in(cx, |view, window, cx| {
+            view.add_to_queue(
+                vec![acp_v2::ContentBlock::Text(acp_v2::TextContent::new(
+                    "queued after regenerate".to_string(),
+                ))],
+                Vec::new(),
+                window,
+                cx,
+            );
+        });
 
         cx.run_until_parked();
 
@@ -15344,6 +16268,97 @@ pub(crate) mod tests {
             assert!(
                 active.list_state.is_following_tail(),
                 "stale stop events from the cancelled turn must not disable follow-tail for the new turn"
+            );
+            assert_eq!(
+                active.message_queue.len(),
+                1,
+                "a stale stop must not dispatch a queued message into the newer turn"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_stale_stop_after_send_now_does_not_swallow_the_newer_turn_stop(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let connection = StubAgentConnection::new().with_receipt_submissions(true);
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+        let thread_view = active_thread(&conversation_view, cx);
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+
+        let send_now_id = thread_view.update_in(cx, |view, window, cx| {
+            view.add_to_queue(vec!["send now".into()], vec![], window, cx);
+            view.add_to_queue(vec!["after the newer turn".into()], vec![], window, cx);
+            view.message_queue
+                .first_id()
+                .expect("the first queued message should exist")
+        });
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("the first turn should start running");
+        });
+        cx.run_until_parked();
+
+        // "Send Now" while generating makes the queue expect a stop from the
+        // cancellation it just caused.
+        thread_view.update_in(cx, |view, window, cx| {
+            view.send_queued_message_now(send_now_id, window, cx);
+        });
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(view.message_queue.len(), 1);
+        });
+
+        // The cancelled turn's stop is only delivered after the newer turn
+        // has already started, so it arrives stale.
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Idle(
+                        acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::Cancelled),
+                    ),
+                    cx,
+                )
+                .expect("the cancelled turn should stop");
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Running(acp_v2::RunningStateUpdate::new()),
+                    cx,
+                )
+                .expect("the newer turn should start running");
+        });
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.message_queue.len(),
+                1,
+                "a stale stop must not dispatch a queued message into the newer turn"
+            );
+        });
+
+        thread.update(cx, |thread, cx| {
+            thread
+                .update_session_state(
+                    acp_v2::StateUpdate::Idle(
+                        acp_v2::IdleStateUpdate::new().stop_reason(acp_v2::StopReason::EndTurn),
+                    ),
+                    cx,
+                )
+                .expect("the newer turn should finish");
+        });
+        cx.run_until_parked();
+        thread_view.read_with(cx, |view, _| {
+            assert_eq!(
+                view.message_queue.len(),
+                0,
+                "the newer turn's own stop must still send the next queued message"
             );
         });
     }
