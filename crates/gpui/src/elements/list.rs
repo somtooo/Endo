@@ -738,6 +738,20 @@ impl ListState {
         None
     }
 
+    /// Get the measured size of the given item.
+    pub fn size_for_item(&self, ix: usize) -> Option<Size<Pixels>> {
+        let state = &*self.0.borrow();
+        let mut cursor = state.items.cursor::<Count>(());
+        cursor.seek(&Count(ix), Bias::Right);
+        if cursor.start().0 != ix {
+            return None;
+        }
+        match cursor.item()? {
+            ListItem::Measured { size, .. } => Some(*size),
+            ListItem::Unmeasured { .. } => None,
+        }
+    }
+
     /// Call this method when the user starts dragging the scrollbar.
     ///
     /// This will prevent the height reported to the scrollbar from changing during the drag
@@ -1945,6 +1959,56 @@ mod test {
         let offset = state.logical_scroll_top();
         assert_eq!(offset.item_ix, 0);
         assert_eq!(offset.offset_in_item, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_horizontal_input_does_not_scroll_or_notify_vertical_list(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(10, crate::ListAlignment::Top, px(10.));
+        let did_scroll = Rc::new(Cell::new(false));
+        state.set_scroll_handler({
+            let did_scroll = did_scroll.clone();
+            move |_, _, _| did_scroll.set(true)
+        });
+        let view = cx.update(|_, cx| cx.new(|_| TestListView(state.clone())));
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.into_any_element()
+        });
+        cx.simulate_event(ScrollEvent {
+            position: point(px(50.), px(20.)),
+            delta: ScrollDelta::Lines(point(1.0, 0.0)),
+            ..Default::default()
+        });
+
+        assert!(!did_scroll.get());
+        let scroll_top = state.logical_scroll_top();
+        assert_eq!(scroll_top.item_ix, 0);
+        assert_eq!(scroll_top.offset_in_item, px(0.));
+    }
+
+    #[gpui::test]
+    fn test_size_for_measured_item_above_viewport(cx: &mut TestAppContext) {
+        let cx = cx.add_empty_window();
+        let state = ListState::new(5, crate::ListAlignment::Top, px(10.)).measure_all();
+        let view = cx.update(|_, cx| cx.new(|_| TestListView(state.clone())));
+
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.clone().into_any_element()
+        });
+        state.scroll_to(ListOffset {
+            item_ix: 2,
+            offset_in_item: px(0.),
+        });
+        cx.draw(point(px(0.), px(0.)), size(px(100.), px(40.)), |_, _| {
+            view.into_any_element()
+        });
+
+        assert_eq!(state.bounds_for_item(0), None);
+        assert_eq!(
+            state.size_for_item(0).map(|size| size.height),
+            Some(px(20.))
+        );
     }
 
     #[gpui::test]
