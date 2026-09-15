@@ -16156,6 +16156,651 @@ pub(crate) mod tests {
     }
 
     #[gpui::test]
+    async fn test_selection_comment_queues_prose_into_draft(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+
+        let project = conversation_view.read_with(cx, |conversation_view, _cx| {
+            conversation_view.project.clone()
+        });
+        let workspace = conversation_view.read_with(cx, |conversation_view, _cx| {
+            conversation_view.workspace.upgrade().unwrap()
+        });
+        let buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer("let a = 10 + 10;", None, false, cx)
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let editor = cx.new(|cx| {
+                let mut editor =
+                    Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx);
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([MultiBufferOffset(8)..MultiBufferOffset(15)]);
+                });
+                editor
+            });
+            workspace.add_item_to_active_pane(Box::new(editor), None, false, window, cx);
+        });
+
+        let selection = workspace
+            .update(cx, |workspace, cx| {
+                AgentContextSource::from_active(workspace, cx)?.read_selection(workspace, false, cx)
+            })
+            .unwrap();
+
+        workspace.update_in(cx, |_workspace, window, cx| {
+            crate::selection_comments::queue_selection_comment(
+                &conversation_view,
+                selection,
+                "explain this".to_string(),
+                window,
+                cx,
+            );
+        });
+
+        message_editor.read_with(cx, |editor, cx| {
+            assert!(editor.text(cx).contains("explain this"));
+        });
+    }
+
+    fn add_selection_comment_source_editor(
+        conversation_view: &Entity<ConversationView>,
+        text: &str,
+        cx: &mut VisualTestContext,
+    ) -> (Entity<workspace::Workspace>, Entity<Editor>) {
+        let (workspace, project) = conversation_view.read_with(cx, |conversation_view, _cx| {
+            (
+                conversation_view.workspace.upgrade().unwrap(),
+                conversation_view.project.clone(),
+            )
+        });
+        let buffer = project.update(cx, |project, cx| {
+            project.create_local_buffer(text, None, false, cx)
+        });
+        let source_editor = workspace.update_in(cx, |workspace, window, cx| {
+            let editor =
+                cx.new(|cx| Editor::for_buffer(buffer.clone(), Some(project.clone()), window, cx));
+            workspace.add_item_to_active_pane(Box::new(editor.clone()), None, false, window, cx);
+            editor
+        });
+        (workspace, source_editor)
+    }
+
+    fn confirm_selection_comment_into_draft(
+        conversation_view: &Entity<ConversationView>,
+        workspace: &Entity<workspace::Workspace>,
+        source_editor: &Entity<Editor>,
+        range: std::ops::Range<text::Point>,
+        comment: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        let conversation_view = conversation_view.clone();
+        confirm_selection_comment_with(
+            move |_workspace, _cx| Some(conversation_view.clone()),
+            workspace,
+            source_editor,
+            range,
+            comment,
+            cx,
+        );
+    }
+
+    fn confirm_selection_comment_with(
+        resolve_conversation_view: impl Fn(
+            &workspace::Workspace,
+            &App,
+        ) -> Option<Entity<ConversationView>>
+        + Clone
+        + 'static,
+        workspace: &Entity<workspace::Workspace>,
+        source_editor: &Entity<Editor>,
+        range: std::ops::Range<text::Point>,
+        comment: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        source_editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchor_range =
+                snapshot.anchor_before(range.start)..snapshot.anchor_before(range.end);
+            let queued_ranges = editor.selection_comment_queue_ranges(&anchor_range, cx);
+            let callback = crate::selection_comments::comment_callback(
+                workspace.downgrade(),
+                cx.entity().downgrade(),
+                crate::completion_provider::AgentContextSelection::Editor(queued_ranges),
+                resolve_conversation_view,
+            );
+            editor.show_selection_comment(anchor_range, callback, true, window, cx);
+            let prompt = editor.selection_comment_prompt_editor().unwrap();
+            prompt.update(cx, |prompt, cx| {
+                prompt.set_text(comment, window, cx);
+            });
+            window.focus(&prompt.focus_handle(cx), cx);
+            editor.confirm_selection_comment(window, cx);
+        });
+        cx.run_until_parked();
+    }
+
+    fn draft_text(message_editor: &Entity<MessageEditor>, cx: &mut VisualTestContext) -> String {
+        message_editor.read_with(cx, |message_editor, cx| message_editor.text(cx))
+    }
+
+    fn edit_draft(
+        message_editor: &Entity<MessageEditor>,
+        edit: impl FnOnce(&mut Editor, &mut Context<Editor>),
+        cx: &mut VisualTestContext,
+    ) {
+        message_editor.update(cx, |message_editor, cx| {
+            message_editor.editor().update(cx, edit);
+        });
+        cx.run_until_parked();
+    }
+
+    fn replace_in_draft(
+        message_editor: &Entity<MessageEditor>,
+        find: &str,
+        replace_with: &str,
+        cx: &mut VisualTestContext,
+    ) {
+        edit_draft(
+            message_editor,
+            |editor, cx| {
+                let start = editor.text(cx).find(find).unwrap();
+                editor.edit(
+                    [(
+                        MultiBufferOffset(start)..MultiBufferOffset(start + find.len()),
+                        replace_with,
+                    )],
+                    cx,
+                );
+            },
+            cx,
+        );
+    }
+
+    fn delete_marker(source_editor: &Entity<Editor>, index: usize, cx: &mut VisualTestContext) {
+        source_editor.update_in(cx, |editor, window, cx| {
+            let id = editor.selection_comment_ids()[index];
+            assert!(editor.delete_selection_comment(id, window, cx));
+        });
+        cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_selection_comment_marker_delete_removes_only_its_draft_entry(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("Please review:\n", window, cx);
+            editor.set_cursor_offset("Please review:\n".len(), window, cx);
+        });
+        let (workspace, source_editor) = add_selection_comment_source_editor(
+            &conversation_view,
+            "let a = 10 + 10;\nlet b = 2;",
+            cx,
+        );
+
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            text::Point::new(0, 0)..text::Point::new(0, 5),
+            "first note",
+            cx,
+        );
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            text::Point::new(1, 0)..text::Point::new(1, 5),
+            "second note",
+            cx,
+        );
+
+        let draft = draft_text(&message_editor, cx);
+        let position = |needle: &str| {
+            draft
+                .find(needle)
+                .unwrap_or_else(|| panic!("{needle:?} missing from draft {draft:?}"))
+        };
+        assert!(position("Please review:") < position("first note"));
+        assert!(position("first note") < position("second note"));
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.confirmed_selection_comment_count(), 2);
+        });
+
+        // Text typed right next to a queued entry belongs to the user, not to
+        // the entry, so removing the entry must leave it alone.
+        edit_draft(
+            &message_editor,
+            |editor, cx| {
+                let end = editor.buffer().read(cx).len(cx);
+                editor.edit([(end..end, "thanks")], cx);
+                let start = editor.text(cx).find("selection").unwrap();
+                editor.edit(
+                    [(MultiBufferOffset(start)..MultiBufferOffset(start), "NOTE ")],
+                    cx,
+                );
+            },
+            cx,
+        );
+
+        delete_marker(&source_editor, 0, cx);
+        let draft = draft_text(&message_editor, cx);
+        assert!(!draft.contains("first note"), "{draft:?}");
+        assert!(draft.contains("second note"), "{draft:?}");
+        assert!(draft.contains("NOTE "), "{draft:?}");
+        assert!(draft.contains("thanks"), "{draft:?}");
+        assert_eq!(
+            draft.matches("selection").count(),
+            1,
+            "only the second pill should remain: {draft:?}"
+        );
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.confirmed_selection_comment_texts(), ["second note"]);
+        });
+
+        delete_marker(&source_editor, 0, cx);
+        let draft = draft_text(&message_editor, cx);
+        assert!(!draft.contains("second note"), "{draft:?}");
+        assert!(!draft.contains("selection"), "{draft:?}");
+        assert!(draft.starts_with("Please review:"), "{draft:?}");
+    }
+
+    #[gpui::test]
+    async fn test_selection_comment_draft_edits_update_and_remove_marker(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        let (workspace, source_editor) = add_selection_comment_source_editor(
+            &conversation_view,
+            "let a = 10 + 10;\nlet b = 2;",
+            cx,
+        );
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            text::Point::new(0, 0)..text::Point::new(0, 5),
+            "rename this please",
+            cx,
+        );
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            text::Point::new(1, 0)..text::Point::new(1, 5),
+            "check bounds",
+            cx,
+        );
+
+        // Trimming words in the draft is reflected on the marker.
+        replace_in_draft(&message_editor, " please", "", cx);
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(
+                editor.confirmed_selection_comment_texts(),
+                ["rename this", "check bounds"]
+            );
+        });
+
+        // Typing into the draft is reflected too.
+        replace_in_draft(&message_editor, "check", "double check", cx);
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(
+                editor.confirmed_selection_comment_texts(),
+                ["rename this", "double check bounds"]
+            );
+        });
+
+        // Deleting all of one comment removes only that marker.
+        replace_in_draft(&message_editor, "rename this", "", cx);
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(
+                editor.confirmed_selection_comment_texts(),
+                ["double check bounds"]
+            );
+        });
+        let draft = draft_text(&message_editor, cx);
+        assert!(draft.contains("double check bounds"), "{draft:?}");
+
+        // Emptying the whole draft clears the rest.
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("", window, cx);
+        });
+        cx.run_until_parked();
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.selection_comment_count(), 0);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_selection_comment_reconfirm_rewrites_draft_entry_in_place(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        let (workspace, source_editor) =
+            add_selection_comment_source_editor(&conversation_view, "let a = 10 + 10;", cx);
+        let range = text::Point::new(0, 0)..text::Point::new(0, 5);
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            range.clone(),
+            "first note",
+            cx,
+        );
+
+        // Invoking again on the commented range reopens it; confirming then
+        // rewrites the queued entry instead of appending a second one.
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            range,
+            "second note",
+            cx,
+        );
+
+        let draft = draft_text(&message_editor, cx);
+        assert!(draft.contains("second note"), "{draft:?}");
+        assert!(!draft.contains("first note"), "{draft:?}");
+        assert_eq!(draft.matches("selection").count(), 1, "{draft:?}");
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.confirmed_selection_comment_texts(), ["second note"]);
+        });
+
+        // The rewritten entry is still linked in both directions.
+        replace_in_draft(&message_editor, "second", "third", cx);
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.confirmed_selection_comment_texts(), ["third note"]);
+        });
+        delete_marker(&source_editor, 0, cx);
+        let draft = draft_text(&message_editor, cx);
+        assert!(!draft.contains("third note"), "{draft:?}");
+        assert!(!draft.contains("selection"), "{draft:?}");
+    }
+
+    #[gpui::test]
+    async fn test_selection_comment_send_clears_linked_markers(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("review please\n", window, cx);
+            editor.set_cursor_offset("review please\n".len(), window, cx);
+        });
+        let (workspace, source_editor) =
+            add_selection_comment_source_editor(&conversation_view, "let a = 10 + 10;", cx);
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            text::Point::new(0, 0)..text::Point::new(0, 5),
+            "rename this",
+            cx,
+        );
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.confirmed_selection_comment_count(), 1);
+        });
+
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.selection_comment_count(), 0);
+        });
+        assert!(draft_text(&message_editor, cx).is_empty());
+    }
+
+    #[gpui::test]
+    async fn test_selection_comment_send_only_clears_markers_linked_to_the_sent_draft(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        message_editor.update_in(cx, |editor, window, cx| {
+            editor.set_text("review please\n", window, cx);
+            editor.set_cursor_offset("review please\n".len(), window, cx);
+        });
+        let (workspace, source_editor) = add_selection_comment_source_editor(
+            &conversation_view,
+            "let a = 10 + 10;\nlet b = 2;",
+            cx,
+        );
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            text::Point::new(0, 0)..text::Point::new(0, 5),
+            "rename this",
+            cx,
+        );
+
+        // A marker whose comment lives in some other thread's draft: nothing
+        // in the draft being sent below is linked to it.
+        source_editor.update_in(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let range = snapshot.anchor_before(text::Point::new(1, 0))
+                ..snapshot.anchor_before(text::Point::new(1, 5));
+            editor.show_selection_comment(
+                range,
+                std::rc::Rc::new(|_, _, _, _| {}),
+                true,
+                window,
+                cx,
+            );
+            let prompt = editor.selection_comment_prompt_editor().unwrap();
+            prompt.update(cx, |prompt, cx| {
+                prompt.set_text("belongs elsewhere", window, cx);
+            });
+            window.focus(&prompt.focus_handle(cx), cx);
+            editor.confirm_selection_comment(window, cx);
+        });
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.confirmed_selection_comment_count(), 2);
+        });
+
+        active_thread(&conversation_view, cx)
+            .update_in(cx, |view, window, cx| view.send(window, cx));
+        cx.run_until_parked();
+
+        assert!(draft_text(&message_editor, cx).is_empty());
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(
+                editor.confirmed_selection_comment_texts(),
+                ["belongs elsewhere"],
+                "sending a draft must only clear the markers of comments it contained"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_selection_comment_without_a_thread_returns_to_input_and_can_retry(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        let (workspace, source_editor) =
+            add_selection_comment_source_editor(&conversation_view, "let a = 10 + 10;", cx);
+
+        let available: Rc<RefCell<Option<Entity<ConversationView>>>> = Rc::default();
+        let resolve = {
+            let available = available.clone();
+            move |_workspace: &workspace::Workspace, _cx: &App| available.borrow().clone()
+        };
+        confirm_selection_comment_with(
+            resolve,
+            &workspace,
+            &source_editor,
+            text::Point::new(0, 0)..text::Point::new(0, 5),
+            "rename this",
+            cx,
+        );
+
+        source_editor.read_with(cx, |editor, cx| {
+            assert_eq!(editor.selection_comment_count(), 1);
+            assert_eq!(
+                editor.confirmed_selection_comment_count(),
+                0,
+                "a marker must not claim a comment was queued when nothing was"
+            );
+            let prompt = editor.selection_comment_prompt_editor().unwrap();
+            assert_eq!(prompt.read(cx).text(cx), "rename this");
+        });
+        assert!(draft_text(&message_editor, cx).is_empty());
+
+        *available.borrow_mut() = Some(conversation_view.clone());
+        source_editor.update_in(cx, |editor, window, cx| {
+            editor.confirm_selection_comment(window, cx);
+        });
+        cx.run_until_parked();
+
+        assert!(draft_text(&message_editor, cx).contains("rename this"));
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.confirmed_selection_comment_texts(), ["rename this"]);
+        });
+    }
+
+    #[gpui::test]
+    async fn test_selection_comment_with_no_active_thread_queues_nothing(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new().with_supports_load_session(true);
+        let (server, _fail) = FlakyAgentServer::new(connection);
+        let (conversation_view, cx) = setup_conversation_view(server, cx).await;
+        conversation_view.read_with(cx, |view, _cx| {
+            assert!(view.active_thread().is_none());
+        });
+        let (workspace, source_editor) =
+            add_selection_comment_source_editor(&conversation_view, "let a = 10 + 10;", cx);
+
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            text::Point::new(0, 0)..text::Point::new(0, 5),
+            "rename this",
+            cx,
+        );
+
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.selection_comment_count(), 1);
+            assert_eq!(editor.confirmed_selection_comment_count(), 0);
+        });
+        conversation_view.read_with(cx, |view, _cx| {
+            assert!(
+                !view.has_pending_selections(),
+                "the pill must not be parked for later while its comment text is dropped"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_selection_comment_deleting_the_pill_removes_the_marker_and_keeps_the_prose(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+
+        let connection = StubAgentConnection::new();
+        let (conversation_view, cx) =
+            setup_conversation_view(StubAgentServer::new(connection), cx).await;
+        add_to_workspace(conversation_view.clone(), cx);
+
+        let message_editor = message_editor(&conversation_view, cx);
+        let (workspace, source_editor) = add_selection_comment_source_editor(
+            &conversation_view,
+            "let a = 10 + 10;\nlet b = 2;",
+            cx,
+        );
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            text::Point::new(0, 0)..text::Point::new(0, 5),
+            "first note",
+            cx,
+        );
+        confirm_selection_comment_into_draft(
+            &conversation_view,
+            &workspace,
+            &source_editor,
+            text::Point::new(1, 0)..text::Point::new(1, 5),
+            "second note",
+            cx,
+        );
+
+        // The first pill is the first placeholder in the draft.
+        replace_in_draft(&message_editor, "selection ", "", cx);
+
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(
+                editor.confirmed_selection_comment_texts(),
+                ["second note"],
+                "without its pill the first entry no longer sends its code"
+            );
+        });
+        let draft = draft_text(&message_editor, cx);
+        assert!(draft.contains("first note"), "{draft:?}");
+        assert!(draft.contains("second note"), "{draft:?}");
+
+        // The neighbouring entry is untouched and still linked.
+        replace_in_draft(&message_editor, "second", "2nd", cx);
+        source_editor.read_with(cx, |editor, _cx| {
+            assert_eq!(editor.confirmed_selection_comment_texts(), ["2nd note"]);
+        });
+        delete_marker(&source_editor, 0, cx);
+        let draft = draft_text(&message_editor, cx);
+        assert!(!draft.contains("2nd note"), "{draft:?}");
+        assert!(
+            draft.contains("first note"),
+            "prose left behind by a deleted pill is the user's text now: {draft:?}"
+        );
+    }
+
+    #[gpui::test]
     async fn test_tool_permission_buttons_terminal_with_pattern(cx: &mut TestAppContext) {
         init_test(cx);
 
