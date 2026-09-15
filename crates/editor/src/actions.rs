@@ -933,6 +933,11 @@ actions!(
         ToggleSelectedDiffHunks,
         /// Stores the diff review comment locally (for later batch submission).
         SubmitDiffReviewComment,
+        /// Confirms the focused selection comment and queues it into the agent thread draft.
+        /// The overlay stays visible as a marker until the agent message is sent.
+        ConfirmSelectionComment,
+        /// Cancels the focused unconfirmed selection comment without queueing anything.
+        CancelSelectionComment,
         /// Toggles the expanded state of the comments section in the overlay.
         ToggleReviewCommentsExpanded,
         /// Sends all stored review comments to the Agent panel.
