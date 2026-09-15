@@ -39,6 +39,20 @@ impl FeatureFlag for DiffReviewFeatureFlag {
 }
 register_feature_flag!(DiffReviewFeatureFlag);
 
+/// Gates selection comments queued into the agent thread draft.
+/// Always on: this is a personal fork, not upstream.
+pub struct SelectionCommentFeatureFlag;
+
+impl FeatureFlag for SelectionCommentFeatureFlag {
+    const NAME: &'static str = "selection-comment";
+    type Value = PresenceFlag;
+
+    fn enabled_for_all() -> bool {
+        true
+    }
+}
+register_feature_flag!(SelectionCommentFeatureFlag);
+
 /// Gates the `create_thread` and `list_agents_and_models` tools, which let
 /// the agent spawn independent sibling threads that show up in the agent
 /// panel sidebar.
