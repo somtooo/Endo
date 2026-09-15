@@ -154,6 +154,12 @@ impl MessageQueue {
         Some(entry)
     }
 
+    pub fn absorb_stale_generation_stopped(&mut self) {
+        if self.processing_state == ProcessingState::AbsorbingCancel {
+            self.processing_state = ProcessingState::AutoProcess;
+        }
+    }
+
     /// Handles a generation Stopped event, returning the entry to auto-send,
     /// if any.
     pub fn auto_send_candidate(&self, is_first_editor_focused: bool) -> Option<&QueueEntry> {
