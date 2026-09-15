@@ -1115,6 +1115,7 @@ mod tests {
                 position: settings::SidebarDockPosition::Left,
             },
             thinking_display: Default::default(),
+            anchor_response_to_user_message: true,
         };
 
         cx.update(|cx| {
