@@ -1,0 +1,306 @@
+#!/usr/bin/env bash
+# Build a fork release branch: an upstream stable tag plus the fork's commits.
+#
+# Model: the release branch is the upstream stable tag with the fork's own
+# commits replayed onto it:
+#   release/fork-vX.Y.Z = <upstream tag> + <the fork's commits from develop>
+#
+# The fork's commits are the ones develop has gained since it forked from
+# upstream, so a release needs no list of commits: whatever is on develop is
+# what ships. The release branch is rebuilt from the tag every time, so it
+# carries the current state of the fork's features, not the state they had
+# when they were last released.
+#
+# The replay itself is done by script/fork-resolve, which resolves the
+# conflicts with opencode and then repairs the build: upstream renames and
+# removes APIs, so replaying the fork's commits onto an older tag can leave
+# code that no longer compiles.
+#
+# Release branches carry the fork automation too, so pushing one runs
+# fork-checks on it -- the fork-release workflow requires that run green
+# before publishing (skippable).
+#
+# Tag scheme: fork-<upstream release> (e.g. fork-v1.20.2); if the tag already
+# exists a .N suffix is added. Pushing the release branch starts fork-checks
+# on it; the fork-release workflow requires green before publishing. Tags are
+# created by the workflow, not here -- dispatch it with the release branch.
+# Nothing here publishes anything.
+#
+# Conflicts: the replay can conflict when the release base is older than
+# develop. script/fork-resolve resolves them with opencode (same model and
+# variant defaults as script/fork-sync); use --no-ai to abort for manual
+# resolution instead. CI never auto-resolves: the workflow only releases
+# green, conflict-free branches.
+#
+# Usage:
+#   script/fork-release [<tag>]
+#                       [--upstream-tag <vX.Y.Z>] [--no-push]
+#                       [--no-fix-build] [--build-attempts <n>]
+#                       [--dry-run] [--no-ai]
+#                       [--model <m>] [--variant <v>]
+#
+#   --upstream-tag <vX.Y.Z>
+#                        upstream stable tag to build on (default: latest)
+#   --no-push             build the branch but do not push it
+#   --no-fix-build        do not repair the build after the replay
+#   --build-attempts <n>  how often to try repairing the build (default: 2)
+#   --dry-run             print the plan and exit before creating anything
+#   --no-ai               don't call opencode; abort on conflict for manual
+#                        resolution instead
+#   --model <m>           opencode model (default: github-copilot/claude-sonnet-5.5)
+#   --variant <v>         model reasoning variant (default: xhigh)
+#   <tag>                 release tag (default: fork-<upstream-tag>[.N])
+#
+# Run from develop with a clean tree. Then dispatch the fork-release workflow
+# with the release branch, or let the workflow build the branch itself by
+# dispatching it without a branch.
+
+set -euo pipefail
+
+# The repo root comes from git, not from the script's own path: the CI job
+# runs this script from a copy outside the checkout, so that the script can
+# come from a different ref than the branch being built.
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT" || exit 1
+
+DRY_RUN=false
+PUSH=true
+FIX_BUILD=true
+BUILD_ATTEMPTS=2
+AI=true
+UPSTREAM_TAG=""
+TAG=""
+MODEL="github-copilot/claude-sonnet-5.5"
+VARIANT="xhigh"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --no-push)
+            PUSH=false
+            shift
+            ;;
+        --no-fix-build)
+            FIX_BUILD=false
+            shift
+            ;;
+        --build-attempts)
+            BUILD_ATTEMPTS="$2"
+            shift 2
+            ;;
+        --upstream-tag)
+            UPSTREAM_TAG="$2"
+            shift 2
+            ;;
+        --no-ai)
+            AI=false
+            FIX_BUILD=false
+            shift
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --variant)
+            VARIANT="$2"
+            shift 2
+            ;;
+        -h | --help)
+            echo "Usage: script/fork-release [<tag>] [--upstream-tag <vX.Y.Z>] [--no-push] [--no-fix-build] [--build-attempts <n>] [--dry-run] [--no-ai] [--model <m>] [--variant <v>]"
+            exit 0
+            ;;
+        -*)
+            echo "Unknown argument: $1 (see --help)" >&2
+            exit 1
+            ;;
+        *)
+            TAG="$1"
+            shift
+            ;;
+    esac
+done
+
+latest_stable_upstream() {
+    local tags
+    tags=$(git ls-remote --tags --refs upstream 2>/dev/null | awk '{print $2}' | sed 's|refs/tags/||' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+    if [ -z "$tags" ]; then
+        tags=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || true)
+    fi
+    echo "$tags" | sort -V | tail -n 1
+}
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "error: working tree is dirty -- commit or stash first" >&2
+    exit 1
+fi
+
+BRANCH=$(git branch --show-current)
+if [ "$BRANCH" != "develop" ]; then
+    echo "error: run from develop (currently on '$BRANCH')" >&2
+    exit 1
+fi
+
+git fetch origin >/dev/null 2>&1 || true
+# Not --tags: the fork and upstream both carry a 'nightly' and a
+# 'collab-staging' tag with different objects, so fetching all of upstream's
+# tags fails on them. The one tag this run needs is fetched below.
+git fetch upstream >/dev/null 2>&1 || true
+
+if [ -z "$UPSTREAM_TAG" ]; then
+    UPSTREAM_TAG=$(latest_stable_upstream)
+    if [ -z "$UPSTREAM_TAG" ]; then
+        echo "error: could not determine latest stable upstream tag" >&2
+        exit 1
+    fi
+fi
+
+case "$UPSTREAM_TAG" in
+    v[0-9]*.[0-9]*.[0-9]*)
+        ;;
+    *)
+        echo "error: upstream tag must look like 'vX.Y.Z' (got '$UPSTREAM_TAG')" >&2
+        exit 1
+        ;;
+esac
+
+if ! git rev-parse --verify --quiet "refs/tags/$UPSTREAM_TAG" >/dev/null; then
+    git fetch upstream "refs/tags/$UPSTREAM_TAG:refs/tags/$UPSTREAM_TAG" >/dev/null 2>&1 || true
+fi
+
+if ! git rev-parse --verify --quiet "refs/tags/$UPSTREAM_TAG" >/dev/null; then
+    echo "error: upstream tag $UPSTREAM_TAG not found locally -- fetch upstream tags first" >&2
+    exit 1
+fi
+
+# The fork's commits are the ones develop has gained since it forked from
+# upstream. The fork point is the merge base rather than upstream/main's tip
+# because upstream/main moves: the tip can drift ahead of develop and widen
+# the range with upstream's own commits.
+FORK_POINT=$(git merge-base develop upstream/main)
+if [ -z "$FORK_POINT" ]; then
+    echo "error: develop and upstream/main have no common ancestor" >&2
+    exit 1
+fi
+
+PICKS=()
+while IFS= read -r sha; do
+    [ -n "$sha" ] && PICKS+=("$sha")
+done < <(git rev-list --reverse "$FORK_POINT"..develop)
+
+if [ "${#PICKS[@]}" -eq 0 ]; then
+    echo "error: develop has no commits of its own -- nothing to release" >&2
+    exit 1
+fi
+
+# A merge commit cannot be replayed with git rebase --onto, and this flow
+# has no way to ask which parent to use.
+if [ -n "$(git rev-list --merges "$FORK_POINT"..develop || true)" ]; then
+    echo "error: develop contains merge commits -- the fork's history must be linear" >&2
+    exit 1
+fi
+
+if [ -z "$TAG" ]; then
+    BASE="fork-$UPSTREAM_TAG"
+    TAG="$BASE"
+    N=1
+    while git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; do
+        N=$((N + 1))
+        TAG="$BASE.$N"
+    done
+fi
+
+case "$TAG" in
+    fork-v*) ;;
+    *)
+        echo "error: tag must look like 'fork-vX.Y.Z' (got '$TAG')" >&2
+        exit 1
+        ;;
+esac
+
+if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
+    echo "error: tag $TAG already exists" >&2
+    exit 1
+fi
+
+RELEASE_BRANCH="release/$TAG"
+
+echo "Upstream tag:      $UPSTREAM_TAG ($(git rev-parse --short "$UPSTREAM_TAG"))"
+echo "Release branch:    $RELEASE_BRANCH"
+echo "Release tag:       $TAG (created by the workflow, not here)"
+echo "Fork point:        $(git rev-parse --short "$FORK_POINT") (develop forked from upstream here)"
+echo "Picks (the fork's commits, oldest first):"
+for pick in "${PICKS[@]}"; do
+    echo "  $(git rev-parse --short "$pick") $(git log -1 --format=%s "$pick")"
+done
+# Machine-readable, so a caller can pick the branch name up without parsing
+# the output above.
+echo "FORK_RELEASE_BRANCH=$RELEASE_BRANCH"
+echo "FORK_RELEASE_TAG=$TAG"
+echo "FORK_RELEASE_UPSTREAM_TAG=$UPSTREAM_TAG"
+
+if [ "$DRY_RUN" = true ]; then
+    echo "--dry-run: not creating anything."
+    exit 0
+fi
+
+PRIOR_SHA=""
+if git rev-parse --verify --quiet "refs/heads/$RELEASE_BRANCH" >/dev/null; then
+    PRIOR_SHA=$(git rev-parse "$RELEASE_BRANCH")
+fi
+
+restore_on_failure() {
+    git rebase --abort >/dev/null 2>&1 || true
+    git checkout develop >/dev/null 2>&1 || true
+    if [ -n "$PRIOR_SHA" ]; then
+        git checkout -B "$RELEASE_BRANCH" "$PRIOR_SHA" >/dev/null 2>&1 || true
+        git checkout develop >/dev/null 2>&1 || true
+    else
+        git branch -D "$RELEASE_BRANCH" >/dev/null 2>&1 || true
+    fi
+}
+
+# The release branch is rebuilt from the tag every time: the fork's commits
+# are replayed onto it, so the branch carries the fork's current features
+# rather than the adaptations the last release was built from. Starting from
+# develop and replaying onto the tag is what script/fork-resolve does.
+git checkout -B "$RELEASE_BRANCH" develop
+
+RESOLVE_ARGS=(--onto "$UPSTREAM_TAG" --upstream-point "$FORK_POINT" --model "$MODEL" --variant "$VARIANT")
+# Older release tags can compile while still breaking fork behavior; check the
+# changed packages before handing the branch to the full release gate.
+RESOLVE_ARGS+=(--test-touched-packages)
+if [ "$FIX_BUILD" = false ]; then
+    RESOLVE_ARGS+=(--no-fix-build)
+else
+    RESOLVE_ARGS+=(--build-attempts "$BUILD_ATTEMPTS")
+fi
+if [ "$AI" = false ]; then
+    RESOLVE_ARGS+=(--no-ai)
+fi
+
+if ! script/fork-resolve "${RESOLVE_ARGS[@]}"; then
+    restore_on_failure
+    echo "error: the replay failed -- nothing was pushed." >&2
+    exit 1
+fi
+
+# The replay rewrote the branch's commits, so the release branch now holds
+# the fork's commits adapted to the upstream tag. The branch stays checked
+# out: a caller that bundles the result needs it under its own name.
+if [ "$PUSH" = false ]; then
+    echo "Release branch built: $RELEASE_BRANCH (not pushed)"
+    echo "To publish it:"
+    echo "  git push -u origin $RELEASE_BRANCH"
+    echo "  gh workflow run fork-release.yml --repo somtooo/zed --ref develop -f branch=$RELEASE_BRANCH"
+    exit 0
+fi
+
+git checkout develop >/dev/null 2>&1 || true
+git push -u origin "$RELEASE_BRANCH"
+
+echo "Release branch ready: $RELEASE_BRANCH"
+echo "Pushing it started fork-checks on the branch. When it is green:"
+echo "  gh workflow run fork-release.yml --repo somtooo/zed --ref develop -f branch=$RELEASE_BRANCH"
