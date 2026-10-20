@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# Keep this fork synced with upstream (zed-industries/zed).
+#
+# Model: main is a pristine mirror of upstream/main (fast-forward only --
+# it must never diverge). develop carries all custom commits linearly on
+# top of main. Syncing means: fast-forward main, then rebase develop.
+# There are no merge commits anywhere in this flow.
+#
+# Fully automated: fast-forwards and clean rebases push directly.
+# On rebase conflict the script resolves with opencode headlessly
+# (Claude Sonnet 5.5 through the GitHub Copilot provider, xhigh reasoning)
+# then verifies before pushing.
+# CI (fork-sync.yml) resolves the same way, but inside a Namespace Devbox:
+# the resolution runs there (script/fork-resolve) and the result is
+# verified by fork-checks before it is pushed to develop.
+#
+# Usage:
+#   script/fork-sync [--dry-run] [--no-push] [--no-ai] [--skip-verify]
+#                    [--upstream <remote>] [--model <m>] [--variant <v>]
+#
+#   --dry-run         print the plan (how far each branch trails) and exit
+#                     before moving anything
+#   --no-push         leave both branches local (no pushes)
+#   --no-ai           don't call opencode; abort on conflict for manual fix
+#   --skip-verify     skip ./script/fork-checks after a rebase (pushed develop
+#                     gets no CI run -- this is the only gate, so skipping is
+#                     at your own risk)
+#   --upstream <name> upstream remote name (default: upstream)
+#   --model <m>       opencode model (default: github-copilot/claude-sonnet-5.5)
+#   --variant <v>     model reasoning variant (default: xhigh)
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+
+DRY_RUN=false
+PUSH=true
+AI=true
+SKIP_VERIFY=false
+UPSTREAM="upstream"
+MODEL="github-copilot/claude-sonnet-5.5"
+VARIANT="xhigh"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --dry-run)
+            DRY_RUN=true
+            shift
+            ;;
+        --no-push)
+            PUSH=false
+            shift
+            ;;
+        --no-ai)
+            AI=false
+            shift
+            ;;
+        --skip-verify)
+            SKIP_VERIFY=true
+            shift
+            ;;
+        --upstream)
+            UPSTREAM="$2"
+            shift 2
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --variant)
+            VARIANT="$2"
+            shift 2
+            ;;
+        -h | --help)
+            echo "Usage: script/fork-sync [--dry-run] [--no-push] [--no-ai] [--skip-verify] [--upstream <remote>] [--model <m>] [--variant <v>]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1 (see --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "error: working tree is dirty -- commit or stash first" >&2
+    exit 1
+fi
+
+if ! git remote get-url "$UPSTREAM" >/dev/null 2>&1; then
+    echo "error: no '$UPSTREAM' remote -- add it with:" >&2
+    echo "  git remote add upstream https://github.com/zed-industries/zed.git" >&2
+    exit 1
+fi
+
+command -v gh >/dev/null 2>&1 || {
+    echo "error: gh CLI required (push + checks dispatch)" >&2
+    exit 1
+}
+
+git fetch "$UPSTREAM"
+git fetch origin
+
+if ! git show-ref --verify --quiet refs/heads/main; then
+    echo "error: no local main branch" >&2
+    exit 1
+fi
+if ! git show-ref --verify --quiet refs/heads/develop; then
+    echo "error: no local develop branch" >&2
+    exit 1
+fi
+
+MAIN_BEHIND=$(git rev-list --count main.."$UPSTREAM"/main)
+MAIN_AHEAD=$(git rev-list --count "$UPSTREAM"/main..main)
+DEV_BEHIND_MAIN=$(git rev-list --count develop..main)
+
+echo "main is $MAIN_AHEAD ahead / $MAIN_BEHIND behind $UPSTREAM/main"
+echo "develop is $DEV_BEHIND_MAIN behind main"
+
+if [ "$MAIN_AHEAD" -ne 0 ]; then
+    echo "error: main has diverged from $UPSTREAM/main ($MAIN_AHEAD commits) --" >&2
+    echo "main must stay a pristine mirror. Reset it explicitly, never merge:" >&2
+    echo "  git checkout main && git reset --hard $UPSTREAM/main" >&2
+    exit 1
+fi
+
+if [ "$MAIN_BEHIND" -eq 0 ] && [ "$DEV_BEHIND_MAIN" -eq 0 ]; then
+    echo "Already up to date -- nothing to do."
+    exit 0
+fi
+
+if [ "$DRY_RUN" = true ]; then
+    if [ "$MAIN_BEHIND" -ne 0 ]; then
+        echo "Would fast-forward main by $MAIN_BEHIND commit(s)."
+    fi
+    COMMITS=$(git rev-list --count main..develop)
+    if [ "$MAIN_BEHIND" -ne 0 ] || [ "$DEV_BEHIND_MAIN" -ne 0 ]; then
+        echo "Would rebase $COMMITS develop commit(s) onto the new main."
+    fi
+    echo "--dry-run: not moving anything."
+    exit 0
+fi
+
+MAIN_MOVED=false
+if [ "$MAIN_BEHIND" -ne 0 ]; then
+    git checkout -q main
+    git merge --ff-only "$UPSTREAM"/main
+    MAIN_MOVED=true
+    echo "main fast-forwarded to $(git rev-parse --short main)"
+fi
+
+git checkout -q develop
+REBASED=false
+if [ "$DEV_BEHIND_MAIN" -ne 0 ] || [ "$MAIN_MOVED" = true ]; then
+    REBASED=true
+fi
+# The resolver does the rebase and, when the rebase leaves the fork's code
+# not compiling, repairs it -- upstream renames APIs, and CI denies
+# warnings, so a clean rebase is not the same as working code.
+if [ "$AI" = false ]; then
+    if ! git rebase main; then
+        git rebase --abort
+        echo "Aborted (--no-ai). Resolve manually: rebase develop onto main, then push." >&2
+        exit 1
+    fi
+else
+    command -v opencode >/dev/null 2>&1 || {
+        echo "error: opencode CLI not found -- install it or re-run with --no-ai" >&2
+        exit 1
+    }
+    script/fork-resolve --onto main --model "$MODEL" --variant "$VARIANT"
+fi
+
+git diff --check
+
+if [ "$SKIP_VERIFY" = false ] && [ "$REBASED" = true ]; then
+    ./script/fork-checks
+fi
+
+if [ "$PUSH" = false ]; then
+    echo "Synced locally (--no-push). Push when ready:"
+    echo "  git push origin main"
+    echo "  git push --force-with-lease origin develop"
+    exit 0
+fi
+
+if [ "$MAIN_MOVED" = true ]; then
+    git push origin main
+fi
+git push --force-with-lease origin develop
+
+echo "Synced: main $(git rev-parse --short main), develop $(git rev-parse --short develop)"
+echo "Pushed develop has no CI run -- dispatch fork-checks on develop if you skipped verification:"
+echo "  gh workflow run fork-checks.yml --repo somtooo/zed --ref develop"
