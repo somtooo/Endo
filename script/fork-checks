@@ -1,0 +1,71 @@
+#!/usr/bin/env bash
+# Local equivalent of the fork-checks CI gate: the same commands upstream's
+# run_tests.yml gates PRs on (Linux leg), run on this machine.
+#
+#   1. ./script/clippy                                 (workspace clippy, deny warnings)
+#   2. cargo nextest run --workspace --no-fail-fast    (full unit test suite)
+#   3. cargo test --workspace --doc --no-fail-fast     (doctests)
+#
+# This is slow (30-90+ min on a laptop, per AGENTS.md use ./script/clippy not
+# cargo clippy). Prefer pushing a sync branch and letting the fork-checks
+# workflow run it on Actions free compute instead.
+#
+# Usage:
+#   script/fork-checks [--clippy-only | --tests-only | --doc-only]
+
+set -euo pipefail
+
+cd "$(dirname "$0")/.." || exit 1
+
+RUN_CLIPPY=true
+RUN_TESTS=true
+RUN_DOC=true
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --clippy-only)
+            RUN_TESTS=false
+            RUN_DOC=false
+            shift
+            ;;
+        --tests-only)
+            RUN_CLIPPY=false
+            RUN_DOC=false
+            shift
+            ;;
+        --doc-only)
+            RUN_CLIPPY=false
+            RUN_TESTS=false
+            shift
+            ;;
+        -h | --help)
+            echo "Usage: script/fork-checks [--clippy-only | --tests-only | --doc-only]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1 (see --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ "$RUN_CLIPPY" = true ]; then
+    echo "=== clippy (./script/clippy) ==="
+    ./script/clippy
+fi
+
+if [ "$RUN_TESTS" = true ]; then
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        echo "cargo-nextest not found -- installing (cargo install cargo-nextest --locked) ..."
+        cargo install cargo-nextest --locked
+    fi
+    echo "=== full test suite (cargo nextest run --workspace) ==="
+    cargo nextest run --workspace --no-fail-fast
+fi
+
+if [ "$RUN_DOC" = true ]; then
+    echo "=== doctests (cargo test --workspace --doc) ==="
+    cargo test --workspace --doc --no-fail-fast
+fi
+
+echo "fork-checks: all selected checks passed."
