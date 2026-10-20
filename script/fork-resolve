@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+# Replay the fork's commits onto a base, resolving conflicts with opencode one
+# stop at a time, and then make the result compile again.
+#
+# Shared by the two places the fork's commits meet an upstream base:
+#   - script/fork-sync, locally, and the fork-sync workflow, in CI: develop's
+#     commits are rebased onto the new main tip.
+#   - script/fork-release, locally, and the fork-release workflow, in CI: the
+#     fork's commits are replayed onto an upstream release tag.
+# It either starts the replay itself or picks up one that is already in
+# progress, so both callers use one code path.
+#
+# A clean replay is not the end of the story: upstream renames and removes
+# APIs, so the fork's own code can stop compiling after the replay. With
+# --fix-build the resolver runs clippy afterwards and lets opencode repair
+# what the replay broke.
+#
+# Usage:
+#   script/fork-resolve [--onto <ref>] [--upstream-point <ref>]
+#                        [--model <m>] [--variant <v>]
+#                        [--fix-build] [--no-fix-build] [--build-attempts <n>]
+#                        [--test-touched-packages] [--test-attempts <n>]
+#
+#   --onto <ref>         base to replay the commits onto (default: main)
+#   --upstream-point <ref>
+#                        replay only the commits after this ref (default: the
+#                        same as --onto). A release replays the fork's commits
+#                        since it forked from upstream, not all of upstream's
+#                        history, so the point matters.
+#   --model <m>          opencode model (default: github-copilot/claude-sonnet-5.5)
+#   --variant <v>        model reasoning variant (default: xhigh)
+#   --fix-build          repair compile errors after the replay (default)
+#   --no-fix-build       only resolve the conflicts
+#   --build-attempts <n> how often to try repairing the build (default: 2)
+#   --test-touched-packages
+#                        test each Cargo package containing changed Rust files
+#   --test-attempts <n>  how often to repair focused test failures (default: 2)
+#
+# On success the replay is finished and the working tree holds the replayed
+# branch. On failure the replay is aborted and the script exits 1.
+
+set -euo pipefail
+
+ONTO=main
+UPSTREAM_POINT=""
+MODEL="github-copilot/claude-sonnet-5.5"
+VARIANT="xhigh"
+FIX_BUILD=true
+BUILD_ATTEMPTS=2
+TEST_TOUCHED_PACKAGES=false
+TEST_ATTEMPTS=2
+AI=true
+REPLAY_ONLY=false
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --onto)
+            ONTO="$2"
+            shift 2
+            ;;
+        --upstream-point)
+            UPSTREAM_POINT="$2"
+            shift 2
+            ;;
+        --model)
+            MODEL="$2"
+            shift 2
+            ;;
+        --variant)
+            VARIANT="$2"
+            shift 2
+            ;;
+        --fix-build)
+            FIX_BUILD=true
+            shift
+            ;;
+        --no-fix-build)
+            FIX_BUILD=false
+            shift
+            ;;
+        --no-replay)
+            REPLAY_ONLY=true
+            shift
+            ;;
+        --no-ai)
+            AI=false
+            FIX_BUILD=false
+            shift
+            ;;
+        --build-attempts)
+            BUILD_ATTEMPTS="$2"
+            shift 2
+            ;;
+        --test-touched-packages)
+            TEST_TOUCHED_PACKAGES=true
+            shift
+            ;;
+        --test-attempts)
+            TEST_ATTEMPTS="$2"
+            shift 2
+            ;;
+        -h | --help)
+            echo "Usage: script/fork-resolve [--onto <ref>] [--upstream-point <ref>] [--no-replay] [--model <m>] [--variant <v>] [--fix-build|--no-fix-build] [--build-attempts <n>] [--test-touched-packages] [--test-attempts <n>] [--no-ai]"
+            exit 0
+            ;;
+        *)
+            echo "Unknown argument: $1 (see --help)" >&2
+            exit 1
+            ;;
+    esac
+done
+
+if [ -z "$UPSTREAM_POINT" ]; then
+    UPSTREAM_POINT="$ONTO"
+fi
+
+# The repo root comes from git, not from the script's own path: the CI job
+# runs this script from a copy outside the checkout, so that the script can
+# come from a different ref than the branch being replayed.
+REPO_ROOT=$(git rev-parse --show-toplevel)
+cd "$REPO_ROOT"
+
+# `git rebase --continue` opens an editor for the commit message, which
+# there is no terminal for in CI. Take the message as it is.
+export GIT_EDITOR=true
+export GIT_SEQUENCE_EDITOR=true
+
+if [ "$AI" = true ]; then
+    command -v opencode >/dev/null 2>&1 || {
+        echo "error: opencode CLI not found -- install it first" >&2
+        exit 1
+    }
+fi
+
+# REBASE_HEAD survives the last commit of a rebase, so the rebase state
+# directory is what says whether there is still a stop to resolve.
+rebase_in_progress() {
+    local state
+    state=$(git rev-parse --git-path rebase-merge)
+    [ -d "$state" ] && return 0
+    state=$(git rev-parse --git-path rebase-apply)
+    [ -d "$state" ] && return 0
+    return 1
+}
+
+# The fork features the replay carries, listed from the commits themselves:
+# a hardcoded list goes stale as soon as a feature is added to develop, and
+# the resolver would then have no idea it must not drop the new one.
+fork_features() {
+    local commit subject paths
+    for commit in $(git rev-list --reverse "$UPSTREAM_POINT"..HEAD); do
+        subject=$(git log -1 --format=%s "$commit")
+        paths=$(git show --name-only --format="" "$commit" | grep -v "^$" | head -4 | tr '\n' ' ')
+        if [ -n "$paths" ]; then
+            echo "- $subject ($paths)"
+        else
+            echo "- $subject"
+        fi
+    done
+}
+
+FEATURES=$(fork_features)
+
+if [ "$REPLAY_ONLY" = false ]; then
+    if ! rebase_in_progress; then
+        if git rebase --onto "$ONTO" "$UPSTREAM_POINT"; then
+            echo "Replay clean."
+        else
+            if [ "$AI" = false ]; then
+                git rebase --abort
+                echo "error: the replay conflicted and --no-ai was given -- resolve it by hand." >&2
+                exit 1
+            fi
+            echo "Replay conflicted -- resolving with opencode ($MODEL, variant $VARIANT) ..."
+        fi
+    fi
+
+    while rebase_in_progress; do
+        CONFLICTS=$(git diff --name-only --diff-filter=U || true)
+        if [ -z "$CONFLICTS" ]; then
+            # No conflicted files, but the replay is still going: rerere resolved
+            # the conflict on its own, or the commit turned out to be empty.
+            # Either way there is nothing for opencode to do here.
+            if [ "$AI" = false ]; then
+                git rebase --abort
+                echo "error: the replay stopped with no conflicted files and --no-ai was given -- resolve it by hand." >&2
+                exit 1
+            fi
+            echo "No conflicted files left (rerere resolved it, or the commit is empty) -- continuing ..."
+            if ! git rebase --continue; then
+                if ! rebase_in_progress; then
+                    echo "Replay finished."
+                    break
+                fi
+                git rebase --skip
+                echo "Skipped the empty commit."
+            fi
+            continue
+        fi
+        if [ "$AI" = false ]; then
+            git rebase --abort
+            echo "error: the replay conflicted and --no-ai was given -- resolve it by hand." >&2
+            exit 1
+        fi
+        echo "Conflicted files:"
+        echo "$CONFLICTS"
+        STOP_SHA=$(git rev-parse --short REBASE_HEAD)
+        STOP_SUBJECT=$(git log -1 --format=%s REBASE_HEAD)
+        # The branch being replayed, for the prompt: the rebase state names it.
+        BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+        if [ "$BRANCH" = "HEAD" ] && [ -f "$(git rev-parse --git-path rebase-merge/head-name)" ]; then
+            BRANCH=$(basename "$(cat "$(git rev-parse --git-path rebase-merge/head-name)")")
+        fi
+        BRANCH=${BRANCH:-develop}
+        if ! opencode run -m "$MODEL" --variant "$VARIANT" "You are resolving a git rebase conflict in this repo. Context: branch $BRANCH (all custom fork commits, kept linear) is having its commits replayed onto '$ONTO'. Replaying commit $STOP_SHA ($STOP_SUBJECT) just conflicted; these files now contain git conflict markers: $CONFLICTS.
+
+    Our fork features you must PRESERVE (never delete to 'resolve' a conflict):
+    $FEATURES
+
+    CI tool constraints: this is a non-interactive run. Stay inside the checkout; do not read or write /tmp, /etc, $HOME, or any other path outside it. Keep scratch files under target/. Do not use commands that require confirmation or a terminal prompt; use 'git add -- <file>', never 'git add -p'. If a tool call is rejected, replace it with a checkout-local, non-interactive command and continue rather than retrying the same call.
+
+    How to resolve this stop:
+    1. Inspect every conflict hunk (grep -n '^<<<<<<< \|^=======$\|^>>>>>>> ' in each file). Use 'git show :2:<file>' (BASE, upstream) and 'git show :3:<file>' (THEIRS, our commit) to understand what each side intended. For shared APIs, inspect their call sites and tests on both sides before choosing a shape.
+    2. Merge SEMANTICALLY: keep the feature's intent, adapted to the new base's APIs. When upstream refactored code our feature touches, adapt our feature to the new shape -- do not revert the refactor and do not drop our feature. Preserve upstream behavior relied on by other call sites; do not blindly choose one side or keep only the version that compiles. Do NOT pull newer upstream code into an older base; adapt minimally. If a hunk is genuinely ambiguous, prefer keeping upstream behavior and note the choice in your final summary.
+    3. Follow this repo's Rust rules (AGENTS.md): no unwrap()/expect() in new code, propagate errors with ?, handle fallible results explicitly, full-word variable names, and keep diffs minimal -- no drive-by reformatting.
+    4. Remove ALL conflict markers. After editing each file, stage it with 'git add <file>'. Do NOT commit and do NOT run 'git rebase --continue' -- the script continues the rebase after verifying.
+    5. When all files are staged, run 'git diff --check' (must be clean) and verify no markers remain (rg -n '^<{7} |^={7}\$|^>{7} ' on the touched files).
+    6. Do NOT run cargo build, cargo check or cargo test while the rebase is paused: later fork commits may not have been replayed yet. After the complete replay, fork-resolve runs focused tests for every Cargo package containing changed Rust files and will ask you to repair any failures before the branch is handed to fork-checks. Resolve the conflict, stage it, and stop.
+
+    Final summary must list: each file, what each side changed, and how you reconciled it."; then
+            git rebase --abort
+            echo "error: opencode run failed -- replay aborted." >&2
+            exit 1
+        fi
+        if [ -n "$(git diff --name-only --diff-filter=U || true)" ]; then
+            git rebase --abort
+            echo "error: conflicts remain after opencode -- replay aborted." >&2
+            echo "Re-run with --no-ai and resolve manually." >&2
+            exit 1
+        fi
+        if ! git diff --check; then
+            git rebase --abort
+            echo "error: whitespace/marker issues after opencode -- replay aborted." >&2
+            exit 1
+        fi
+        if ! git rebase --continue; then
+            if ! rebase_in_progress; then
+                # The replay finished: `git rebase --continue` returns non-zero
+                # when it cannot open the commit message editor.
+                echo "Replay finished."
+                break
+            fi
+            if [ -z "$(git diff --name-only --diff-filter=U || true)" ]; then
+                git rebase --abort
+                echo "error: replay cannot continue (likely an emptied commit) --" >&2
+                echo "inspect with 'git status', then continue manually." >&2
+                exit 1
+            fi
+            # `git rebase --continue` also exits non-zero when it applied this
+            # stop and the next commit conflicted. Every conflict of the stop
+            # just resolved was staged, so the unmerged files are the next
+            # stop's: go round the loop and resolve those.
+            echo "Resolved $STOP_SHA; the next commit conflicted too ..."
+            continue
+        fi
+        echo "Resolved $STOP_SHA, continuing replay ..."
+    done
+
+    echo "Replay completed with AI resolutions."
+else
+    echo "Skipping the replay (--no-replay)."
+fi
+
+COMMITS_BEFORE=$(git rev-list --count "$ONTO"..HEAD)
+if [ "$FIX_BUILD" = true ]; then
+    # The replay can leave the fork's code not compiling: upstream renames and
+    # removes APIs, and the fork's own code still uses the old names. Repair it
+    # here, with the same model, instead of leaving it for a human.
+    # The log has to live inside the project: opencode refuses to read files
+    # outside the project directory in a non-interactive run.
+    BUILD_LOG="$REPO_ROOT/target/fork-resolve-build.log"
+    mkdir -p "$(dirname "$BUILD_LOG")"
+BUILD_PASSED=false
+for attempt in $(seq 1 "$BUILD_ATTEMPTS"); do
+    echo "=== build check (attempt $attempt of $BUILD_ATTEMPTS) ==="
+    # --all-features matters: the fork's own flags are enabled for everyone, but
+    # upstream's are staff-gated, so a build without it leaves code paths that
+    # the fork-checks gate does compile unchecked.
+    if cargo clippy --workspace --all-targets --all-features -- --deny warnings >"$BUILD_LOG" 2>&1; then
+        echo "the build is clean"
+        BUILD_PASSED=true
+        break
+    fi
+    ERRORS=$(grep -E "^(error|warning)(\[E[0-9]+\])?: " "$BUILD_LOG" | sort -u | head -40 || true)
+    if [ -z "$ERRORS" ]; then
+        ERRORS=$(tail -40 "$BUILD_LOG")
+    fi
+    echo "the build is broken:"
+    echo "$ERRORS"
+    if ! opencode run -m "$MODEL" --variant "$VARIANT" "The replay onto the new upstream base is done, but the fork's code no longer compiles cleanly. Upstream renamed or removed APIs that this fork still uses, and CI denies warnings.
+
+Fix every error reported by the build. The errors are:
+$ERRORS
+
+How to fix them:
+1. Read the full output from the build log at $BUILD_LOG (it is inside the project, so it can be read) and reproduce the errors yourself with 'cargo clippy --workspace --all-targets --all-features -- --deny warnings'. This is a non-interactive CI run: stay inside the checkout, never access /tmp, /etc, $HOME, or other external paths, and keep any scratch files under target/; use the existing $BUILD_LOG instead of creating another log.
+2. Fix the cause, not the symptom: when upstream renamed a type or a function, use the new name and adapt the call sites. When upstream changed a signature, adapt the call site to the new shape. Never silence an error with #[allow(...)] and never delete a test to make it pass.
+3. Follow this repo's Rust rules (AGENTS.md): no unwrap()/expect() in new code, propagate errors with ?, handle fallible results explicitly, full-word variable names, and keep diffs minimal -- no drive-by reformatting. Do not use commands that require confirmation or a terminal prompt, including 'git add -p'; stage whole files with 'git add -- <file>'. If partial staging is essential, create or edit a patch under target/ and apply it with 'git apply --cached'. If a tool call is rejected, replace it with a checkout-local, non-interactive command rather than retrying it or abandoning the repair.
+4. Verify: re-run the clippy command until it is clean, then run 'git diff --check' (must be clean).
+
+Where the fix belongs. This branch is a linear sequence of feature commits: each commit is one feature, so the branch stays easy to rebase onto upstream. A fix that upstream's rename forced on us belongs INSIDE the feature commit that owns the affected code, not in a new commit on top. The number of commits on this branch must not change.
+
+So, instead of committing on top:
+1. Stage your changes: 'git add <file>' for every file you touched.
+2. Find the commit that owns the code you changed. 'git log --format='%H %s' $ONTO..HEAD -- <file>' lists the commits that touched it; 'git blame <file>' on the lines you had to change (before your edit) names the commit that introduced them. That commit is the feature the fix belongs to.
+3. Fold the fix into it:
+       git commit --fixup=<owner-sha>
+       GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash $ONTO
+   The autosquash rebase folds the fixup commit into the commit that owns the code, leaving the same number of commits and the same final tree.
+4. If that rebase conflicts, resolve it by hand: the conflict is between the feature's original code and the upstream change; keep the feature's intent adapted to the new base, and make sure the tree at the end is exactly what you had before the fold. Then run 'git rebase --continue'.
+5. When you are done, the branch must have the same number of commits as before your work and a clean working tree, and clippy must be clean.
+
+Do not stop until clippy is clean and the fix is folded into the commit that owns the code. If a tool call is rejected (for example reading a path outside the project), work around it and carry on -- do not give up.
+
+Final summary must list: each file, what broke, how you fixed it, and which commit you folded the fix into."; then
+        echo "error: opencode could not repair the build -- aborting." >&2
+        exit 1
+    fi
+    # Only the tracked files matter here: the repair must not leave a
+    # half-applied edit behind. Untracked files are not the repair's doing --
+    # a caller may have put the resolver itself there.
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+        echo "error: opencode left the working tree dirty -- aborting." >&2
+        exit 1
+    fi
+    # The branch is a linear sequence of feature commits, so a repair that
+    # adds a commit on top is wrong: the fix belongs inside the commit that
+    # owns the code. The count has to stay the same.
+    COMMITS_NOW=$(git rev-list --count "$ONTO"..HEAD)
+    if [ "$COMMITS_NOW" != "$COMMITS_BEFORE" ]; then
+        echo "error: the repair changed the number of commits ($COMMITS_BEFORE -> $COMMITS_NOW)." >&2
+        echo "The fix has to be folded into the commit that owns the code." >&2
+        exit 1
+    fi
+    echo "the repair is folded into the commits that own the code, checking again ..."
+done
+
+if [ "$BUILD_PASSED" != true ]; then
+    echo "error: the build is still broken after $BUILD_ATTEMPTS attempts --" >&2
+    echo "the full log is at $BUILD_LOG" >&2
+    exit 1
+fi
+fi
+
+if [ "$TEST_TOUCHED_PACKAGES" = true ]; then
+    CHANGED_RUST_FILES=$(git diff --name-only "$ONTO"...HEAD -- '*.rs')
+    if [ -z "$CHANGED_RUST_FILES" ]; then
+        echo "No changed Rust files; skipping focused package tests."
+        exit 0
+    fi
+
+    TEST_METADATA="$REPO_ROOT/target/fork-resolve-metadata.json"
+    TEST_PACKAGE_FILE="$REPO_ROOT/target/fork-resolve-test-packages.txt"
+    TEST_LOG="$REPO_ROOT/target/fork-resolve-tests.log"
+    mkdir -p "$REPO_ROOT/target"
+    cargo metadata --no-deps --format-version 1 > "$TEST_METADATA"
+    : > "$TEST_PACKAGE_FILE"
+
+    while IFS= read -r FILE; do
+        DIRECTORY=$(dirname "$FILE")
+        while :; do
+            if [ -f "$DIRECTORY/Cargo.toml" ]; then
+                MANIFEST_PATH="$(cd "$DIRECTORY" && pwd)/Cargo.toml"
+                PACKAGE=$(jq -r --arg manifest "$MANIFEST_PATH" '.packages[] | select(.manifest_path == $manifest) | .name' "$TEST_METADATA")
+                if [ -n "$PACKAGE" ] && [ "$PACKAGE" != "null" ]; then
+                    printf '%s\n' "$PACKAGE" >> "$TEST_PACKAGE_FILE"
+                    break
+                fi
+            fi
+            [ "$DIRECTORY" != "." ] || break
+            PARENT_DIRECTORY=$(dirname "$DIRECTORY")
+            [ "$PARENT_DIRECTORY" != "$DIRECTORY" ] || break
+            DIRECTORY="$PARENT_DIRECTORY"
+        done
+    done <<< "$CHANGED_RUST_FILES"
+
+    TEST_PACKAGES=$(sort -u "$TEST_PACKAGE_FILE")
+    if [ -z "$TEST_PACKAGES" ]; then
+        echo "error: could not map changed Rust files to Cargo packages" >&2
+        exit 1
+    fi
+
+    if ! command -v xvfb-run >/dev/null 2>&1; then
+        echo "error: xvfb-run is required for focused GPUI tests" >&2
+        exit 1
+    fi
+    if ! command -v cargo-nextest >/dev/null 2>&1; then
+        echo "cargo-nextest not found -- installing (cargo install cargo-nextest --locked) ..."
+        cargo install cargo-nextest --locked
+    fi
+
+    TEST_PACKAGE_ARGS=()
+    while IFS= read -r PACKAGE; do
+        [ -n "$PACKAGE" ] || continue
+        TEST_PACKAGE_ARGS+=(--package "$PACKAGE")
+    done <<< "$TEST_PACKAGES"
+
+    TEST_NEXTEST_CONFIG="$REPO_ROOT/target/fork-resolve-nextest.toml"
+    if [ -f "$REPO_ROOT/.config/nextest.toml" ]; then
+        cp "$REPO_ROOT/.config/nextest.toml" "$TEST_NEXTEST_CONFIG"
+    else
+        : > "$TEST_NEXTEST_CONFIG"
+    fi
+    cat >> "$TEST_NEXTEST_CONFIG" <<'EOF'
+
+[[profile.default.overrides]]
+filter = 'test(test_random_columnar_selections) or test(test_completion_without_text_edit) or test(test_random_worktree_changes)'
+slow-timeout = { period = "300s", terminate-after = 1 }
+EOF
+    TEST_COMMAND="xvfb-run -a cargo nextest run --config-file '$TEST_NEXTEST_CONFIG' --no-fail-fast --no-tests=warn --retries 1"
+    for PACKAGE in $TEST_PACKAGES; do
+        TEST_COMMAND="$TEST_COMMAND --package $PACKAGE"
+    done
+
+    TESTS_PASSED=false
+    for attempt in $(seq 0 "$TEST_ATTEMPTS"); do
+        TEST_RUN=$((attempt + 1))
+        echo "=== focused tests (attempt $TEST_RUN of $((TEST_ATTEMPTS + 1))) ==="
+        echo "Changed packages: $TEST_PACKAGES"
+        if xvfb-run -a cargo nextest run --config-file "$TEST_NEXTEST_CONFIG" --no-fail-fast --no-tests=warn --retries 1 "${TEST_PACKAGE_ARGS[@]}" > "$TEST_LOG" 2>&1; then
+            TEST_SUMMARY=$(grep -E 'Summary|Finished' "$TEST_LOG" | tail -20 || true)
+            if [ -n "$TEST_SUMMARY" ]; then
+                echo "$TEST_SUMMARY"
+            else
+                tail -30 "$TEST_LOG"
+            fi
+            TESTS_PASSED=true
+            break
+        fi
+
+        TEST_FAILURES=$(grep -E 'FAIL|failures:|panicked at|timed out|error:|Summary' "$TEST_LOG" | tail -80 || true)
+        if [ -z "$TEST_FAILURES" ]; then
+            TEST_FAILURES=$(tail -80 "$TEST_LOG")
+        fi
+        echo "focused tests failed; details from $TEST_LOG:"
+        echo "$TEST_FAILURES"
+        if [ "$AI" != true ]; then
+            echo "error: focused tests failed and --no-ai prevents automated repair" >&2
+            exit 1
+        fi
+        if [ "$attempt" -eq "$TEST_ATTEMPTS" ]; then
+            break
+        fi
+        if ! opencode run -m "$MODEL" --variant "$VARIANT" "The full rebase onto '$ONTO' is complete, but focused tests for the changed Rust packages failed. Fix the regression before handing this branch to the full fork-checks gate.
+
+The affected packages and exact test command are:
+$TEST_PACKAGES
+$TEST_COMMAND
+
+Failure output:
+$TEST_FAILURES
+
+Read the full test log at $TEST_LOG and inspect the changed Rust files. Classify failures first: deterministic assertion failures usually indicate a regression in the rebased code; shell-startup output failures may be an environment mismatch, so compare the setup with fork-checks before changing product behavior; reproduce timeouts before changing behavior. Reproduce the failures with the exact focused test command, fix the underlying behavior, and rerun it until all selected tests pass. Do not delete or skip tests, weaken assertions, or add retries beyond the single CI retry already configured. Do not inspect system files or paths outside the checkout, launch tests in the background, or leave temporary debug edits in the final diff; the workflow configures the test environment and the full log is inside the checkout. This is a non-interactive run: do not use commands that request confirmation or require a terminal prompt, including 'git add -p'; use checkout-local scratch files under target/, and if a tool call is rejected, replace it with a checkout-local, non-interactive command. Follow AGENTS.md and keep the fork feature intent intact.
+
+Fold every code fix into the existing commit that owns the affected code; do not add commits. Stage your changes, use git log/git blame to find the owning commit, create a fixup commit, and autosquash it with 'GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash $ONTO'. Resolve any autosquash conflict by hand. Finish with the same number of commits as before the repair, a clean tracked working tree, and 'git diff --check' clean."; then
+            echo "error: opencode could not repair the focused test failures" >&2
+            exit 1
+        fi
+        if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+            echo "error: opencode left the working tree dirty after test repair" >&2
+            exit 1
+        fi
+        COMMITS_NOW=$(git rev-list --count "$ONTO"..HEAD)
+        if [ "$COMMITS_NOW" != "$COMMITS_BEFORE" ]; then
+            echo "error: the test repair changed the number of commits ($COMMITS_BEFORE -> $COMMITS_NOW)" >&2
+            exit 1
+        fi
+        if ! git diff --check; then
+            echo "error: whitespace issues after focused test repair" >&2
+            exit 1
+        fi
+    done
+
+    if [ "$TESTS_PASSED" != true ]; then
+        echo "error: focused tests still fail after $TEST_ATTEMPTS repair attempt(s)" >&2
+        echo "the full log is at $TEST_LOG" >&2
+        exit 1
+    fi
+fi
