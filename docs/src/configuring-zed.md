@@ -34,6 +34,18 @@ The file is located at:
 - Linux: `~/.config/zed/settings.json` (or `$XDG_CONFIG_HOME/zed/settings.json`)
 - Windows: `%APPDATA%\Zed\settings.json`
 
+Endo keeps its user settings separate from Zed, in `~/.config/endo/settings.json`
+on macOS and Linux (or `$XDG_CONFIG_HOME/endo/settings.json` on Linux), and in
+`%APPDATA%\Endo\settings.json` on Windows. On first launch, Endo copies your
+existing Zed settings. Later changes are independent. Keymaps, project settings,
+and other application data remain shared. A custom `--user-data-dir` keeps its
+own settings in that folder instead.
+
+This is a one-time copy, not ongoing synchronization. Endo never removes
+fork-specific options from Zed's old settings file. If an older Zelda build
+already wrote those options there, remove them from Zed's copy after Endo has
+imported it.
+
 The syntax is JSON with support for `//` comments.
 
 ### Default Settings

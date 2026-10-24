@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Install a local Endo Linux release without touching an existing Zed install."""
+
+import argparse
+import os
+import tarfile
+import tempfile
+from pathlib import Path
+
+
+def install(archive: Path, home: Path):
+    local = home / ".local"
+    local.mkdir(parents=True, exist_ok=True)
+    launcher = local / "bin/endo"
+    if launcher.exists() and not launcher.is_symlink():
+        raise RuntimeError(f"Refusing to replace a regular file: {launcher}")
+    app = local / "endo.app"
+    if app.is_symlink():
+        raise RuntimeError(f"Refusing to replace a linked app folder: {app}")
+    if app.exists() and not app.is_dir():
+        raise RuntimeError(f"Refusing to replace a regular file: {app}")
+    with tempfile.TemporaryDirectory(prefix="endo-install-", dir=local) as temporary:
+        staging = Path(temporary)
+        with tarfile.open(archive) as bundle:
+            if any(
+                not Path(member.name).parts or Path(member.name).parts[0] != "endo.app"
+                for member in bundle.getmembers()
+            ):
+                raise RuntimeError("The archive is not an Endo bundle")
+            bundle.extractall(staging, filter="data")
+        incoming = staging / "endo.app"
+        for required in [
+            "bin/endo", "libexec/zed-editor", "share/applications/dev.zed.Endo.desktop"
+        ]:
+            if not (incoming / required).is_file():
+                raise RuntimeError(f"Incomplete Endo bundle: missing {required}")
+        backup = staging / "previous.app"
+        if app.exists():
+            app.rename(backup)
+        try:
+            incoming.rename(app)
+        except OSError:
+            if backup.exists():
+                backup.rename(app)
+            raise
+    launcher.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".endo-launcher-", dir=launcher.parent) as temporary:
+        temporary_link = Path(temporary) / "endo"
+        temporary_link.symlink_to(app / "bin/endo")
+        os.replace(temporary_link, launcher)
+    desktop = app / "share/applications/dev.zed.Endo.desktop"
+    executable = str(app / "bin/endo").replace("\\", "\\\\").replace('"', '\\"')
+    contents = (
+        desktop.read_text()
+        .replace("TryExec=endo", f"TryExec={app}/bin/endo")
+        .replace("Exec=endo", f'Exec="{executable}"')
+        .replace("Icon=endo", f"Icon={app}/share/icons/hicolor/512x512/apps/endo.png")
+    )
+    applications = local / "share/applications"
+    applications.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(mode="w", dir=applications, delete=False) as output:
+        output.write(contents)
+        temporary_desktop = Path(output.name)
+    try:
+        os.replace(temporary_desktop, applications / desktop.name)
+    finally:
+        temporary_desktop.unlink(missing_ok=True)
+    print(f"Installed Endo to {app}. Launch it with {launcher}.")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("archive", type=Path)
+    args = parser.parse_args()
+    install(args.archive.resolve(), Path.home())
+
+
+if __name__ == "__main__":
+    main()

@@ -303,6 +303,13 @@ impl Onboarding {
 
 impl Render for Onboarding {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let is_endo =
+            release_channel::ReleaseChannel::global(cx) == release_channel::ReleaseChannel::Endo;
+        let (logo, welcome_label) = if is_endo {
+            (VectorName::EndoLogo, "Welcome to Endo")
+        } else {
+            (VectorName::ZedLogo, "Welcome to Zed")
+        };
         div()
             .image_cache(gpui::retain_all("onboarding-page"))
             .key_context({
@@ -347,11 +354,11 @@ impl Render for Onboarding {
                                     .child(
                                         h_flex()
                                             .gap_4()
-                                            .child(Vector::square(VectorName::ZedLogo, rems(2.5)))
+                                            .child(Vector::square(logo, rems(2.5)))
                                             .child(
                                                 v_flex()
                                                     .child(
-                                                        Headline::new("Welcome to Zed")
+                                                        Headline::new(welcome_label)
                                                             .size(HeadlineSize::Small),
                                                     )
                                                     .child(
