@@ -20,6 +20,7 @@ pub enum VectorName {
     ProTrialStamp,
     ProUserStamp,
     StudentStamp,
+    EndoLogo,
     ZedLogo,
     ZedXCopilot,
 }
@@ -188,6 +189,7 @@ mod tests {
 
     #[test]
     fn vector_path() {
+        assert_eq!(VectorName::EndoLogo.path().as_ref(), "images/endo_logo.svg");
         assert_eq!(VectorName::ZedLogo.path().as_ref(), "images/zed_logo.svg");
     }
 }

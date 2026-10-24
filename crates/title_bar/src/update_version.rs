@@ -130,9 +130,15 @@ impl Render for UpdateVersion {
         if self.showing_up_to_date {
             return UpdateButton::up_to_date().into_any_element();
         }
+        let is_endo = release_channel::ReleaseChannel::try_global(cx)
+            == Some(release_channel::ReleaseChannel::Endo);
         match &self.status {
             AutoUpdateStatus::Checking if self.update_check_type.is_manual() => {
-                UpdateButton::checking().into_any_element()
+                UpdateButton::checking()
+                    .when(is_endo, |button| {
+                        button.message("Checking for Endo Updates…")
+                    })
+                    .into_any_element()
             }
             AutoUpdateStatus::Downloading { version, progress } => {
                 let rendered_version = version.clone();
@@ -147,12 +153,15 @@ impl Render for UpdateVersion {
                     Label::new(message).into_any_element()
                 });
                 UpdateButton::downloading(*progress)
+                    .when(is_endo, |button| button.message("Downloading Endo Update…"))
                     .tooltip_fn(tooltip)
                     .into_any_element()
             }
             AutoUpdateStatus::Installing { version } => {
                 let version = Self::version_tooltip_message(version);
-                UpdateButton::installing(version).into_any_element()
+                UpdateButton::installing(version)
+                    .when(is_endo, |button| button.message("Installing Endo Update…"))
+                    .into_any_element()
             }
             AutoUpdateStatus::Updated { version } => {
                 let version = Self::version_tooltip_message(version);
