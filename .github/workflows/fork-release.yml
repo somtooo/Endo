@@ -2,9 +2,9 @@
 # Cut a fork release off a release branch with downloadable binaries, the
 # same artifacts the Zed team builds for their releases (release.yml), minus
 # what needs their secrets:
-#   linux x86_64  = ./script/bundle-linux            -> zelda-linux-x86_64.tar.gz
-#   macOS arm64   = ./script/bundle-mac aarch64-apple-darwin -> Zelda-aarch64.dmg
-# (each plus its remote-server archive). Both are built on the `zelda` release
+#   linux x86_64  = ./script/bundle-linux            -> endo-linux-x86_64.tar.gz
+#   macOS arm64   = ./script/bundle-mac aarch64-apple-darwin -> Endo-aarch64.dmg
+# (each plus its remote-server archive). Both are built on the `endo` release
 # channel: its own binary names, app id and icon, so it installs next to Zed and
 # Zed Preview, and it updates itself from this repository's releases. The
 # updater looks the assets up by the file names above, so renaming them breaks
@@ -342,10 +342,16 @@ jobs:
               TAG="${BRANCH#release/}.$N"
             done
           fi
-          case "$TAG" in
-            fork-v*) ;;
-            *) echo "::error::tag must look like 'fork-vX.Y.Z' (got '$TAG')"; exit 1 ;;
-          esac
+          if [[ ! "$TAG" =~ ^fork-v([0-9]+\.[0-9]+\.[0-9]+)(\.[0-9]+)?$ ]]; then
+            echo "::error::tag must look like 'fork-vX.Y.Z' or 'fork-vX.Y.Z.N' (got '$TAG')"
+            exit 1
+          fi
+          TAG_BASE="${BASH_REMATCH[1]}"
+          CODE_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' crates/zed/Cargo.toml | head -1)
+          if [ "$TAG_BASE" != "$CODE_VERSION" ]; then
+            echo "::error::release tag base $TAG_BASE differs from the bundled Zed base $CODE_VERSION"
+            exit 1
+          fi
           if git rev-parse --verify --quiet "refs/tags/$TAG" >/dev/null; then
             echo "::error::tag $TAG already exists"
             exit 1
@@ -430,10 +436,12 @@ jobs:
       - name: Download WASI SDK
         run: ./script/download-wasi-sdk
 
-      - name: Select the Zelda release channel
-        run: echo -n zelda > crates/zed/RELEASE_CHANNEL
+      - name: Select the Endo release channel
+        run: echo -n endo > crates/zed/RELEASE_CHANNEL
 
       - name: Bundle Linux release
+        env:
+          ENDO_RELEASE_TAG: ${{ needs.guard.outputs.tag }}
         run: ./script/bundle-linux
 
       - name: Upload artifacts
@@ -441,7 +449,7 @@ jobs:
         with:
           name: fork-linux-x86_64
           path: |
-            target/release/zelda-linux-x86_64.tar.gz
+            target/release/endo-linux-x86_64.tar.gz
             target/zed-remote-server-linux-x86_64.gz
           if-no-files-found: error
 
@@ -561,10 +569,12 @@ jobs:
       - name: Download WASI SDK
         run: ./script/download-wasi-sdk
 
-      - name: Select the Zelda release channel
-        run: echo -n zelda > crates/zed/RELEASE_CHANNEL
+      - name: Select the Endo release channel
+        run: echo -n endo > crates/zed/RELEASE_CHANNEL
 
       - name: Bundle macOS release (unsigned)
+        env:
+          ENDO_RELEASE_TAG: ${{ needs.guard.outputs.tag }}
         run: ./script/bundle-mac aarch64-apple-darwin
 
       - name: Upload artifacts
@@ -572,7 +582,7 @@ jobs:
         with:
           name: fork-macos-aarch64
           path: |
-            target/aarch64-apple-darwin/release/Zelda-aarch64.dmg
+            target/aarch64-apple-darwin/release/Endo-aarch64.dmg
             target/zed-remote-server-macos-aarch64.gz
           if-no-files-found: error
 
