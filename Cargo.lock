@@ -1393,6 +1393,7 @@ dependencies = [
  "clock",
  "ctor",
  "db",
+ "endo",
  "futures 0.3.34",
  "futures-lite 2.6.1",
  "gpui",
@@ -5652,6 +5653,20 @@ name = "endi"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3d8a32ae18130a3c84dd492d4215c3d913c3b07c6b63c2eb3eb7ff1101ab7bf"
+
+[[package]]
+name = "endo"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "http_client",
+ "paths",
+ "semver",
+ "serde",
+ "serde_json",
+ "smol",
+ "tempfile",
+]
 
 [[package]]
 name = "enumflags2"
@@ -12096,6 +12111,7 @@ dependencies = [
  "notifications",
  "picker",
  "project",
+ "release_channel",
  "schemars 1.0.4",
  "serde",
  "settings",
@@ -18399,6 +18415,7 @@ dependencies = [
  "platform_title_bar",
  "project",
  "recent_projects",
+ "release_channel",
  "remote",
  "remote_connection",
  "rpc",
@@ -22480,6 +22497,7 @@ dependencies = [
  "edit_prediction_ui",
  "editor",
  "encoding_selector",
+ "endo",
  "env_logger 0.11.8",
  "etw_tracing",
  "extension",
