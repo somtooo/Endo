@@ -319,5 +319,14 @@ osx_minimum_system_version = "12.0"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["zed"]
 
+[package.metadata.bundle-zelda]
+icon = ["resources/app-icon-zelda@2x.png", "resources/app-icon-zelda.png"]
+identifier = "dev.zed.Zelda"
+name = "Zelda"
+category = "Developer Tool"
+osx_minimum_system_version = "10.15.7"
+osx_info_plist_exts = ["resources/info/*"]
+osx_url_schemes = ["zed"]
+
 [package.metadata.cargo-shear]
 ignored = ["profiling", "tracing"]

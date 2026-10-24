@@ -187,10 +187,14 @@ zed_dir="${temp_dir}/zed$suffix.app"
 
 # Cargo may reuse its outputs on the next invocation. Strip packaging copies
 # so reruns still upload full ELFs and extract complete debug companions.
+cli_name="zed"
+if [[ "$channel" == "zelda" ]]; then
+  cli_name="zelda"
+fi
 mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
 llvm-objcopy --strip-unneeded "${target_dir}/${target_triple}/release/zed" "${zed_dir}/libexec/zed-editor"
-llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/zed"
-llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/release/remote-server" "${temp_dir}/remote_server"
+llvm-objcopy --strip-debug --discard-all "${target_dir}/${target_triple}/release/cli" "${zed_dir}/bin/${cli_name}"
+llvm-objcopy --strip-debug --discard-all "${target_dir}/${remote_server_triple}/release/remote_server" "${temp_dir}/remote_server"
 
 # Libs
 # Bundle libstdc++ so older supported systems can run binaries built with our
@@ -224,6 +228,10 @@ export APP_ARGS="%U"
 if [[ "$channel" == "preview" ]]; then
   export APP_NAME="Zed Preview"
   APP_ID="dev.zed.Zed-Preview"
+elif [[ "$channel" == "zelda" ]]; then
+  export APP_NAME="Zelda"
+  export APP_CLI="zelda"
+  APP_ID="dev.zed.Zelda"
 elif [[ "$channel" == "nightly" ]]; then
   export APP_NAME="Zed Nightly"
   APP_ID="dev.zed.Zed-Nightly"
@@ -244,10 +252,14 @@ cp "assets/licenses.md" "${zed_dir}/licenses.md"
 
 # Create archive out of everything that's in the temp directory
 arch=$(uname -m)
-archive="zed-linux-${arch}.tar.gz"
+archive_name="zed"
+if [[ "$channel" == "zelda" ]]; then
+  archive_name="zelda"
+fi
+archive="${archive_name}-linux-${arch}.tar.gz"
 
 rm -rf "${archive}"
-remove_match="zed(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
+remove_match="(zed|zelda)(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
 tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "zed$suffix.app"
 

@@ -47,6 +47,10 @@ impl std::error::Error for MissingDependencyError {}
 const POLL_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const NIGHTLY_POLL_INTERVAL: Duration = Duration::from_secs(15 * 60);
 const REMOTE_SERVER_CACHE_LIMIT: usize = 5;
+/// The Zelda channel is the fork's own build. It is updated from the GitHub
+/// releases of this repository rather than from zed.dev.
+const ZELDA_RELEASES_REPOSITORY: &str = "somtooo/zed";
+const ZELDA_RELEASE_TAG_PREFIX: &str = "fork-v";
 
 #[cfg(target_os = "linux")]
 fn linux_rsync_install_hint() -> &'static str {
@@ -187,6 +191,25 @@ pub struct AutoUpdater {
     update_check_type: UpdateCheckType,
     _wake_subscription: gpui::Subscription,
     dismissed_status: Option<AutoUpdateStatus>,
+}
+
+#[derive(Deserialize)]
+struct GithubRelease {
+    tag_name: String,
+    draft: bool,
+    prerelease: bool,
+    assets: Vec<GithubReleaseAsset>,
+}
+
+#[derive(Deserialize)]
+struct GithubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Deserialize)]
+struct GithubCommit {
+    sha: String,
 }
 
 #[derive(Deserialize, Serialize, Clone, Debug)]
@@ -357,6 +380,9 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
         }
         ReleaseChannel::Nightly => {
             "https://github.com/zed-industries/zed/commits/nightly/".to_string()
+        }
+        ReleaseChannel::Zelda => {
+            format!("https://github.com/{ZELDA_RELEASES_REPOSITORY}/releases/latest")
         }
         ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
     };
@@ -685,6 +711,10 @@ impl AutoUpdater {
     ) -> Result<ReleaseAsset> {
         let client = this.read_with(cx, |this, _| this.client.clone());
 
+        if release_channel == ReleaseChannel::Zelda {
+            return get_zelda_release_asset(client.http_client(), version, asset, os, arch).await;
+        }
+
         let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {
             (
                 client.telemetry().system_id(),
@@ -875,7 +905,9 @@ impl AutoUpdater {
         let fetched_version = fetched_version.parse::<Version>()?;
 
         match release_channel {
-            ReleaseChannel::Nightly => {
+            // Zelda releases share the upstream version number, so like
+            // nightly they are told apart by the commit they were built from.
+            ReleaseChannel::Nightly | ReleaseChannel::Zelda => {
                 let should_download = if let AutoUpdateStatus::Updated { version } = status {
                     fetched_version != version
                 } else {
@@ -994,6 +1026,116 @@ impl AutoUpdater {
             Ok(kvp.read_kvp(SHOULD_SHOW_UPDATE_NOTIFICATION_KEY)?.is_some())
         })
     }
+}
+
+/// The upstream version a fork release tag was built on: `fork-v1.25.3` and
+/// its re-releases such as `fork-v1.25.3.2` are all `1.25.3`.
+fn zelda_version_from_tag(tag: &str) -> Option<Version> {
+    let mut components = tag
+        .strip_prefix(ZELDA_RELEASE_TAG_PREFIX)?
+        .split('.')
+        .map(|component| component.parse::<u64>().ok());
+    let major = components.next()??;
+    let minor = components.next()??;
+    let patch = components.next()??;
+    Some(Version::new(major, minor, patch))
+}
+
+/// The name of the file the fork's release workflow uploads for `asset` on
+/// this platform.
+fn zelda_asset_file_name(asset: &str, os: &str, arch: &str) -> Result<String> {
+    match (asset, os) {
+        ("zed", "linux") => Ok(format!("zelda-linux-{arch}.tar.gz")),
+        ("zed", "macos") => Ok(format!("Zelda-{arch}.dmg")),
+        ("zed-remote-server", "linux" | "macos") => Ok(format!("zed-remote-server-{os}-{arch}.gz")),
+        _ => anyhow::bail!("Zelda has no {asset} release for {os}"),
+    }
+}
+
+/// Picks the newest release that was built on `version` (or the newest one
+/// at all, when `version` is `None`) and has the file `file_name`.
+/// `releases` is ordered newest first, as the GitHub API returns it.
+fn select_zelda_release<'a>(
+    releases: &'a [GithubRelease],
+    version: Option<&Version>,
+    file_name: &str,
+) -> Option<(&'a GithubRelease, &'a GithubReleaseAsset)> {
+    releases
+        .iter()
+        .filter(|release| !release.draft && !release.prerelease)
+        .filter(|release| {
+            version.is_none_or(|version| {
+                zelda_version_from_tag(&release.tag_name).as_ref() == Some(version)
+            })
+        })
+        .find_map(|release| {
+            let asset = release
+                .assets
+                .iter()
+                .find(|asset| asset.name == file_name)?;
+            Some((release, asset))
+        })
+}
+
+async fn get_zelda_release_asset(
+    http_client: Arc<HttpClientWithUrl>,
+    version: Option<Version>,
+    asset: &str,
+    os: &str,
+    arch: &str,
+) -> Result<ReleaseAsset> {
+    let file_name = zelda_asset_file_name(asset, os, arch)?;
+    let version = version.map(|mut version| {
+        version.pre = semver::Prerelease::EMPTY;
+        version.build = semver::BuildMetadata::EMPTY;
+        version
+    });
+
+    let releases: Vec<GithubRelease> = get_github_json(
+        &http_client,
+        &format!("https://api.github.com/repos/{ZELDA_RELEASES_REPOSITORY}/releases?per_page=30"),
+    )
+    .await?;
+    let (release, release_asset) = select_zelda_release(&releases, version.as_ref(), &file_name)
+        .with_context(|| match &version {
+            Some(version) => format!("no Zelda release built on {version} has {file_name}"),
+            None => format!("no Zelda release has {file_name}"),
+        })?;
+    let release_version = zelda_version_from_tag(&release.tag_name)
+        .with_context(|| format!("unexpected Zelda release tag {:?}", release.tag_name))?;
+
+    // The tag is annotated, and this endpoint resolves it to the commit.
+    let commit: GithubCommit = get_github_json(
+        &http_client,
+        &format!(
+            "https://api.github.com/repos/{ZELDA_RELEASES_REPOSITORY}/commits/{}",
+            release.tag_name
+        ),
+    )
+    .await?;
+
+    Ok(ReleaseAsset {
+        version: format!("{release_version}+zelda.{}", commit.sha),
+        url: release_asset.browser_download_url.clone(),
+    })
+}
+
+async fn get_github_json<T: serde::de::DeserializeOwned>(
+    http_client: &HttpClientWithUrl,
+    url: &str,
+) -> Result<T> {
+    let mut response = http_client.get(url, Default::default(), true).await?;
+    let mut body = Vec::new();
+    response.body_mut().read_to_end(&mut body).await?;
+
+    anyhow::ensure!(
+        response.status().is_success(),
+        "failed to fetch {url}: {:?}",
+        String::from_utf8_lossy(&body),
+    );
+
+    serde_json::from_slice(&body)
+        .with_context(|| format!("error deserializing response from {url}"))
 }
 
 async fn download_remote_server_binary(
@@ -1883,5 +2025,135 @@ mod tests {
             newer_version.unwrap(),
             Some(fetched_version.parse().unwrap())
         );
+    }
+
+    #[test]
+    fn test_zelda_version_from_tag() {
+        assert_eq!(
+            zelda_version_from_tag("fork-v1.25.3"),
+            Some(Version::new(1, 25, 3))
+        );
+        assert_eq!(
+            zelda_version_from_tag("fork-v1.25.3.2"),
+            Some(Version::new(1, 25, 3))
+        );
+        assert_eq!(zelda_version_from_tag("v1.25.3"), None);
+        assert_eq!(zelda_version_from_tag("fork-v1.25"), None);
+        assert_eq!(zelda_version_from_tag("fork-v1.25.x"), None);
+    }
+
+    #[test]
+    fn test_zelda_asset_file_names() {
+        assert_eq!(
+            zelda_asset_file_name("zed", "linux", "x86_64").unwrap(),
+            "zelda-linux-x86_64.tar.gz"
+        );
+        assert_eq!(
+            zelda_asset_file_name("zed", "macos", "aarch64").unwrap(),
+            "Zelda-aarch64.dmg"
+        );
+        assert_eq!(
+            zelda_asset_file_name("zed-remote-server", "linux", "aarch64").unwrap(),
+            "zed-remote-server-linux-aarch64.gz"
+        );
+        assert!(zelda_asset_file_name("zed", "windows", "x86_64").is_err());
+    }
+
+    fn github_release(tag_name: &str, draft: bool, file_names: &[&str]) -> GithubRelease {
+        GithubRelease {
+            tag_name: tag_name.to_string(),
+            draft,
+            prerelease: false,
+            assets: file_names
+                .iter()
+                .map(|name| GithubReleaseAsset {
+                    name: name.to_string(),
+                    browser_download_url: format!("https://test.example/{tag_name}/{name}"),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn test_select_zelda_release() {
+        let releases = vec![
+            github_release("fork-v1.25.4", true, &["zelda-linux-x86_64.tar.gz"]),
+            github_release("fork-v1.25.3.2", false, &["zelda-linux-x86_64.tar.gz"]),
+            github_release("fork-v1.25.3", false, &["zelda-linux-x86_64.tar.gz"]),
+            github_release("fork-v1.25.2", false, &["zed-linux-x86_64.tar.gz"]),
+        ];
+        let file_name = "zelda-linux-x86_64.tar.gz";
+
+        let (latest, _) = select_zelda_release(&releases, None, file_name).unwrap();
+        assert_eq!(latest.tag_name, "fork-v1.25.3.2");
+
+        let (pinned, asset) =
+            select_zelda_release(&releases, Some(&Version::new(1, 25, 3)), file_name).unwrap();
+        assert_eq!(pinned.tag_name, "fork-v1.25.3.2");
+        assert_eq!(
+            asset.browser_download_url,
+            "https://test.example/fork-v1.25.3.2/zelda-linux-x86_64.tar.gz"
+        );
+
+        // Releases from before the Zelda channel existed have no Zelda assets.
+        assert!(
+            select_zelda_release(&releases, Some(&Version::new(1, 25, 2)), file_name).is_none()
+        );
+        assert!(
+            select_zelda_release(&releases, Some(&Version::new(1, 25, 4)), file_name).is_none()
+        );
+    }
+
+    #[test]
+    fn test_zelda_updates_by_commit_sha() {
+        let installed_version = semver::Version::new(1, 25, 3);
+        let fetched_version = "1.25.3+zelda.bbbb".to_string();
+
+        let same_commit = AutoUpdater::check_if_fetched_version_is_newer(
+            ReleaseChannel::Zelda,
+            Ok(Some("bbbb".to_string())),
+            installed_version.clone(),
+            fetched_version.clone(),
+            AutoUpdateStatus::Idle,
+        );
+        assert_eq!(same_commit.unwrap(), None);
+
+        let other_commit = AutoUpdater::check_if_fetched_version_is_newer(
+            ReleaseChannel::Zelda,
+            Ok(Some("aaaa".to_string())),
+            installed_version,
+            fetched_version.clone(),
+            AutoUpdateStatus::Idle,
+        );
+        assert_eq!(
+            other_commit.unwrap(),
+            Some(fetched_version.parse().unwrap())
+        );
+    }
+
+    #[gpui::test]
+    async fn test_get_zelda_release_asset(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+
+        let client = FakeHttpClient::create(move |request| async move {
+            let body = match request.uri().path() {
+                "/repos/somtooo/zed/releases" => {
+                    r#"[
+                        {"tag_name": "fork-v1.25.3", "draft": false, "prerelease": false, "assets": [
+                            {"name": "Zelda-aarch64.dmg", "browser_download_url": "https://test.example/Zelda-aarch64.dmg"}
+                        ]}
+                    ]"#
+                }
+                "/repos/somtooo/zed/commits/fork-v1.25.3" => r#"{"sha": "cafe"}"#,
+                path => panic!("unexpected request to {path}"),
+            };
+            Ok(Response::builder().status(200).body(body.into()).unwrap())
+        });
+
+        let release = get_zelda_release_asset(client, None, "zed", "macos", "aarch64")
+            .await
+            .unwrap();
+        assert_eq!(release.version, "1.25.3+zelda.cafe");
+        assert_eq!(release.url, "https://test.example/Zelda-aarch64.dmg");
     }
 }
