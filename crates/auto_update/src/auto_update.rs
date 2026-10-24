@@ -358,6 +358,12 @@ pub fn release_notes_url(cx: &mut App) -> Option<String> {
         ReleaseChannel::Nightly => {
             "https://github.com/zed-industries/zed/commits/nightly/".to_string()
         }
+        ReleaseChannel::Endo => {
+            format!(
+                "https://github.com/{}/releases/latest",
+                endo::RELEASES_REPOSITORY
+            )
+        }
         ReleaseChannel::Dev => "https://github.com/zed-industries/zed/commits/main/".to_string(),
     };
     Some(url)
@@ -685,6 +691,16 @@ impl AutoUpdater {
     ) -> Result<ReleaseAsset> {
         let client = this.read_with(cx, |this, _| this.client.clone());
 
+        if release_channel == ReleaseChannel::Endo {
+            let release =
+                endo::releases::get_release_asset(client.http_client(), version, asset, os, arch)
+                    .await?;
+            return Ok(ReleaseAsset {
+                version: release.version,
+                url: release.url,
+            });
+        }
+
         let (system_id, metrics_id, is_staff) = if client.telemetry().metrics_enabled() {
             (
                 client.telemetry().system_id(),
@@ -784,6 +800,14 @@ impl AutoUpdater {
             return Ok(());
         };
 
+        #[cfg(not(test))]
+        if release_channel == ReleaseChannel::Endo {
+            anyhow::ensure!(
+                option_env!("ZED_BUNDLE").is_some(),
+                "Endo updates can only be installed by a bundled build"
+            );
+        }
+
         this.update(cx, |this, cx| {
             this.status = AutoUpdateStatus::Downloading {
                 version: newer_version.clone(),
@@ -875,6 +899,19 @@ impl AutoUpdater {
         let fetched_version = fetched_version.parse::<Version>()?;
 
         match release_channel {
+            ReleaseChannel::Endo => {
+                if let AutoUpdateStatus::Updated { version } = status
+                    && version == fetched_version
+                {
+                    return Ok(None);
+                }
+                Ok(endo::releases::newer_version(
+                    &installed_version,
+                    fetched_version,
+                    app_commit_sha.ok().flatten().as_deref(),
+                    endo::RELEASE_TAG,
+                ))
+            }
             ReleaseChannel::Nightly => {
                 let should_download = if let AutoUpdateStatus::Updated { version } = status {
                     fetched_version != version
@@ -973,16 +1010,13 @@ impl AutoUpdater {
         cx: &App,
     ) -> Task<Result<()>> {
         let kvp = KeyValueStore::global(cx);
+        let notification_key = Self::update_notification_key(cx);
         cx.background_spawn(async move {
             if should_show {
-                kvp.write_kvp(
-                    SHOULD_SHOW_UPDATE_NOTIFICATION_KEY.to_string(),
-                    "".to_string(),
-                )
-                .await?;
-            } else {
-                kvp.delete_kvp(SHOULD_SHOW_UPDATE_NOTIFICATION_KEY.to_string())
+                kvp.write_kvp(notification_key.to_string(), "".to_string())
                     .await?;
+            } else {
+                kvp.delete_kvp(notification_key.to_string()).await?;
             }
             Ok(())
         })
@@ -990,9 +1024,16 @@ impl AutoUpdater {
 
     pub fn should_show_update_notification(&self, cx: &App) -> Task<Result<bool>> {
         let kvp = KeyValueStore::global(cx);
-        cx.background_spawn(async move {
-            Ok(kvp.read_kvp(SHOULD_SHOW_UPDATE_NOTIFICATION_KEY)?.is_some())
-        })
+        let notification_key = Self::update_notification_key(cx);
+        cx.background_spawn(async move { Ok(kvp.read_kvp(notification_key)?.is_some()) })
+    }
+
+    fn update_notification_key(cx: &App) -> &'static str {
+        if ReleaseChannel::try_global(cx) == Some(ReleaseChannel::Endo) {
+            "endo-auto-updater-should-show-updated-notification"
+        } else {
+            SHOULD_SHOW_UPDATE_NOTIFICATION_KEY
+        }
     }
 }
 
@@ -1162,7 +1203,11 @@ async fn install_release_linux(
     } else {
         String::default()
     };
-    let app_folder_name = format!("zed{}.app", suffix);
+    let app_folder_name = if channel == "endo" {
+        "endo.app".to_string()
+    } else {
+        format!("zed{}.app", suffix)
+    };
 
     let from = extracted.join(&app_folder_name);
     let mut to = home_dir.join(".local");
@@ -1177,6 +1222,11 @@ async fn install_release_linux(
     }
 
     let mut cmd = new_command("rsync");
+    if channel == "endo" {
+        // A release can preserve both size and timestamps while changing the
+        // executable. The default quick check would leave the old binary there.
+        cmd.arg("--checksum");
+    }
     cmd.args(["-av", "--delete"]).arg(&from).arg(&to);
     let output = cmd
         .output()
@@ -1204,15 +1254,15 @@ async fn install_release_macos(
         .file_name()
         .with_context(|| format!("invalid running app path {running_app_path:?}"))?;
 
-    let mount_path = temp_dir.path().join("Zed");
+    let mount_path = temp_dir.path().join("mounted-app");
     let mut mounted_app_path: OsString = mount_path.join(running_app_filename).into();
 
     mounted_app_path.push("/");
     let mut cmd = new_command("hdiutil");
     cmd.args(["attach", "-nobrowse"])
         .arg(&downloaded_dmg)
-        .arg("-mountroot")
-        .arg(temp_dir.path());
+        .arg("-mountpoint")
+        .arg(&mount_path);
     let output = cmd
         .output()
         .await
@@ -1398,6 +1448,66 @@ mod tests {
         });
     }
 
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[gpui::test]
+    async fn test_endo_update_downloads_and_notifies(cx: &mut TestAppContext) {
+        cx.background_executor.allow_parking();
+        let file_name =
+            endo::releases::asset_file_name("zed", OS, ARCH).expect("supported test platform");
+        let download_path = format!("/somtooo/zed/releases/download/fork-v99.0.0/{file_name}");
+        let listing = serde_json::json!([{
+            "tag_name": "fork-v99.0.0", "draft": false, "prerelease": false,
+            "assets": [{"name": file_name, "browser_download_url": format!("https://github.com{download_path}")}]
+        }]).to_string();
+        let client = FakeHttpClient::create(move |request| {
+            let listing = listing.clone();
+            let download_path = download_path.clone();
+            async move {
+                let body = match request.uri().path() {
+                    "/repos/somtooo/zed/releases" => listing,
+                    "/repos/somtooo/zed/commits/fork-v99.0.0" => r#"{"sha":"cafe"}"#.into(),
+                    path if path == download_path => "<endo-update>".into(),
+                    path => anyhow::bail!("unexpected update endpoint: {path}"),
+                };
+                Ok(Response::builder().status(200).body(body.into())?)
+            }
+        });
+        let installed = Arc::new(tempdir().expect("installer test directory"));
+        let updater = cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
+            settings::init(cx);
+            release_channel::init_test(Version::new(1, 0, 0), ReleaseChannel::Endo, cx);
+            let client = Client::new(Arc::new(FakeSystemClock::new()), client, cx);
+            cx.set_global(InstallOverride(Rc::new({
+                let installed = installed.clone();
+                move |path, _| {
+                    let destination = installed.path().join("endo");
+                    std::fs::copy(path, &destination)?;
+                    Ok(Some(destination))
+                }
+            })));
+            cx.new(|cx| AutoUpdater::new(Version::new(1, 0, 0), client, cx))
+        });
+        let update = cx.update(|cx| {
+            cx.spawn({
+                let updater = updater.clone();
+                async move |cx| AutoUpdater::update(updater, cx).await
+            })
+        });
+        update.await.expect("Endo update should succeed");
+        assert_eq!(
+            std::fs::read(installed.path().join("endo")).expect("installed update"),
+            b"<endo-update>"
+        );
+        assert!(updater.read_with(cx, |updater, _| updater.status().is_updated()));
+        cx.run_until_parked();
+        let notified = cx.update(|cx| updater.read(cx).should_show_update_notification(cx));
+        assert!(notified.await.expect("Endo update flag"));
+        let zed_notified =
+            cx.update(|cx| KeyValueStore::global(cx).read_kvp(SHOULD_SHOW_UPDATE_NOTIFICATION_KEY));
+        assert!(zed_notified.expect("Zed update flag").is_none());
+    }
+
     #[gpui::test]
     async fn test_auto_update_downloads(cx: &mut TestAppContext) {
         cx.background_executor.allow_parking();
@@ -1407,6 +1517,7 @@ mod tests {
         let (dmg_tx, dmg_rx) = oneshot::channel::<String>();
 
         cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
             settings::init(cx);
 
             let current_version = semver::Version::new(0, 100, 0);
@@ -1883,5 +1994,70 @@ mod tests {
             newer_version.unwrap(),
             Some(fetched_version.parse().unwrap())
         );
+    }
+
+    #[test]
+    fn test_endo_updates_by_commit_sha() {
+        let installed_version = semver::Version::new(1, 25, 3);
+        let fetched_version = "1.25.3+endo.2.bbbb".to_string();
+
+        let same_commit = AutoUpdater::check_if_fetched_version_is_newer(
+            ReleaseChannel::Endo,
+            Ok(Some("bbbb".to_string())),
+            installed_version.clone(),
+            fetched_version.clone(),
+            AutoUpdateStatus::Idle,
+        );
+        assert_eq!(same_commit.unwrap(), None);
+
+        let other_commit = AutoUpdater::check_if_fetched_version_is_newer(
+            ReleaseChannel::Endo,
+            Ok(Some("aaaa".to_string())),
+            installed_version,
+            fetched_version.clone(),
+            AutoUpdateStatus::Idle,
+        );
+        assert_eq!(
+            other_commit.unwrap(),
+            Some(fetched_version.parse().unwrap())
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_install_endo_leaves_zed_untouched() -> Result<()> {
+        smol::block_on(async {
+            let root = tempfile::tempdir()?;
+            let installed = root.path().join("installed");
+            let running_app = installed.join("endo.app/libexec/zed-editor");
+            let zed_binary = installed.join("zed.app/libexec/zed-editor");
+            let payload = root.path().join("payload");
+            for path in [
+                &running_app,
+                &zed_binary,
+                &payload.join("endo.app/libexec/zed-editor"),
+            ] {
+                fs::create_dir_all(path.parent().context("missing parent")?).await?;
+                fs::write(path, b"original").await?;
+            }
+            fs::write(payload.join("endo.app/libexec/zed-editor"), b"new endo").await?;
+            let installer = InstallerDir::new().await?;
+            let archive = installer.path().join("endo.tar.gz");
+            let output = new_command("tar")
+                .arg("-czf")
+                .arg(&archive)
+                .arg("-C")
+                .arg(&payload)
+                .arg("endo.app")
+                .output()
+                .await?;
+            anyhow::ensure!(output.status.success(), "tar failed");
+            let restart =
+                install_release_linux(&installer, &archive, "endo", running_app.clone()).await?;
+            assert_eq!(restart, Some(running_app.clone()));
+            assert_eq!(fs::read(&running_app).await?, b"new endo");
+            assert_eq!(fs::read(&zed_binary).await?, b"original");
+            Ok(())
+        })
     }
 }
