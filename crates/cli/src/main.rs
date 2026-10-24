@@ -31,7 +31,9 @@ use walkdir::WalkDir;
 
 use std::io::IsTerminal;
 
-const URL_PREFIX: [&'static str; 5] = ["zed://", "http://", "https://", "file://", "ssh://"];
+const URL_PREFIX: [&'static str; 6] = [
+    "zed://", "endo://", "http://", "https://", "file://", "ssh://",
+];
 
 struct Detect;
 
@@ -48,9 +50,11 @@ trait InstalledApp {
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "zed",
+    name = release_channel::RELEASE_CHANNEL.cli_name(),
     disable_version_flag = true,
-    before_help = "The Zed CLI binary.
+    before_help = if *release_channel::RELEASE_CHANNEL == release_channel::ReleaseChannel::Endo {
+        "The Endo CLI binary.\nOpens Endo, a fork of Zed.\n\nExamples:\n    endo\n    endo --foreground\n    endo path-to-your-project\n    endo -n path-to-file"
+    } else { "The Zed CLI binary.
 This CLI is a separate binary that invokes Zed.
 
 Examples:
@@ -61,8 +65,10 @@ Examples:
     `zed path-to-your-project`
           Open your project in Zed
     `zed -n path-to-file `
-          Open file/folder in a new window",
-    after_help = "To read from stdin, append '-', e.g. 'ps axf | zed -'"
+          Open file/folder in a new window" },
+    after_help = if *release_channel::RELEASE_CHANNEL == release_channel::ReleaseChannel::Endo {
+        "To read from stdin, append '-', e.g. 'ps axf | endo -'"
+    } else { "To read from stdin, append '-', e.g. 'ps axf | zed -'" }
 )]
 struct Args {
     /// Wait for all of the given paths to be opened/closed before exiting.
@@ -563,6 +569,10 @@ fn run() -> Result<()> {
         not(feature = "no-bundled-uninstall")
     ))]
     if args.uninstall {
+        anyhow::ensure!(
+            *release_channel::RELEASE_CHANNEL != release_channel::ReleaseChannel::Endo,
+            "Endo does not use Zed's uninstaller. Remove Endo's app folder and its `endo` launcher manually; leave Zed's installation and settings unchanged."
+        );
         static UNINSTALL_SCRIPT: &[u8] = include_bytes!("../../../script/uninstall.sh");
 
         let tmp_dir = tempfile::tempdir()?;
@@ -849,18 +859,27 @@ fn prompt_open_behavior() -> Option<cli::CliBehaviorSetting> {
     }
 
     let blue = console::Style::new().blue();
+    let cli_name = release_channel::RELEASE_CHANNEL.cli_name();
+    let app_name = if *release_channel::RELEASE_CHANNEL == release_channel::ReleaseChannel::Endo {
+        "Endo"
+    } else {
+        "Zed"
+    };
     let items = [
         format!(
-            "Add to existing Zed window ({})",
-            blue.apply_to("zed --existing")
+            "Add to existing {app_name} window ({})",
+            blue.apply_to(format!("{cli_name} --existing"))
         ),
-        format!("Open a new window ({})", blue.apply_to("zed --classic")),
+        format!(
+            "Open a new window ({})",
+            blue.apply_to(format!("{cli_name} --classic"))
+        ),
     ];
 
     let prompt = format!(
         "Configure default behavior for {}\n{}",
-        blue.apply_to("zed <path>"),
-        console::style("You can change this later in Zed settings"),
+        blue.apply_to(format!("{cli_name} <path>")),
+        console::style(format!("You can change this later in {app_name} settings")),
     );
 
     let selection = dialoguer::Select::new()
@@ -925,8 +944,16 @@ mod linux {
     impl InstalledApp for App {
         fn zed_version_string(&self) -> String {
             format!(
-                "Zed {}{}{} – {}",
-                if *release_channel::RELEASE_CHANNEL_NAME == "stable" {
+                "{} {}{}{} – {}",
+                if *release_channel::RELEASE_CHANNEL == release_channel::ReleaseChannel::Endo {
+                    "Endo"
+                } else {
+                    "Zed"
+                },
+                if matches!(
+                    *release_channel::RELEASE_CHANNEL,
+                    release_channel::ReleaseChannel::Stable | release_channel::ReleaseChannel::Endo
+                ) {
                     "".to_string()
                 } else {
                     format!("{} ", *release_channel::RELEASE_CHANNEL_NAME)
@@ -1202,8 +1229,16 @@ mod windows {
     impl InstalledApp for App {
         fn zed_version_string(&self) -> String {
             format!(
-                "Zed {}{}{} – {}",
-                if *release_channel::RELEASE_CHANNEL_NAME == "stable" {
+                "{} {}{}{} – {}",
+                if *release_channel::RELEASE_CHANNEL == release_channel::ReleaseChannel::Endo {
+                    "Endo"
+                } else {
+                    "Zed"
+                },
+                if matches!(
+                    *release_channel::RELEASE_CHANNEL,
+                    release_channel::ReleaseChannel::Stable | release_channel::ReleaseChannel::Endo
+                ) {
                     "".to_string()
                 } else {
                     format!("{} ", *release_channel::RELEASE_CHANNEL_NAME)
@@ -1375,7 +1410,12 @@ mod mac_os {
 
     impl InstalledApp for Bundle {
         fn zed_version_string(&self) -> String {
-            format!("Zed {} – {}", self.version(), self.path().display(),)
+            format!(
+                "{} {} – {}",
+                release_channel::RELEASE_CHANNEL.display_name(),
+                self.version(),
+                self.path().display(),
+            )
         }
 
         fn launch(&self, url: String, user_data_dir: Option<&str>) -> anyhow::Result<()> {

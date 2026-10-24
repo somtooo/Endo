@@ -1079,6 +1079,39 @@ mod tests {
     use util::rel_path::rel_path;
 
     #[gpui::test]
+    fn test_endo_configuration_uses_jsonc(cx: &mut App) {
+        let mut store = SettingsStore::new(cx, &settings::default_settings());
+        store.register_setting::<AllLanguageSettings>();
+        let settings = store.get::<AllLanguageSettings>(None);
+        let (matcher, _) = settings
+            .file_types
+            .get("JSONC")
+            .expect("JSONC associations");
+        for directory in [
+            "/home/test/.config/endo",
+            "/custom-config/endo",
+            "C:/Users/Test/AppData/Roaming/Endo",
+        ] {
+            for filename in [
+                "settings.json",
+                "global_settings.json",
+                "settings_backup.json",
+            ] {
+                let path = format!("{directory}/{filename}");
+                assert!(matcher.is_match(&path), "{path} should allow comments");
+            }
+        }
+        assert!(matcher.is_match("/home/test/.config/zed/settings.json"));
+        for path in [
+            "/project/settings.json",
+            "/project/package.json",
+            "/project/endo/package.json",
+        ] {
+            assert!(!matcher.is_match(path), "{path} should remain strict JSON");
+        }
+    }
+
+    #[gpui::test]
     fn test_file_types_preserves_valid_patterns(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let mut store = SettingsStore::new(cx, &settings::default_settings());
