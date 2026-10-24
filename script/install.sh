@@ -9,6 +9,10 @@ main() {
     platform="$(uname -s)"
     arch="$(uname -m)"
     channel="${ZED_CHANNEL:-stable}"
+    if [ "$channel" = "endo" ]; then
+        echo "Use 'python3 script/install-endo <endo-linux-ARCH.tar.gz>' for Endo on Linux, or install Endo.app from its DMG on macOS."
+        exit 1
+    fi
     ZED_VERSION="${ZED_VERSION:-latest}"
     # Use TMPDIR if available (for environments with non-standard temp directories)
     if [ -n "${TMPDIR:-}" ] && [ -d "${TMPDIR}" ]; then

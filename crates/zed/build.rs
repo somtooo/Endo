@@ -220,11 +220,14 @@ fn main() {
 fn icon_path() -> std::path::PathBuf {
     use std::str::FromStr;
 
-    let release_channel = option_env!("RELEASE_CHANNEL").unwrap_or("dev");
-    let channel = match release_channel {
+    let release_channel = std::env::var("ZED_RELEASE_CHANNEL")
+        .or_else(|_| std::env::var("RELEASE_CHANNEL"))
+        .unwrap_or_else(|_| include_str!("RELEASE_CHANNEL").trim().to_string());
+    let channel = match release_channel.as_str() {
         "stable" => "",
         "preview" => "-preview",
         "nightly" => "-nightly",
+        "endo" => "-endo",
         "dev" => "-dev",
         _ => "-dev",
     };
@@ -256,5 +259,7 @@ fn prepare_app_icon_x11() {
     resized_image.save(&icon_out_path).expect("saving app icon");
 
     println!("cargo:rerun-if-env-changed=RELEASE_CHANNEL");
+    println!("cargo:rerun-if-env-changed=ZED_RELEASE_CHANNEL");
+    println!("cargo:rerun-if-changed=RELEASE_CHANNEL");
     println!("cargo:rerun-if-changed={}", icon_path().to_string_lossy());
 }
