@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Check Endo's Linux installation and cross-platform branding assets."""
+
+import os
+import plistlib
+import runpy
+import struct
+import subprocess
+import tarfile
+import tempfile
+import tomllib
+import unittest
+import xml.etree.ElementTree as ElementTree
+from pathlib import Path
+from unittest.mock import patch
+
+ROOT = Path(__file__).resolve().parent.parent
+install = runpy.run_path(str(ROOT / "script/install-endo"))["install"]
+
+
+class EndoBrandingTests(unittest.TestCase):
+    def test_source_build_defaults_to_endo(self):
+        self.assertEqual((ROOT / "crates/zed/RELEASE_CHANNEL").read_text().strip(), "endo")
+
+    def test_welcome_logo_matches_app_artwork(self):
+        namespace = {"svg": "http://www.w3.org/2000/svg"}
+        source = ElementTree.parse(ROOT / "crates/zed/resources/app-icon-endo.svg").getroot()
+        logo = ElementTree.parse(ROOT / "assets/images/endo_logo.svg").getroot()
+        self.assertEqual(logo.attrib["viewBox"], source.attrib["viewBox"])
+        for shape in ["path", "line", "circle"]:
+            original = source.find(f"svg:{shape}", namespace)
+            monochrome = logo.find(f"svg:{shape}", namespace)
+            self.assertIsNotNone(original)
+            self.assertIsNotNone(monochrome)
+            expected = {key: "currentColor" if value == "#ffffff" else value for key, value in original.attrib.items()}
+            self.assertEqual(monochrome.attrib, expected)
+
+    def bundle(self, root, name="endo.app"):
+        payload = root / "payload" / name
+        for filename in ["bin/endo", "libexec/zed-editor", "share/icons/hicolor/512x512/apps/endo.png"]:
+            path = payload / filename
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("endo payload")
+        desktop = payload / "share/applications/dev.zed.Endo.desktop"
+        desktop.parent.mkdir(parents=True)
+        desktop.write_text("Name=Endo\nExec=endo %U\nTryExec=endo\nIcon=endo\nMimeType=x-scheme-handler/endo;\n")
+        archive = root / "endo.tar.gz"
+        with tarfile.open(archive, "w:gz") as output:
+            output.add(payload, arcname=name)
+        return archive
+
+    def test_install_leaves_zed_unchanged(self):
+        with tempfile.TemporaryDirectory(prefix="endo-test-") as temporary:
+            root = Path(temporary)
+            home = root / "home with spaces"
+            zed = home / ".local/bin/zed"
+            zed.parent.mkdir(parents=True)
+            zed.write_text("keep zed")
+            archive = self.bundle(root)
+            install(archive, home)
+            install(archive, home)
+            self.assertEqual(zed.read_text(), "keep zed")
+            self.assertEqual((home / ".local/bin/endo").resolve(), home / ".local/endo.app/bin/endo")
+            desktop = (home / ".local/share/applications/dev.zed.Endo.desktop").read_text()
+            self.assertIn('Exec="', desktop)
+            self.assertIn("/endo.app/bin/endo", desktop)
+            self.assertIn(f"TryExec={home}/.local/endo.app/bin/endo\n", desktop)
+            self.assertIn("x-scheme-handler/endo;", desktop)
+
+    def test_rejects_non_endo_archive(self):
+        with tempfile.TemporaryDirectory(prefix="endo-test-") as temporary:
+            root = Path(temporary)
+            with self.assertRaises(RuntimeError):
+                install(self.bundle(root, "zed.app"), root / "home")
+
+    def test_does_not_overwrite_a_user_launcher(self):
+        with tempfile.TemporaryDirectory(prefix="endo-test-") as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            launcher = home / ".local/bin/endo"
+            launcher.parent.mkdir(parents=True)
+            launcher.write_text("my own launcher")
+            with self.assertRaises(RuntimeError):
+                install(self.bundle(root), home)
+            self.assertEqual(launcher.read_text(), "my own launcher")
+
+    def test_does_not_write_through_a_linked_desktop_file(self):
+        with tempfile.TemporaryDirectory(prefix="endo-test-") as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            applications = home / ".local/share/applications"
+            applications.mkdir(parents=True)
+            zed_desktop = applications / "dev.zed.Zed.desktop"
+            zed_desktop.write_text("keep Zed desktop")
+            endo_desktop = applications / "dev.zed.Endo.desktop"
+            endo_desktop.symlink_to(zed_desktop)
+            install(self.bundle(root), home)
+            self.assertEqual(zed_desktop.read_text(), "keep Zed desktop")
+            self.assertFalse(endo_desktop.is_symlink())
+
+    def test_rejects_a_linked_app_folder(self):
+        with tempfile.TemporaryDirectory(prefix="endo-test-") as temporary:
+            root = Path(temporary)
+            home = root / "home"
+            local = home / ".local"
+            local.mkdir(parents=True)
+            (local / "zed.app").mkdir()
+            (local / "endo.app").symlink_to(local / "zed.app")
+            with self.assertRaises(RuntimeError):
+                install(self.bundle(root), home)
+            (local / "endo.app").unlink()
+            (local / "endo.app").write_text("keep this file")
+            with self.assertRaises(RuntimeError):
+                install(root / "endo.tar.gz", home)
+            self.assertEqual((local / "endo.app").read_text(), "keep this file")
+
+    def test_icon_dimensions_and_metadata(self):
+        resources = ROOT / "crates/zed/resources"
+        for name in ["app-icon-endo", "app-icon-endo-macos"]:
+            for suffix, size in [("", 512), ("@2x", 1024)]:
+                contents = (resources / f"{name}{suffix}.png").read_bytes()
+                self.assertEqual(contents[:8], b"\x89PNG\r\n\x1a\n")
+                self.assertEqual(struct.unpack(">II", contents[16:24]), (size, size))
+        metadata = tomllib.loads((ROOT / "crates/zed/Cargo.toml").read_text())["package"]["metadata"]["bundle-endo"]
+        self.assertEqual(metadata["name"], "Endo")
+        self.assertEqual(metadata["identifier"], "dev.zed.Endo")
+        self.assertEqual(metadata["osx_url_schemes"], ["endo"])
+        for icon in metadata["icon"]:
+            self.assertTrue((ROOT / "crates/zed" / icon).is_file())
+        source = (resources / "app-icon-endo.svg").read_text()
+        self.assertEqual((resources / "EndoIcon.icon/Assets/endo.svg").read_text(), source.replace('rx="112"', 'rx="0"'))
+
+    def test_upstream_installer_refuses_endo(self):
+        result = subprocess.run(["sh", str(ROOT / "script/install.sh")], env={**os.environ, "ZED_CHANNEL": "endo"}, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("install-endo", result.stdout)
+
+    def test_macos_catalog_and_permission_branding(self):
+        brand_bundle = runpy.run_path(str(ROOT / "script/endo-icons"))["brand_macos_bundle"]
+        with tempfile.TemporaryDirectory(prefix="endo-test-") as temporary:
+            bundle = Path(temporary) / "Endo.app"
+            (bundle / "Contents/Resources").mkdir(parents=True)
+            info_path = bundle / "Contents/Info.plist"
+            info_path.write_bytes(plistlib.dumps({"CFBundleName": "Endo", "NSCameraUsageDescription": "An application in Zed wants to use the camera."}))
+
+            def fake_actool(arguments, check):
+                self.assertTrue(check)
+                self.assertEqual(arguments[:2], ["xcrun", "actool"])
+                output = Path(arguments[arguments.index("--compile") + 1])
+                (output / "Assets.car").write_bytes(b"compiled catalog fixture")
+
+            with patch("subprocess.run", side_effect=fake_actool):
+                brand_bundle(bundle)
+            info = plistlib.loads(info_path.read_bytes())
+            self.assertEqual(info["CFBundleIconName"], "EndoIcon")
+            self.assertIn("Endo", info["NSCameraUsageDescription"])
+            self.assertEqual((bundle / "Contents/Resources/Assets.car").read_bytes(), b"compiled catalog fixture")
+
+
+if __name__ == "__main__":
+    unittest.main()

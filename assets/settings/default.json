@@ -2375,6 +2375,7 @@
       "**/.zed/*.json",
       "**/.vscode/**/*.json",
       "**/{zed,Zed}/{settings,keymap,tasks,debug}.json",
+      "**/{endo,Endo}/{settings,global_settings,settings_backup}.json",
       "tsconfig*.json",
     ],
     "Markdown": [".rules", ".cursorrules", ".windsurfrules", ".clinerules"],
