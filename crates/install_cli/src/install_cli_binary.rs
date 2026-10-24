@@ -25,7 +25,13 @@ const CANT_INSTALL_DOCS_URL: &str = "https://zed.dev/docs/macos#cant-install-cli
 /// commonly because the user is not an admin.
 async fn install_script(cx: &AsyncApp) -> Result<Option<PathBuf>> {
     let cli_path = cx.update(|cx| cx.path_for_auxiliary_executable("cli"))?;
-    let link_path = Path::new("/usr/local/bin/zed");
+    // Zelda is installed next to Zed, so it must not take over Zed's `zed` link.
+    let link_name = match cx.update(|cx| ReleaseChannel::global(cx)) {
+        ReleaseChannel::Zelda => "zelda",
+        _ => "zed",
+    };
+    let link_path = Path::new("/usr/local/bin").join(link_name);
+    let link_path = link_path.as_path();
     let bin_dir_path = link_path.parent().unwrap();
 
     // Don't re-create symlink if it points to the same CLI binary.

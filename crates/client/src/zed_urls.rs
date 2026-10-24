@@ -17,7 +17,7 @@ fn server_url(cx: &App) -> &str {
 fn docs_url(cx: &App) -> String {
     let server_url = server_url(cx);
     match ReleaseChannel::try_global(cx).unwrap_or_default() {
-        ReleaseChannel::Stable => {
+        ReleaseChannel::Stable | ReleaseChannel::Zelda => {
             format!("{server_url}/docs")
         }
         ReleaseChannel::Preview => {
