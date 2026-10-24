@@ -93,9 +93,11 @@ fn view_release_notes_locally(
 ) {
     let release_channel = ReleaseChannel::global(cx);
 
+    // These channels have no zed.dev release notes: they link to a commit or
+    // release page instead.
     if matches!(
         release_channel,
-        ReleaseChannel::Nightly | ReleaseChannel::Dev
+        ReleaseChannel::Nightly | ReleaseChannel::Dev | ReleaseChannel::Zelda
     ) {
         if let Some(url) = release_notes_url(cx) {
             cx.open_url(&url);

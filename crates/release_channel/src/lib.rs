@@ -9,7 +9,7 @@ use semver::Version;
 
 const ZED_DOCS_URL: &str = "https://zed.dev/docs";
 
-/// stable | dev | nightly | preview
+/// stable | dev | nightly | preview | zelda
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
     if cfg!(debug_assertions) {
         env::var("ZED_RELEASE_CHANNEL").unwrap_or_else(|_| compile_time_release_channel_name())
@@ -48,6 +48,7 @@ pub fn app_identifier() -> &'static str {
         ReleaseChannel::Nightly => "Zed-Editor-Nightly",
         ReleaseChannel::Preview => "Zed-Editor-Preview",
         ReleaseChannel::Stable => "Zed-Editor-Stable",
+        ReleaseChannel::Zelda => "Zed-Editor-Zelda",
     }
 }
 
@@ -151,6 +152,11 @@ pub enum ReleaseChannel {
 
     /// The Stable release channel.
     Stable,
+
+    /// The fork's own release channel, updated from the fork's GitHub
+    /// releases. It has its own name, app ID and icon so that it can be
+    /// installed next to Zed and Zed Preview.
+    Zelda,
 }
 
 struct GlobalReleaseChannel(ReleaseChannel);
@@ -179,11 +185,12 @@ pub fn docs_url(slug: &str, cx: &App) -> String {
 
 impl ReleaseChannel {
     /// All release channels.
-    pub const ALL: [ReleaseChannel; 4] = [
+    pub const ALL: [ReleaseChannel; 5] = [
         ReleaseChannel::Dev,
         ReleaseChannel::Nightly,
         ReleaseChannel::Preview,
         ReleaseChannel::Stable,
+        ReleaseChannel::Zelda,
     ];
 
     /// Returns the global [`ReleaseChannel`].
@@ -209,6 +216,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
             ReleaseChannel::Stable => "Zed",
+            ReleaseChannel::Zelda => "Zelda",
         }
     }
 
@@ -219,6 +227,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "nightly",
             ReleaseChannel::Preview => "preview",
             ReleaseChannel::Stable => "stable",
+            ReleaseChannel::Zelda => "zelda",
         }
     }
 
@@ -231,6 +240,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
             ReleaseChannel::Preview => "dev.zed.Zed-Preview",
             ReleaseChannel::Stable => "dev.zed.Zed",
+            ReleaseChannel::Zelda => "dev.zed.Zelda",
         }
     }
 
@@ -240,7 +250,7 @@ impl ReleaseChannel {
             Self::Dev => None,
             Self::Nightly => Some("nightly=1"),
             Self::Preview => Some("preview=1"),
-            Self::Stable => None,
+            Self::Stable | Self::Zelda => None,
         }
     }
 
@@ -250,7 +260,7 @@ impl ReleaseChannel {
         let channel_path_segment = match self {
             Self::Dev | Self::Nightly => Some("nightly"),
             Self::Preview => Some("preview"),
-            Self::Stable => None,
+            Self::Stable | Self::Zelda => None,
         };
 
         match channel_path_segment {
@@ -275,6 +285,7 @@ impl FromStr for ReleaseChannel {
             "nightly" => ReleaseChannel::Nightly,
             "preview" => ReleaseChannel::Preview,
             "stable" => ReleaseChannel::Stable,
+            "zelda" => ReleaseChannel::Zelda,
             _ => return Err(InvalidReleaseChannel),
         })
     }
@@ -302,5 +313,19 @@ mod tests {
             ReleaseChannel::Stable.docs_url("settings"),
             "https://zed.dev/docs/settings"
         );
+    }
+
+    #[test]
+    fn test_zelda_is_distinct_from_zed_channels() {
+        use std::str::FromStr;
+
+        assert_eq!(ReleaseChannel::from_str("zelda"), Ok(ReleaseChannel::Zelda));
+        for channel in ReleaseChannel::ALL {
+            assert_eq!(ReleaseChannel::from_str(channel.dev_name()), Ok(channel));
+            if channel != ReleaseChannel::Zelda {
+                assert_ne!(channel.app_id(), ReleaseChannel::Zelda.app_id());
+                assert_ne!(channel.display_name(), ReleaseChannel::Zelda.display_name());
+            }
+        }
     }
 }
