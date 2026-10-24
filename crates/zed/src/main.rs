@@ -120,6 +120,10 @@ fn files_not_created_on_launch(errors: HashMap<io::ErrorKind, Vec<&Path>>) {
         })
         .collect::<Vec<_>>().join("\n\n");
 
+    show_startup_error(message, error_details);
+}
+
+fn show_startup_error(message: &'static str, error_details: String) {
     eprintln!("{message}: {error_details}");
     build_application()
         .with_quit_mode(QuitMode::Explicit)
@@ -269,6 +273,13 @@ fn main() {
         Vec::new()
     };
 
+    if *release_channel::RELEASE_CHANNEL == ReleaseChannel::Endo
+        && let Err(error) = endo::init_settings(args.user_data_dir.is_some())
+    {
+        show_startup_error("Could not initialize Endo's settings", error.to_string());
+        return;
+    }
+
     #[cfg(target_os = "windows")]
     match util::get_zed_cli_path() {
         Ok(path) => askpass::set_askpass_program(path),
@@ -315,7 +326,12 @@ fn main() {
             client::telemetry::os_name(),
             client::telemetry::os_version(),
         );
-        println!("Zed System Specs (from CLI):\n{}", system_specs);
+        let app_name = if *release_channel::RELEASE_CHANNEL == ReleaseChannel::Endo {
+            "Endo"
+        } else {
+            "Zed"
+        };
+        println!("{app_name} System Specs (from CLI):\n{}", system_specs);
         return;
     }
 

@@ -367,7 +367,7 @@ pub fn get_zed_cli_path() -> Result<PathBuf> {
         &["bin/zed.exe", "./cli.exe"]
     } else if cfg!(target_os = "linux") || cfg!(target_os = "freebsd") {
         // bin is the standard, ./cli is for the target directory in development builds.
-        &["../bin/zed", "./cli"]
+        &["../bin/zed", "../bin/endo", "./cli"]
     } else {
         anyhow::bail!("unsupported platform for determining zed-cli path");
     };

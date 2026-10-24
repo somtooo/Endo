@@ -450,7 +450,13 @@ impl Render for WelcomePage {
                 .into_any_element()
         };
 
-        let welcome_label = if self.fallback_to_recent_projects {
+        let is_endo = release_channel::ReleaseChannel::try_global(cx)
+            == Some(release_channel::ReleaseChannel::Endo);
+        let welcome_label = if is_endo && self.fallback_to_recent_projects {
+            "Welcome back to Endo"
+        } else if is_endo {
+            "Welcome to Endo"
+        } else if self.fallback_to_recent_projects {
             "Welcome back to Zed"
         } else {
             "Welcome to Zed"
@@ -480,7 +486,14 @@ impl Render for WelcomePage {
                             .justify_center()
                             .mb_4()
                             .gap_4()
-                            .child(Vector::square(VectorName::ZedLogo, rems_from_px(45_f32)))
+                            .child(Vector::square(
+                                if is_endo {
+                                    VectorName::EndoLogo
+                                } else {
+                                    VectorName::ZedLogo
+                                },
+                                rems_from_px(45_f32),
+                            ))
                             .child(
                                 v_flex().child(Headline::new(welcome_label)).child(
                                     Label::new("The editor for what's next")
