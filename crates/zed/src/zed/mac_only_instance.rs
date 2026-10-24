@@ -32,6 +32,7 @@ fn address() -> SocketAddr {
         ReleaseChannel::Preview => 43737 + USER_BLOCK,
         ReleaseChannel::Stable => 43737 + (2 * USER_BLOCK),
         ReleaseChannel::Nightly => 43737 + (3 * USER_BLOCK),
+        ReleaseChannel::Zelda => 43737 + (4 * USER_BLOCK),
     };
     let uid = getuid().as_raw();
     // Ensure that the user ID is not too large to avoid overflow when
@@ -50,6 +51,7 @@ fn instance_handshake() -> &'static str {
         ReleaseChannel::Nightly => "Zed Editor Nightly Instance Running",
         ReleaseChannel::Preview => "Zed Editor Preview Instance Running",
         ReleaseChannel::Stable => "Zed Editor Stable Instance Running",
+        ReleaseChannel::Zelda => "Zelda Editor Instance Running",
     }
 }
 

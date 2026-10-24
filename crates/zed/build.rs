@@ -225,6 +225,7 @@ fn icon_path() -> std::path::PathBuf {
         "stable" => "",
         "preview" => "-preview",
         "nightly" => "-nightly",
+        "zelda" => "-zelda",
         "dev" => "-dev",
         _ => "-dev",
     };
