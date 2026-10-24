@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Regenerate Endo's PNGs and macOS Icon Composer artwork from its SVG."""
+
+import argparse
+import plistlib
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+
+def brand_macos_bundle(bundle: Path):
+    resources = Path(__file__).resolve().parent.parent / "crates/zed/resources"
+    with tempfile.TemporaryDirectory(prefix="endo-icon-") as temporary:
+        output = Path(temporary)
+        subprocess.run([
+            "xcrun", "actool", str(resources / "EndoIcon.icon"), "--compile", str(output),
+            "--app-icon", "EndoIcon", "--platform", "macosx",
+            "--minimum-deployment-target", "12.0",
+            "--output-partial-info-plist", str(output / "Info.plist"),
+        ], check=True)
+        shutil.copyfile(output / "Assets.car", bundle / "Contents/Resources/Assets.car")
+    info_path = bundle / "Contents/Info.plist"
+    with info_path.open("rb") as source:
+        info = plistlib.load(source)
+    info["CFBundleIconName"] = "EndoIcon"
+    for key, value in info.items():
+        if key.endswith("UsageDescription") and isinstance(value, str):
+            info[key] = value.replace("Zed", "Endo")
+    with info_path.open("wb") as destination:
+        plistlib.dump(info, destination)
+
+
+def render_icons():
+    resources = Path(__file__).resolve().parent.parent / "crates/zed/resources"
+    source = resources / "app-icon-endo.svg"
+    for size, suffix in [(512, ""), (1024, "@2x")]:
+        subprocess.run([
+            "rsvg-convert", "--width", str(size), "--height", str(size),
+            "--output", str(resources / f"app-icon-endo{suffix}.png"), str(source),
+        ], check=True)
+        # Older macOS draws ICNS without applying a system mask. Leave the
+        # standard transparent margin around the already rounded tile.
+        tile_size = size * 824 // 1024
+        subprocess.run([
+            "magick", str(resources / f"app-icon-endo{suffix}.png"),
+            "-resize", f"{tile_size}x{tile_size}", "-gravity", "center",
+            "-background", "none", "-extent", f"{size}x{size}",
+            str(resources / f"app-icon-endo-macos{suffix}.png"),
+        ], check=True)
+    # macOS 26 masks asset-catalog icons itself; transparent margins in its
+    # legacy ICNS path trigger glass shading instead of the supplied artwork.
+    artwork = resources / "EndoIcon.icon/Assets/endo.svg"
+    artwork.parent.mkdir(parents=True, exist_ok=True)
+    artwork.write_text(source.read_text().replace('rx="112"', 'rx="0"'))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bundle", type=Path, help="Apply the macOS 26 icon catalog to a built app")
+    args = parser.parse_args()
+    if args.bundle:
+        brand_macos_bundle(args.bundle)
+    else:
+        render_icons()
+
+
+if __name__ == "__main__":
+    main()
