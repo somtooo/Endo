@@ -2606,6 +2606,105 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_reveal_other_panel_after_closing_last_terminal(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        init_test(cx);
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.terminal.get_or_insert_default().dock = Some(TerminalDockPosition::Right);
+            });
+        });
+
+        let (window_handle, terminal_panel) = init_workspace_with_panel(cx).await;
+        let workspace = window_handle
+            .update(cx, |multi_workspace, _, _| {
+                multi_workspace.workspace().clone()
+            })
+            .expect("Failed to read workspace");
+        let cx = &mut VisualTestContext::from_window(window_handle.into(), cx);
+        let other_panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel =
+                cx.new(|cx| workspace::dock::test::TestPanel::new(DockPosition::Right, 100, cx));
+            workspace.add_panel(panel.clone(), window, cx);
+            panel
+        });
+
+        terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(false, None, RevealStrategy::Never, window, cx)
+            })
+            .await
+            .expect("Failed to spawn terminal");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<TerminalPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        terminal_panel.update_in(cx, |panel, window, cx| {
+            panel.active_pane.update(cx, |pane, cx| {
+                let item_id = pane
+                    .active_item()
+                    .expect("terminal should be open")
+                    .item_id();
+                pane.remove_item(item_id, true, true, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.right_dock().read(cx).is_open());
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_panel_focus::<workspace::dock::test::TestPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.right_dock().read(cx);
+            assert_eq!(
+                dock.visible_panel().map(|panel| panel.panel_id()),
+                Some(other_panel.entity_id())
+            );
+            assert!(other_panel.focus_handle(cx).contains_focused(window, cx));
+        });
+
+        terminal_panel
+            .update_in(cx, |panel, window, cx| {
+                panel.add_terminal_shell(false, None, RevealStrategy::Never, window, cx)
+            })
+            .await
+            .expect("Failed to spawn another terminal");
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.focus_panel::<TerminalPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        terminal_panel.update_in(cx, |panel, window, cx| {
+            panel.active_pane.update(cx, |pane, cx| {
+                let item_id = pane
+                    .active_item()
+                    .expect("terminal should be open")
+                    .item_id();
+                pane.remove_item(item_id, true, true, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.right_dock().read(cx).is_open());
+        });
+
+        other_panel.update(cx, |_, cx| cx.emit(PanelEvent::Activate));
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.right_dock().read(cx);
+            assert!(dock.is_open());
+            assert_eq!(
+                dock.visible_panel().map(|panel| panel.panel_id()),
+                Some(other_panel.entity_id())
+            );
+            assert!(other_panel.focus_handle(cx).contains_focused(window, cx));
+            assert_eq!(terminal_panel.read(cx).active_pane.read(cx).items_len(), 0);
+        });
+    }
+
+    #[gpui::test]
     async fn test_panel_terminal_keeps_focus_on_active_modal(cx: &mut TestAppContext) {
         cx.executor().allow_parking();
         init_test(cx);
