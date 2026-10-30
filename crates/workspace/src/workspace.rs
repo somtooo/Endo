@@ -17045,6 +17045,105 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_panel_activation_does_not_reactivate_previous_panel(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        let (previous_panel, intended_panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let previous_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 100, cx));
+            let intended_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(previous_panel.clone(), window, cx);
+            workspace.add_panel(intended_panel.clone(), window, cx);
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.set_open(true, window, cx);
+                dock.set_open(false, window, cx);
+            });
+            (previous_panel, intended_panel)
+        });
+        let previous_activation_count = previous_panel.read_with(cx, |panel, _| {
+            assert!(!panel.active);
+            panel.activation_count
+        });
+
+        intended_panel.update(cx, |_, cx| cx.emit(PanelEvent::Activate));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            let dock = workspace.left_dock();
+            assert!(dock.read(cx).is_open());
+            assert_eq!(
+                dock.read(cx).visible_panel().map(|panel| panel.panel_id()),
+                Some(intended_panel.panel_id())
+            );
+            assert!(intended_panel.read(cx).active);
+            assert!(intended_panel.focus_handle(cx).is_focused(window));
+            assert!(!previous_panel.read(cx).active);
+            assert_eq!(
+                previous_panel.read(cx).activation_count,
+                previous_activation_count
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_moving_panel_does_not_reactivate_previous_panel(cx: &mut gpui::TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+
+        let (previous_panel, moving_panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let previous_panel = cx.new(|cx| TestPanel::new(DockPosition::Right, 100, cx));
+            let moving_panel = cx.new(|cx| TestPanel::new(DockPosition::Left, 101, cx));
+            workspace.add_panel(previous_panel.clone(), window, cx);
+            workspace.add_panel(moving_panel.clone(), window, cx);
+            workspace.right_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.set_open(true, window, cx);
+                dock.set_open(false, window, cx);
+            });
+            workspace.left_dock().update(cx, |dock, cx| {
+                dock.activate_panel(0, window, cx);
+                dock.set_open(true, window, cx);
+            });
+            (previous_panel, moving_panel)
+        });
+        let previous_activation_count = previous_panel.read_with(cx, |panel, _| {
+            assert!(!panel.active);
+            panel.activation_count
+        });
+
+        moving_panel.update_in(cx, |panel, window, cx| {
+            panel.set_position(DockPosition::Right, window, cx);
+        });
+
+        workspace.read_with(cx, |workspace, cx| {
+            let dock = workspace.right_dock();
+            assert!(dock.read(cx).is_open());
+            assert_eq!(
+                dock.read(cx).visible_panel().map(|panel| panel.panel_id()),
+                Some(moving_panel.panel_id())
+            );
+            assert!(moving_panel.read(cx).active);
+            assert!(!previous_panel.read(cx).active);
+            assert_eq!(
+                previous_panel.read(cx).activation_count,
+                previous_activation_count
+            );
+        });
+    }
+
+    #[gpui::test]
     async fn test_panels(cx: &mut gpui::TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
