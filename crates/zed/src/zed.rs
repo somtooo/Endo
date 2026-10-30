@@ -1524,6 +1524,8 @@ fn initialize_pane(
             toolbar.add_item(basedpyright_banner, window, cx);
             let image_view_toolbar = cx.new(|_| image_viewer::ImageViewToolbarControls::new());
             toolbar.add_item(image_view_toolbar, window, cx);
+            let pdf_view_toolbar = cx.new(|_| pdf_viewer::PdfViewToolbarControls::new());
+            toolbar.add_item(pdf_view_toolbar, window, cx);
         })
     });
 }
@@ -6266,6 +6268,7 @@ mod tests {
                 "outline",
                 "outline_panel",
                 "pane",
+                "pdf_viewer",
                 "picker",
                 "project_panel",
                 "project_search",
