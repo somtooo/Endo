@@ -689,8 +689,8 @@ impl Dock {
                             new_dock.set_panel_size_state(added_panel.as_ref(), size_state, cx);
                         }
                         if was_visible {
-                            new_dock.set_open(true, window, cx);
                             new_dock.activate_panel(index, window, cx);
+                            new_dock.set_open(true, window, cx);
                         }
                     });
 
