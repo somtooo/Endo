@@ -115,6 +115,7 @@ members = [
     "crates/http_proxy",
     "crates/icons",
     "crates/image_viewer",
+    "crates/pdf_viewer",
     "crates/input_latency_ui",
     "crates/inspector_ui",
     "crates/install_cli",
@@ -395,6 +396,7 @@ http_client_tls = { path = "crates/http_client_tls" }
 http_proxy = { path = "crates/http_proxy" }
 icons = { path = "crates/icons" }
 image_viewer = { path = "crates/image_viewer" }
+pdf_viewer = { path = "crates/pdf_viewer" }
 input_latency_ui = { path = "crates/input_latency_ui" }
 inspector_ui = { path = "crates/inspector_ui" }
 install_cli = { path = "crates/install_cli" }
@@ -1064,6 +1066,14 @@ windows-capture = { git = "https://github.com/zed-industries/windows-capture.git
 calloop = { git = "https://github.com/zed-industries/calloop", rev = "3759371fee14c40066d64777e2a36b6ffcc22590" }
 livekit = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "fbda05eb278b4a7c5be8fc9b2a92e9b62e732236" }
 libwebrtc = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "fbda05eb278b4a7c5be8fc9b2a92e9b62e732236" }
+# The viewer uses text extraction from this hayro fork.
+hayro = { git = "https://github.com/dsturnbull/hayro", rev = "58de31aebb3bc89de5184a392e164247800c2844" }
+hayro-interpret = { git = "https://github.com/dsturnbull/hayro", rev = "58de31aebb3bc89de5184a392e164247800c2844" }
+hayro-syntax = { git = "https://github.com/dsturnbull/hayro", rev = "58de31aebb3bc89de5184a392e164247800c2844" }
+hayro-font = { git = "https://github.com/dsturnbull/hayro", rev = "58de31aebb3bc89de5184a392e164247800c2844" }
+hayro-ccitt = { git = "https://github.com/dsturnbull/hayro", rev = "58de31aebb3bc89de5184a392e164247800c2844" }
+hayro-jbig2 = { git = "https://github.com/dsturnbull/hayro", rev = "58de31aebb3bc89de5184a392e164247800c2844" }
+hayro-jpeg2000 = { git = "https://github.com/dsturnbull/hayro", rev = "58de31aebb3bc89de5184a392e164247800c2844" }
 notify = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
 notify-types = { git = "https://github.com/zed-industries/notify", rev = "d842f16b2716bd60f09caf3ae3a894237ab38f54" }
 webrtc-sys = { git = "https://github.com/zed-industries/livekit-rust-sdks", rev = "fbda05eb278b4a7c5be8fc9b2a92e9b62e732236" }
