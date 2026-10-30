@@ -1737,6 +1737,20 @@
     },
   },
   {
+    "context": "PdfViewer",
+    "use_key_equivalents": true,
+    "bindings": {
+      "cmd-c": "pdf_viewer::CopyDocumentText",
+      "cmd-=": "pdf_viewer::ZoomIn",
+      "cmd-+": "pdf_viewer::ZoomIn",
+      "cmd--": "pdf_viewer::ZoomOut",
+      "cmd-0": "pdf_viewer::ResetZoom",
+      "cmd-1": "pdf_viewer::ZoomToActualSize",
+      "cmd-shift-0": "pdf_viewer::FitToView",
+      "cmd-g": "pdf_viewer::GoToPage",
+    },
+  },
+  {
     "context": "RunModal",
     "bindings": {
       "cmd-1": "new_process_modal::ActivateTaskTab",
