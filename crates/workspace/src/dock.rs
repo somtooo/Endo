@@ -681,8 +681,8 @@ impl Dock {
                             new_dock.set_panel_size_state(added_panel.as_ref(), size_state, cx);
                         }
                         if was_visible {
-                            new_dock.set_open(true, window, cx);
                             new_dock.activate_panel(index, window, cx);
+                            new_dock.set_open(true, window, cx);
                         }
                     });
 
@@ -1605,6 +1605,7 @@ pub mod test {
         /// Keeps track of the values provided to [`Self::set_active`], to allow
         /// inspecting whether the panel was activated or deactivated.
         pub activation_history: Vec<bool>,
+        pub activation_count: usize,
         pub focus_handle: FocusHandle,
         pub activation_focus_handle: Option<FocusHandle>,
         pub default_size: Pixels,
@@ -1622,6 +1623,7 @@ pub mod test {
                 zoomed: false,
                 active: false,
                 activation_history: Vec::new(),
+                activation_count: 0,
                 focus_handle: cx.focus_handle(),
                 activation_focus_handle: None,
                 default_size: px(300.),
@@ -1743,6 +1745,9 @@ pub mod test {
         fn set_active(&mut self, active: bool, _window: &mut Window, _cx: &mut Context<Self>) {
             self.active = active;
             self.activation_history.push(active);
+            if active {
+                self.activation_count += 1;
+            }
         }
 
         fn activation_priority(&self) -> u32 {
