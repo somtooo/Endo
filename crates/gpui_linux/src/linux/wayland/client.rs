@@ -26,6 +26,8 @@ use smallvec::SmallVec;
 use wayland_backend::client::ObjectId;
 use wayland_backend::protocol::WEnum;
 use wayland_client::event_created_child;
+#[cfg(feature = "wayland-first-seat")]
+use wayland_client::globals::Global;
 use wayland_client::globals::{GlobalList, GlobalListContents, registry_queue_init};
 use wayland_client::protocol::wl_callback::{self, WlCallback};
 use wayland_client::protocol::wl_data_device_manager::DndAction;
@@ -953,6 +955,15 @@ fn wl_seat_version(version: u32) -> anyhow::Result<u32> {
     Ok(version.clamp(WL_SEAT_MIN_VERSION, WL_SEAT_MAX_VERSION))
 }
 
+#[cfg(feature = "wayland-first-seat")]
+fn initial_wayland_seat(globals: &[Global]) -> anyhow::Result<(u32, u32)> {
+    let global = globals
+        .iter()
+        .find(|global| global.interface == "wl_seat")
+        .context("Wayland compositor does not provide wl_seat")?;
+    Ok((global.name, wl_seat_version(global.version)?))
+}
+
 fn wl_output_version(version: u32) -> anyhow::Result<u32> {
     const WL_OUTPUT_MIN_VERSION: u32 = 2;
     const WL_OUTPUT_MAX_VERSION: u32 = 4;
@@ -999,7 +1010,16 @@ impl WaylandConnection {
             .context("failed to initialize Wayland registry")?;
         let qh = event_queue.handle();
 
+        #[cfg(not(feature = "wayland-first-seat"))]
         let mut seat: Option<wl_seat::WlSeat> = None;
+        #[cfg(feature = "wayland-first-seat")]
+        let seat = globals.contents().with_list(|list| -> anyhow::Result<_> {
+            let (name, version) = initial_wayland_seat(list)?;
+            Ok(globals
+                .registry()
+                .bind::<wl_seat::WlSeat, _, _>(name, version, &qh, ()))
+        })?;
+
         #[allow(clippy::mutable_key_type)]
         let mut in_progress_outputs = HashMap::default();
         #[allow(clippy::mutable_key_type)]
@@ -1009,6 +1029,7 @@ impl WaylandConnection {
         globals.contents().with_list(|list| -> anyhow::Result<()> {
             for global in list {
                 match &global.interface[..] {
+                    #[cfg(not(feature = "wayland-first-seat"))]
                     "wl_seat" => {
                         seat = Some(globals.registry().bind::<wl_seat::WlSeat, _, _>(
                             global.name,
@@ -1039,6 +1060,7 @@ impl WaylandConnection {
 
         let (frame_ping, frame_ping_source) =
             calloop::ping::make_ping().context("failed to create Wayland frame ping")?;
+        #[cfg(not(feature = "wayland-first-seat"))]
         let seat = seat.context("Wayland compositor does not provide wl_seat")?;
         let foreground_executor = common.borrow().foreground_executor.clone();
         let background_executor = common.borrow().background_executor.clone();
@@ -1608,6 +1630,11 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                 interface,
                 version,
             } => match &interface[..] {
+                #[cfg(feature = "wayland-first-seat")]
+                // GPUI currently has one seat's input and clipboard state. Switching
+                // seats when another is advertised can disconnect the user's input.
+                "wl_seat" => {}
+                #[cfg(not(feature = "wayland-first-seat"))]
                 "wl_seat" => {
                     let Ok(version) = wl_seat_version(version) else {
                         log::error!("ignoring wl_seat below the required version");
@@ -3191,6 +3218,47 @@ mod tests {
         assert!(wl_output_version(1).is_err());
         assert_eq!(wl_seat_version(5).expect("minimum seat version"), 5);
         assert_eq!(wl_output_version(2).expect("minimum output version"), 2);
+    }
+
+    #[cfg(feature = "wayland-first-seat")]
+    #[test]
+    fn initial_seat_keeps_the_first_advertised_seat() {
+        let globals = [
+            Global {
+                name: 7,
+                interface: "wl_output".into(),
+                version: 4,
+            },
+            Global {
+                name: 10,
+                interface: "wl_seat".into(),
+                version: 11,
+            },
+            Global {
+                name: 11,
+                interface: "wl_seat".into(),
+                version: 4,
+            },
+            Global {
+                name: 12,
+                interface: "wl_seat".into(),
+                version: 9,
+            },
+        ];
+
+        assert_eq!(initial_wayland_seat(&globals).expect("valid seat"), (10, 9));
+    }
+
+    #[cfg(feature = "wayland-first-seat")]
+    #[test]
+    fn initial_seat_handles_missing_and_unsupported_seats() {
+        assert!(initial_wayland_seat(&[]).is_err());
+        let seat = Global {
+            name: 10,
+            interface: "wl_seat".into(),
+            version: 4,
+        };
+        assert!(initial_wayland_seat(&[seat]).is_err());
     }
 
     #[derive(Clone)]
