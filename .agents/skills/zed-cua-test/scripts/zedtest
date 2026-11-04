@@ -1,0 +1,1173 @@
+#!/usr/bin/env python3
+"""Start, drive and stop a private Zed for UI tests. See ../SKILL.md.
+
+`zedtest up` prepares everything it needs (private Cage, patched Cua plugin,
+virtual input devices, the worktree's Zed build), starts one isolated Zed and
+prints a short `zt` command for driving it. Every other command acts only on
+that run, so several agents can test at once, in one or many worktrees.
+"""
+
+import argparse
+import base64
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+
+# Keep __pycache__ out of the skill directory when run without -B.
+sys.dont_write_bytecode = True
+import headless  # noqa: E402
+
+SCRIPTS = Path(__file__).resolve().parent
+SKILL = SCRIPTS.parent
+PLUGIN_SOURCE = SKILL / "cua-hyprland-plugin"
+CACHE = Path(os.environ.get("ZEDTEST_CACHE") or Path.home() / ".cache/zed-cua-test/v1")
+RUNS = CACHE / "runs"
+
+# Cage 0.3.1 needs wlroots 0.20, which Omarchy doesn't install. These exact
+# Arch packages are unpacked into the cache; nothing is installed system-wide.
+ARCH_ARCHIVE = "https://archive.archlinux.org/packages"
+CAGE_PACKAGES = (
+    ("c/cage", "cage-0.3.1-1-x86_64.pkg.tar.zst",
+     "d8a8a33d864b8aa85b63990ffd1956be20d56df2f50acde1713fd820d60f61a0"),
+    ("w/wlroots0.20", "wlroots0.20-0.20.2-1-x86_64.pkg.tar.zst",
+     "8b1da3fbf29cc45908d8de771bd22a5813b298a9049462df5b8952f23c3ffb8f"),
+    ("l/libliftoff", "libliftoff-0.5.0-1-x86_64.pkg.tar.zst",
+     "59cf08c21500673a14287b83b89b6db5389134cc24c97d9222c7cddefa639ccf"),
+)
+PLUGIN_QUALIFIED_HYPRLAND = "0.56.2"
+CRASH_EXECUTABLES = {"Hyprland", "Xwayland", "cage", "zed", "cua-driver", "opencode", "opencode.exe", "virtual-devices"}
+DEFAULT_SETTINGS = {
+    "session": {"trust_all_worktrees": True},
+    "auto_update": False,
+    "telemetry": {"diagnostics": False, "metrics": False},
+}
+# Lines every fresh profile logs. `log -e` hides them; `log -e --all` shows them.
+HARMLESS_LOG_LINES = re.compile(
+    r"localhost:(8080|1234|11434)|cannot fetch Anthropic models without an API key|canonicalizing \"crates/grammars/src\""
+    r"|Failed to prevent idle sleep|debug build, only reporting hangs")
+# Expired on the user's machine, and it isn't to be used for tests.
+LOGINS_NOT_COPIED = {"github-copilot"}
+TYPE_CHUNK_CHARACTERS = 400
+NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9-]{0,19}$")
+
+
+class Failure(Exception):
+    pass
+
+
+def say(message):
+    print(message, flush=True)
+
+
+def tail(path, lines=30):
+    try:
+        return "\n".join(Path(path).read_text(errors="replace").splitlines()[-lines:])
+    except OSError:
+        return f"({path} is unreadable)"
+
+
+def file_sha256(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        for block in iter(lambda: source.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def tree_sha256(root, extra=()):
+    digest = hashlib.sha256()
+    for path in sorted(p for p in Path(root).rglob("*") if p.is_file()):
+        digest.update(str(path.relative_to(root)).encode() + b"\0" + path.read_bytes() + b"\0")
+    for value in extra:
+        digest.update(value.encode() + b"\0")
+    return digest.hexdigest()
+
+
+@contextlib.contextmanager
+def cache_lock():
+    CACHE.mkdir(parents=True, exist_ok=True)
+    with open(CACHE / ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        yield
+
+
+def command_output(command, **options):
+    result = subprocess.run(command, capture_output=True, text=True, stdin=subprocess.DEVNULL, **options)
+    if result.returncode:
+        raise Failure(f"{' '.join(map(str, command))} failed:\n{(result.stderr or result.stdout).strip()[-2000:]}")
+    return result.stdout
+
+
+def require_tools():
+    needed = {"cc": "gcc", "g++": "gcc", "cmake": "cmake", "pkg-config": "pkgconf", "curl": "curl",
+              "tar": "tar", "Hyprland": "hyprland", "hyprctl": "hyprland", "cargo": "rustup", "git": "git"}
+    missing = sorted({package for tool, package in needed.items() if not shutil.which(tool)})
+    if missing:
+        raise Failure(f"missing tools; install these packages: {' '.join(missing)}")
+
+
+def driver_path():
+    found = shutil.which("cua-driver") or str(Path.home() / ".local/bin/cua-driver")
+    if not os.access(found, os.X_OK):
+        raise Failure("cua-driver is not installed (expected on PATH or in ~/.local/bin)")
+    return str(Path(found).resolve())
+
+
+def render_node():
+    for node in sorted(Path("/dev/dri").glob("renderD*")):
+        if os.access(node, os.R_OK | os.W_OK):
+            return str(node)
+    raise Failure("no readable and writable /dev/dri/renderD* GPU render node")
+
+
+def hyprland_version():
+    return command_output(["pkg-config", "--modversion", "hyprland"]).strip()
+
+
+def ensure_cage():
+    root = CACHE / "cage"
+    shim = SCRIPTS / "cage-xdg-v6.c"
+    want = hashlib.sha256(("".join(sha for _, _, sha in CAGE_PACKAGES) + file_sha256(shim)).encode()).hexdigest()
+    paths = {"cage": root / "usr/bin/cage", "library_path": root / "usr/lib", "preload": root / "xdg-v6.so"}
+    stamp = root / "stamp"
+    if stamp.is_file() and stamp.read_text() == want and all(path.exists() for path in paths.values()):
+        return paths
+    say("setup: preparing private Cage (pinned Arch packages, about 2 MB)")
+    work = Path(tempfile.mkdtemp(prefix="cage-", dir=CACHE))
+    try:
+        unpacked = work / "root"
+        unpacked.mkdir()
+        for directory, filename, sha256 in CAGE_PACKAGES:
+            archive = work / filename
+            command_output(["curl", "-sfL", "--retry", "3", "-o", str(archive), f"{ARCH_ARCHIVE}/{directory}/{filename}"])
+            if file_sha256(archive) != sha256:
+                raise Failure(f"{filename} does not match its pinned checksum")
+            command_output(["tar", "-xf", str(archive), "-C", str(unpacked), "usr"])
+        command_output(["cc", "-shared", "-fPIC", "-O2", "-Wall", "-o", str(unpacked / "xdg-v6.so"), str(shim), "-ldl"])
+        linked = command_output(["ldd", str(unpacked / "usr/bin/cage")],
+                                env={**os.environ, "LD_LIBRARY_PATH": str(unpacked / "usr/lib")})
+        if "not found" in linked:
+            raise Failure(f"private Cage is missing libraries:\n{linked}")
+        shutil.rmtree(root, ignore_errors=True)
+        unpacked.rename(root)
+        stamp.write_text(want)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    return paths
+
+
+def ensure_virtual_devices():
+    source = SCRIPTS / "virtual-devices.c"
+    output = CACHE / "bin/virtual-devices"
+    stamp = CACHE / "bin/virtual-devices.stamp"
+    want = file_sha256(source)
+    if output.is_file() and stamp.is_file() and stamp.read_text() == want:
+        return output
+    say("setup: building the virtual input devices")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    flags = command_output(["pkg-config", "--cflags", "--libs", "wayland-client", "xkbcommon"]).split()
+    command_output(["cc", "-std=c11", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(output), *flags])
+    stamp.write_text(want)
+    return output
+
+
+def ensure_plugin(version):
+    """Build the vendored, patched Cua plugin for the installed Hyprland."""
+    compiler = command_output(["g++", "--version"]).splitlines()[0]
+    key = tree_sha256(PLUGIN_SOURCE, (version, compiler))[:16]
+    output = CACHE / "plugin" / f"cua-hyprland-plugin-{key}.so"
+    if output.is_file():
+        return output
+    say(f"setup: building the patched Cua plugin for Hyprland {version} (about a minute)")
+    build = Path(tempfile.mkdtemp(prefix="plugin-", dir=CACHE))
+    log = build / "build.log"
+    try:
+        with open(log, "w") as log_file:
+            for command in (
+                ["cmake", "-S", str(PLUGIN_SOURCE), "-B", str(build / "out"), "-DCMAKE_BUILD_TYPE=Release",
+                 "-DCMAKE_CXX_COMPILER=" + shutil.which("g++"), "-DCUA_HYPRLAND_BUILD_PLUGIN=ON",
+                 f"-DCUA_HYPRLAND_EXPECTED_VERSION={version}", "-DCUA_HYPRLAND_INPUT=ON",
+                 "-DCUA_HYPRLAND_TEST_INPUT=OFF", "-DCUA_HYPRLAND_INPUT_TRACE=OFF", "-DBUILD_TESTING=OFF"],
+                ["cmake", "--build", str(build / "out"), "-j", str(os.cpu_count() or 4)],
+            ):
+                if subprocess.run(command, stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL).returncode:
+                    hint = ("" if version == PLUGIN_QUALIFIED_HYPRLAND else
+                            f" The vendored plugin was qualified for Hyprland {PLUGIN_QUALIFIED_HYPRLAND}; "
+                            "update it as described in cua-hyprland-plugin/README.md.")
+                    raise Failure(f"the Cua plugin failed to build.{hint}\n{tail(log, 25)}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        for old in output.parent.glob("*.so"):
+            old.unlink()
+        shutil.copy2(build / "out/cua-hyprland-plugin.so", output)
+    finally:
+        shutil.rmtree(build, ignore_errors=True)
+    return output
+
+
+def prepare_host():
+    require_tools()
+    with cache_lock():
+        version = hyprland_version()
+        tools = {
+            "cage": ensure_cage(),
+            "virtual_devices": ensure_virtual_devices(),
+            "plugin": ensure_plugin(version),
+        }
+    tools.update(driver=driver_path(), render_node=render_node(),
+                 hyprland=shutil.which("Hyprland"), hyprctl=shutil.which("hyprctl"))
+    return tools
+
+
+def find_worktree(path):
+    start = Path(path or os.getcwd()).resolve()
+    top = Path(command_output(["git", "-C", str(start), "rev-parse", "--show-toplevel"]).strip())
+    cargo_toml = top / "crates/zed/Cargo.toml"
+    if not cargo_toml.is_file():
+        raise Failure(f"{top} is not a Zed worktree")
+    if "wayland-first-seat" not in cargo_toml.read_text():
+        raise Failure(f"{top} lacks the wayland-first-seat feature from the \"Fix Wayland input\" commit; "
+                      "rebase this worktree onto develop")
+    return top
+
+
+def zed_binary(worktree):
+    metadata = json.loads(command_output(["cargo", "metadata", "--no-deps", "--format-version", "1"], cwd=worktree))
+    return Path(metadata["target_directory"]) / "debug/zed"
+
+
+def build_zed(worktree, log):
+    say(f"build: cargo build in {worktree} (log: {log}); seconds if up to date, many minutes if cold")
+    with open(log, "w") as log_file:
+        result = subprocess.run(["cargo", "build", "--locked", "-p", "zed", "--bin", "zed",
+                                 "--features", "wayland-first-seat"],
+                                cwd=worktree, stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    if result.returncode:
+        raise Failure(f"cargo build failed; Zed was not started. Last lines of {log}:\n{tail(log, 40)}")
+
+
+def free_port():
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+def process_start_time(pid):
+    try:
+        text = Path(f"/proc/{pid}/stat").read_text()
+        return int(text[text.rfind(")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def process_environment(pid):
+    try:
+        return Path(f"/proc/{pid}/environ").read_bytes().split(b"\0")
+    except OSError:
+        return []
+
+
+def process_name(pid):
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except OSError:
+        return "?"
+
+
+def alive(pid, start_time):
+    return pid is not None and start_time is not None and process_start_time(pid) == start_time
+
+
+def wait_gone(pid, start_time, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if not alive(pid, start_time):
+            return True
+        time.sleep(0.2)
+    return not alive(pid, start_time)
+
+
+def opencode_environment(home):
+    return {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"), "LANG": "C.UTF-8", "HOME": str(home),
+        "XDG_CONFIG_HOME": f"{home}/.config", "XDG_DATA_HOME": f"{home}/.local/share",
+        "XDG_STATE_HOME": f"{home}/.local/state", "XDG_CACHE_HOME": f"{home}/.cache",
+    }
+
+
+def copy_real_logins(binary, environment):
+    """Copy the user's OpenCode logins into a private service, without touching disk here."""
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    try:
+        registered = json.loads((state / "opencode/service.json").read_text())
+    except (OSError, ValueError):
+        registered = {}
+    # `auth export` would otherwise start the user's service as a side effect.
+    if process_start_time(registered.get("pid")) is None:
+        raise Failure("the user's OpenCode service isn't running, so its logins can't be copied. "
+                      "Start it, or pass --no-logins (only OpenCode's free models will work).")
+    exported = subprocess.run([binary, "auth", "export"], capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                              timeout=60)
+    if exported.returncode:
+        raise Failure("`opencode auth export` failed; pass --no-logins to skip copying logins")
+    logins = [login for login in json.loads(exported.stdout) if login.get("integrationID") not in LOGINS_NOT_COPIED]
+    imported = subprocess.run([binary, "auth", "import"], input=json.dumps(logins), capture_output=True, text=True,
+                              env=environment, timeout=60)
+    if imported.returncode:
+        raise Failure("`opencode auth import` failed on the private service; pass --no-logins to skip copying logins")
+    return sorted(login["integrationID"] for login in logins)
+
+
+def start_private_opencode(run_dir, copy_logins):
+    binary = shutil.which("opencode")
+    if not binary:
+        raise Failure("--opencode private needs the opencode CLI on PATH")
+    binary = str(Path(binary).resolve())
+    home = run_dir / "opencode-home"
+    for directory in (".config", ".local/share", ".local/state", ".cache"):
+        (home / directory).mkdir(parents=True, exist_ok=True)
+    environment = opencode_environment(home)
+    if copy_logins:
+        # Claude Agent has no stored key: it reuses Claude Code's own login folder.
+        environment["CLAUDE_CONFIG_DIR"] = os.environ.get("CLAUDE_CONFIG_DIR") or str(Path.home() / ".claude")
+    port = free_port()
+    # A separate port keeps it from colliding with the user's own service.
+    command_output([binary, "service", "set", "port", str(port)], env=environment)
+    log = open(run_dir / "opencode.log", "w")
+    process = subprocess.Popen([binary, "serve", "--service"], env=environment, cwd=run_dir,
+                               stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    registration = home / ".local/state/opencode/service.json"
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise Failure(f"the private OpenCode service exited:\n{tail(run_dir / 'opencode.log', 15)}")
+        try:
+            service = json.loads(registration.read_text())
+            if service.get("url", "").endswith(f":{port}"):
+                started = {"home": str(home), "url": service["url"], "pid": process.pid, "binary": binary,
+                           "start_time": process_start_time(process.pid),
+                           "state_home": str(home / ".local/state")}
+                if copy_logins:
+                    started["logins"] = copy_real_logins(binary, environment)
+                return started
+        except (OSError, ValueError):
+            pass
+        time.sleep(0.3)
+    raise Failure(f"the private OpenCode service did not register:\n{tail(run_dir / 'opencode.log', 15)}")
+
+
+def real_opencode_state(run_dir):
+    state = Path(os.environ.get("XDG_STATE_HOME") or Path.home() / ".local/state")
+    registration = state / "opencode/service.json"
+    if not registration.is_file():
+        raise Failure(f"--opencode real: the user's service isn't running ({registration} is missing)")
+    private_state = run_dir / "opencode-real-state"
+    (private_state / "opencode").mkdir(parents=True)
+    (private_state / "opencode/service.json").symlink_to(registration)
+    return {"state_home": str(private_state), "url": json.loads(registration.read_text()).get("url"), "real": True}
+
+
+def stop_private_opencode(service):
+    home = service.get("home")
+    if not home:
+        return []
+    problems = []
+    pids = {service.get("pid"): service.get("start_time")}
+    try:
+        registered = json.loads((Path(home) / ".local/state/opencode/service.json").read_text())
+        pids.setdefault(registered.get("pid"), process_start_time(registered.get("pid")))
+    except (OSError, ValueError):
+        pass
+    binary = service.get("binary") or shutil.which("opencode")
+    with contextlib.suppress(OSError, subprocess.SubprocessError, TypeError):
+        subprocess.run([binary, "service", "stop"], env=opencode_environment(home), capture_output=True,
+                       stdin=subprocess.DEVNULL, timeout=30)
+    marker = f"HOME={home}".encode()
+    for pid, start_time in pids.items():
+        if alive(pid, start_time) and marker in process_environment(pid):
+            os.kill(pid, signal.SIGTERM)
+            if not wait_gone(pid, start_time, 10):
+                os.kill(pid, signal.SIGKILL)
+                problems.append(f"private OpenCode service {pid} needed SIGKILL")
+    # The service's short-lived helpers (such as Claude Agent's context discovery)
+    # can outlive it. They carry its HOME, so they are safe to stop here.
+    helpers = [int(entry.name) for entry in Path("/proc").iterdir()
+               if entry.name.isdecimal() and marker in process_environment(int(entry.name))]
+    for pid in helpers:
+        start_time = process_start_time(pid)
+        with contextlib.suppress(ProcessLookupError):
+            os.kill(pid, signal.SIGTERM)
+        wait_gone(pid, start_time, 5)
+    if service.get("logins"):
+        # The copied credentials shouldn't outlive the run. Its database holds them.
+        data = Path(home) / ".local/share/opencode"
+        for path in [*data.glob("opencode.db*"), data / "auth.json"]:
+            with contextlib.suppress(FileNotFoundError):
+                path.unlink()
+    return problems
+
+
+def sample_project(directory):
+    (directory / "src").mkdir(parents=True)
+    (directory / "README.md").write_text("# Sample project\n\nA disposable project for Zed UI tests.\n")
+    (directory / "notes.txt").write_text("first line\nsecond line\nthird line\n")
+    (directory / "src/main.py").write_text(
+        "def add(a, b):\n    return a + b\n\n\n"
+        "def greet(name):\n    return \"hello \" + name\n\n\n"
+        "if __name__ == \"__main__\":\n    print(greet(\"zed\"), add(2, 3))\n")
+    git = ["git", "-C", str(directory), "-c", "user.name=zedtest", "-c", "user.email=zedtest@example.invalid"]
+    command_output(git + ["init", "-q"])
+    command_output(git + ["add", "-A"])
+    command_output(git + ["commit", "-qm", "Initial commit"])
+
+
+def merged(base, override):
+    result = dict(base)
+    for key, value in override.items():
+        result[key] = merged(result[key], value) if isinstance(value, dict) and isinstance(result.get(key), dict) else value
+    return result
+
+
+def write_zed_wrapper(run_dir, binary, settings, environment):
+    (run_dir / "settings.json").write_text(json.dumps(settings, indent=2))
+    lines = [
+        "#!/bin/sh",
+        "# headless.py runs this as: zed-wrapper --user-data-dir DIR PROJECT",
+        'mkdir -p "$2/config" && cp ' + sh_quote(run_dir / "settings.json") + ' "$2/config/settings.json"',
+    ]
+    lines += [f"export {key}={sh_quote(value)}" for key, value in environment.items()]
+    lines.append(f'exec {sh_quote(binary)} "$@"')
+    wrapper = run_dir / "zed-wrapper"
+    wrapper.write_text("\n".join(lines) + "\n")
+    wrapper.chmod(0o700)
+    return wrapper
+
+
+def sh_quote(value):
+    return "'" + str(value).replace("'", "'\\''") + "'"
+
+
+def zt_path(name):
+    return Path(f"/tmp/zt-{name}")
+
+
+def write_zt(name):
+    path = zt_path(name)
+    text = (f"#!/bin/sh\n# zedtest run {name}\n"
+            f"exec python3 -B {sh_quote(SCRIPTS / 'zedtest')} --run {name} \"$@\"\n")
+    if path.is_symlink() or (path.exists() and (path.stat().st_uid != os.getuid()
+                                                 or "# zedtest run" not in path.read_text(errors="replace"))):
+        raise Failure(f"{path} exists and isn't a zedtest helper; choose another --name")
+    temporary = path.with_name(path.name + f".{os.getpid()}")
+    temporary.write_text(text)
+    temporary.chmod(0o700)
+    temporary.rename(path)
+    return path
+
+
+def load_meta(name):
+    if not name:
+        raise Failure("no run given; use the zt command printed by `zedtest up`, or pass --run NAME")
+    path = RUNS / name / "meta.json"
+    try:
+        return json.loads(path.read_text())
+    except OSError:
+        raise Failure(f"no run named {name!r}; see `zedtest list`") from None
+
+
+def save_meta(meta):
+    path = Path(meta["run_dir"]) / "meta.json"
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(json.dumps(meta, indent=2))
+    temporary.rename(path)
+
+
+def supervisor_alive(meta):
+    return alive(meta.get("supervisor_pid"), meta.get("supervisor_start_time"))
+
+
+def up(args):
+    name = args.name or secrets.token_hex(2)
+    if not NAME_PATTERN.match(name):
+        raise Failure("--name must be 1-20 lowercase letters, digits or dashes")
+    run_dir = RUNS / name
+    if run_dir.exists():
+        raise Failure(f"run {name!r} already exists; pick another --name, or `zedtest --run {name} down --purge`")
+    worktree = find_worktree(args.worktree)
+    tools = prepare_host()
+    RUNS.mkdir(parents=True, exist_ok=True)
+    run_dir.mkdir(mode=0o700)
+    meta = {"name": name, "run_dir": str(run_dir), "worktree": str(worktree), "started": time.time(),
+            "state": "starting", "shots": 0}
+    save_meta(meta)
+    try:
+        if not args.no_build:
+            build_zed(worktree, run_dir / "build.log")
+        binary = zed_binary(worktree)
+        if not binary.is_file():
+            raise Failure(f"{binary} doesn't exist; run without --no-build")
+        # Debug builds read assets from their checkout, so the binary runs in
+        # place. A later rebuild replaces the file without affecting this Zed.
+        meta["binary"] = str(binary)
+        meta["binary_built"] = time.strftime("%Y-%m-%d %H:%M", time.localtime(binary.stat().st_mtime))
+
+        if args.project:
+            project = Path(args.project).resolve(strict=True)
+        else:
+            # Outside HOME: OpenCode walks up from the project and would load
+            # the skills in the user's ~/.claude and ~/.agents.
+            project = Path(tempfile.mkdtemp(prefix=f"zt-project-{name}-", dir="/tmp")) / "project"
+            meta["sample_project"] = str(project)
+            sample_project(project)
+        meta["project"] = str(project)
+
+        settings = dict(DEFAULT_SETTINGS)
+        if args.ask_trust:
+            settings["session"] = {"trust_all_worktrees": False}
+        if args.settings:
+            settings = merged(settings, json.loads(Path(args.settings).read_text()))
+        environment = {"RUST_LOG": args.rust_log}
+        if args.opencode == "private":
+            meta["opencode"] = start_private_opencode(run_dir, not args.no_logins)
+            save_meta(meta)
+        elif args.opencode == "real":
+            meta["opencode"] = real_opencode_state(run_dir)
+        if "opencode" in meta:
+            environment["XDG_STATE_HOME"] = meta["opencode"]["state_home"]
+        wrapper = write_zed_wrapper(run_dir, binary, settings, environment)
+
+        cage = tools["cage"]
+        command = [sys.executable, "-B", str(SCRIPTS / "headless.py"), "run", "--acknowledge-isolated-test", "--keep",
+                   "--timeout", str(args.timeout), "--zed", str(wrapper), "--project", str(project),
+                   "--cage", str(cage["cage"]), "--cage-library-path", str(cage["library_path"]),
+                   "--cage-preload", str(cage["preload"]), "--hyprland", tools["hyprland"],
+                   "--hyprctl", tools["hyprctl"], "--driver", tools["driver"],
+                   "--virtual-devices", str(tools["virtual_devices"]), "--render-node", tools["render_node"],
+                   "--plugin", str(tools["plugin"])]
+        with open(run_dir / "supervisor.out", "w") as out, open(run_dir / "supervisor.err", "w") as err:
+            supervisor = subprocess.Popen(command, cwd=run_dir, stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+                                          start_new_session=True)
+        meta.update(supervisor_pid=supervisor.pid, supervisor_start_time=process_start_time(supervisor.pid))
+        save_meta(meta)
+        started = wait_for_supervisor(supervisor, run_dir, args.timeout * 4)
+        meta.update(runtime=started["runtime"], zed_pid=started["zed_pid"], window_id=started["window_id"],
+                    state="running")
+        save_meta(meta)
+    except BaseException:
+        meta["state"] = "failed"
+        save_meta(meta)
+        for problem in shutdown(meta, quiet=True):
+            say(f"cleanup after the failed start: {problem}")
+        raise
+
+    zt = write_zt(name)
+    say(f"run {name} is up. Use {zt} for every command (help: {zt} -h).")
+    say(f"zed: {meta['binary']} (built {meta['binary_built']}), project: {meta['project']}")
+    if "opencode" in meta:
+        service = meta["opencode"]
+        kind = "the USER'S REAL service" if service.get("real") else "a private service with an empty history"
+        logins = f", logins: {', '.join(service['logins'])}" if service.get("logins") else ""
+        say(f"opencode: {kind} at {service['url']}{logins}")
+    say(f"zed settings file: {meta['runtime']}/profile/config/settings.json")
+    time.sleep(1)
+    take_shot(meta, None, "start")
+    return 0
+
+
+def wait_for_supervisor(process, run_dir, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        line = (run_dir / "supervisor.out").read_text().strip()
+        if line:
+            return json.loads(line.splitlines()[0])
+        if process.poll() is not None:
+            raise Failure("Zed's private session failed to start: " + startup_error(run_dir))
+        time.sleep(0.3)
+    raise Failure("Zed's private session didn't start in time; see " + str(run_dir / "supervisor.err"))
+
+
+def startup_error(run_dir):
+    """The supervisor's own error lines, plus Zed's panic if Zed died."""
+    lines = (run_dir / "supervisor.err").read_text(errors="replace").splitlines()
+    errors = [line for line in lines if re.match(r"^\w*(Error|Exception)\b", line)]
+    message = "\n".join(errors[:2]) or "\n".join(lines[-10:])
+    match = re.search(r"see (/tmp/z-\w+/zed\.log)", message)
+    if match:
+        zed_lines = Path(match.group(1)).read_text(errors="replace").splitlines()
+        panic = next((index for index, line in enumerate(zed_lines) if "panicked at" in line), None)
+        shown = zed_lines[panic:panic + 2] if panic is not None else zed_lines[-10:]
+        message += "\n" + "\n".join(shown)
+    return message + f"\n(full log: {run_dir / 'supervisor.err'})"
+
+
+def request(meta, payload):
+    runtime = meta.get("runtime")
+    if meta.get("state") != "running" or not runtime or not supervisor_alive(meta):
+        raise Failure(f"run {meta['name']} isn't running. Its last supervisor output:\n"
+                      f"{tail(Path(meta['run_dir']) / 'supervisor.err', 8)}\nRun `down` to collect the report.")
+    path = Path(runtime) / "control.sock"
+    headless.validate_private_socket(Path(runtime), path, name="control.sock")
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.settimeout(90)
+        connection.connect(str(path))
+        connection.sendall(json.dumps(payload).encode() + b"\n")
+        return json.loads(connection.makefile("rb").readline())
+
+
+def png_size(path):
+    with open(path, "rb") as image:
+        header = image.read(24)
+    return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
+
+
+def next_shot_name(meta, label):
+    with open(Path(meta["run_dir"]) / "meta.json", "r+") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        current = json.loads(handle.read())
+        current["shots"] = current.get("shots", 0) + 1
+        handle.seek(0)
+        handle.truncate()
+        handle.write(json.dumps(current, indent=2))
+        number = current["shots"]
+    label = re.sub(r"[^A-Za-z0-9_-]+", "-", label or "").strip("-")[:40]
+    return f"{number:03d}{'-' + label if label else ''}.png"
+
+
+def with_window(payload, window):
+    if window is not None:
+        payload["window_id"] = window
+    return payload
+
+
+def take_shot(meta, window, label=None):
+    name = next_shot_name(meta, label)
+    response = request(meta, with_window({"tool": "get_window_state", "arguments": {"include_screenshot": True},
+                                          "screenshot": name}, window))
+    if not response.get("ok"):
+        raise Failure(f"screenshot failed: {response.get('error') or response.get('stderr', '')[-500:]}")
+    width, height = png_size(response["screenshot"])
+    say(f"shot {response['screenshot']} ({width}x{height}{', window ' + str(window) if window else ''})")
+    return response["screenshot"]
+
+
+def send_steps(meta, window, steps):
+    """Run steps and return a failure message, or None."""
+    response = request(meta, with_window({"tool": "run_steps", "arguments": {
+        "delivery_mode": "foreground", "steps": steps, "observe": {"include_screenshot": True}}}, window))
+    failure = response.get("error")
+    if not failure:
+        try:
+            result = json.loads(response.get("stdout") or "{}")
+        except ValueError:
+            result = {}
+        if not response.get("ok") or result.get("failed_step") is not None:
+            details = [json.dumps(step)[:300] for step in result.get("steps", []) if step.get("error") or step.get("code")]
+            failure = "; ".join(details) or (response.get("stderr") or response.get("stdout") or "unknown")[-500:]
+    return failure
+
+
+def act(meta, args, steps, report_success=True):
+    failure = send_steps(meta, args.window, steps)
+    # Cua refuses before sending anything while Zed's input isn't ready yet.
+    for _ in range(3):
+        if not failure or "foreground_unavailable" not in failure:
+            break
+        time.sleep(1.5)
+        failure = send_steps(meta, args.window, steps)
+    if failure and "foreground_keyboard_resources" in failure:
+        failure += ("\nIf every key action fails like this, the binary was probably built without the "
+                    "wayland-first-seat feature (a plain `cargo run` does that). Run `down`, then `up` "
+                    "without --no-build.")
+    if failure:
+        say(f"action failed: {failure}")
+    elif report_success:
+        say(f"ok: {len(steps)} action(s)")
+    if not args.no_shot:
+        time.sleep(args.wait)
+        take_shot(meta, args.window, args.label)
+        note_other_windows(meta, args.window)
+    return 1 if failure else 0
+
+
+def note_other_windows(meta, current):
+    """Point out windows such as Settings, which the screenshot above doesn't show."""
+    response = request(meta, {"tool": "list_windows"})
+    if not response.get("ok"):
+        return
+    target = current or response["main_window_id"]
+    others = [window for window in response["windows"] if window["window_id"] != target]
+    if others:
+        listed = ", ".join(f"{window['window_id']} {window.get('title')!r}" for window in others)
+        say(f"other windows open (use -w ID): {listed}")
+
+
+def text_chunks(text):
+    """Split text so that typing each piece stays well inside the driver's 45-second limit."""
+    return [text[start:start + TYPE_CHUNK_CHARACTERS] for start in range(0, len(text), TYPE_CHUNK_CHARACTERS)] or [text]
+
+
+def key_step(key):
+    parts = [part for part in key.split("+") if part]
+    if len(parts) > 1:
+        return {"tool": "hotkey", "args": {"keys": parts}}
+    if len(parts) == 1:
+        return {"tool": "press_key", "args": {"key": parts[0]}}
+    raise Failure(f"invalid key {key!r}")
+
+
+def palette(meta, args):
+    quiet = argparse.Namespace(**{**vars(args), "no_shot": True})
+    for steps, pause in (([key_step("ctrl+shift+p")], 0.8), ([{"tool": "type_text", "args": {"text": args.action}}], 0.8),
+                         ([key_step("return")], 0))[:2 if args.search else 3]:
+        if act(meta, quiet, steps, report_success=False):
+            return 1
+        time.sleep(pause)
+    if args.search:
+        say(f"typed {args.action!r} and left the palette open: read the matches in the screenshot, then "
+            "`key return` to run the top one or `key escape` to close it")
+        take_shot(meta, args.window, args.label)
+        return 0
+    say(f"sent: palette, typed {args.action!r}, return. A name that matches nothing does nothing; check the screenshot.")
+    if not args.no_shot:
+        time.sleep(max(args.wait, 1.5))
+        take_shot(meta, args.window, args.label)
+        note_other_windows(meta, args.window)
+    return 0
+
+
+def windows(meta):
+    response = request(meta, {"tool": "list_windows"})
+    if not response.get("ok"):
+        raise Failure(response.get("error") or "listing windows failed")
+    for window in response["windows"]:
+        bounds = window.get("bounds") or {}
+        main = " (main)" if window["window_id"] == response["main_window_id"] else ""
+        say(f"{window['window_id']}{main} {window.get('title')!r} {bounds.get('width')}x{bounds.get('height')}")
+    return 0
+
+
+def collapse_repeats(lines):
+    """Keep the last copy of lines that differ only by timestamp, with a count."""
+    counts = {}
+    latest = {}
+    for line in lines:
+        key = re.sub(r"^\S+T\S+\s+|^timestamp=\S+\s+", "", line)
+        counts[key] = counts.get(key, 0) + 1
+        latest.pop(key, None)
+        latest[key] = line
+    return [line + (f"  (x{counts[key]})" if counts[key] > 1 else "") for key, line in latest.items()]
+
+
+def show_log(meta, args):
+    runtime = Path(meta.get("runtime") or "/nonexistent")
+    opencode_home = (meta.get("opencode") or {}).get("home")
+    sources = {"zed": runtime / "profile/logs/Zed.log", "stdout": runtime / "zed.log",
+               "supervisor": Path(meta["run_dir"]) / "supervisor.err",
+               "opencode": Path(opencode_home or meta["run_dir"]) / ".local/share/opencode/log/opencode.log",
+               "build": Path(meta["run_dir"]) / "build.log"}
+    path = sources[args.source]
+    try:
+        lines = path.read_text(errors="replace").splitlines()
+    except OSError:
+        raise Failure(f"{path} doesn't exist") from None
+    pattern = args.grep or (r"ERROR|WARN|panic" if args.errors else None)
+    if pattern:
+        expression = re.compile(pattern, re.IGNORECASE)
+        lines = [line for line in lines if expression.search(line)]
+    hidden = 0
+    if args.errors and not args.all:
+        kept = [line for line in lines if not HARMLESS_LOG_LINES.search(line)]
+        hidden = len(lines) - len(kept)
+        lines = kept
+    if pattern:
+        lines = collapse_repeats(lines)
+    note = f", {hidden} known-harmless hidden (--all shows them)" if hidden else ""
+    say(f"== {path} ({len(lines)} lines{note}, showing the last {min(len(lines), args.lines)})")
+    for line in lines[-args.lines:]:
+        say(line[:400])
+    return 0
+
+
+def api(meta, args):
+    service = meta.get("opencode") or {}
+    if not service.get("home"):
+        raise Failure("`api` only talks to a private OpenCode service (start the run with --opencode private)")
+    registration = json.loads((Path(service["home"]) / ".local/state/opencode/service.json").read_text())
+    body = args.data.encode() if args.data else None
+    call = urllib.request.Request(registration["url"] + args.path, data=body, method=args.method)
+    token = base64.b64encode(f"opencode:{registration['password']}".encode()).decode()
+    call.add_header("Authorization", f"Basic {token}")
+    if body:
+        call.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(call, timeout=30) as response:
+            text = response.read().decode(errors="replace")
+    except urllib.error.HTTPError as error:
+        text = f"HTTP {error.code}: {error.read().decode(errors='replace')}"
+    if args.full or len(text) <= 6000:
+        say(text)
+    else:
+        say(text[:6000] + f"\n... (cut at 6000 of {len(text)} characters; --full prints everything)")
+    return 0
+
+
+def leftover_processes(meta):
+    markers = [f"XDG_RUNTIME_DIR={meta['runtime']}".encode()] if meta.get("runtime") else []
+    if (meta.get("opencode") or {}).get("home"):
+        markers.append(f"HOME={meta['opencode']['home']}".encode())
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal() or int(entry.name) == os.getpid():
+            continue
+        environment = process_environment(int(entry.name))
+        if any(marker in environment for marker in markers):
+            found.append(int(entry.name))
+    return found
+
+
+def crash_records(meta):
+    try:
+        output = subprocess.run(["coredumpctl", "list", f"--since=@{int(meta['started'])}", "--no-pager",
+                                 "--json=short"], capture_output=True, text=True, timeout=30).stdout
+        records = json.loads(output) if output.strip() else []
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ["could not read crash records (coredumpctl)"]
+    ours = {meta.get("zed_pid"), meta.get("supervisor_pid")}
+    lines = []
+    for record in records:
+        executable = Path(str(record.get("exe", ""))).name
+        if executable in CRASH_EXECUTABLES:
+            owner = "this run" if record.get("pid") in ours else "maybe another run"
+            lines.append(f"{executable} pid {record.get('pid')} signal {record.get('sig')} ({owner})")
+    return lines
+
+
+def shutdown(meta, quiet=False):
+    problems = []
+    if supervisor_alive(meta):
+        os.kill(meta["supervisor_pid"], signal.SIGTERM)
+        if not wait_gone(meta["supervisor_pid"], meta["supervisor_start_time"], 60):
+            problems.append(f"supervisor {meta['supervisor_pid']} is still running after 60 seconds")
+    errors = Path(meta["run_dir"]) / "supervisor.err"
+    if errors.exists():
+        problems += [line for line in errors.read_text(errors="replace").splitlines()
+                     if re.match(r"^\w*(Error|Exception)\b", line)]
+    if meta.get("runtime"):
+        try:
+            status = json.loads((Path(meta["runtime"]) / "hypr-exit.json").read_text())
+            if status.get("returncode") not in (0, -signal.SIGTERM, -signal.SIGINT):
+                problems.append(f"Hyprland exited with {status.get('returncode')}")
+        except (OSError, ValueError):
+            problems.append("Hyprland's exit status is missing")
+    problems += stop_private_opencode(meta.get("opencode") or {})
+    leftovers = leftover_processes(meta)
+    if leftovers:
+        problems.append("leftover processes stopped: " + ", ".join(f"{pid} {process_name(pid)}" for pid in leftovers))
+        for pid in leftovers:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGTERM)
+    crashes = crash_records(meta)
+    problems += [f"crash: {line}" for line in crashes]
+    meta["state"] = "stopped" if meta.get("state") == "running" else meta.get("state", "stopped")
+    save_meta(meta)
+    if not quiet:
+        if problems:
+            say("down: PROBLEMS (report these):")
+            for problem in problems:
+                say(f"  - {problem}")
+        else:
+            say("down: clean (Zed, Hyprland and Cua exited normally, nothing left running, no new crash records)")
+        if meta.get("runtime"):
+            say(f"kept screenshots: {meta['runtime']}/artifacts, Zed log: {meta['runtime']}/profile/logs/Zed.log")
+            if report_path(meta).exists():
+                say(f"report: {report_path(meta)}")
+    return problems
+
+
+def report_path(meta):
+    return Path(meta["runtime"]) / "REPORT.md"
+
+
+def find_shot(meta, reference):
+    artifacts = Path(meta["runtime"]) / "artifacts"
+    name = Path(reference).name
+    matches = sorted(artifacts.glob(name if name.endswith(".png") else f"{name}*.png"))
+    if not matches:
+        raise Failure(f"no screenshot {reference!r} in {artifacts}")
+    return matches[0]
+
+
+def evidence(meta, args):
+    """Add a finding with its screenshots to the run's REPORT.md."""
+    if not meta.get("runtime"):
+        raise Failure("this run never started, so it has no screenshots")
+    shots = [find_shot(meta, reference) for reference in args.shots]
+    report = report_path(meta)
+    if not report.exists():
+        report.write_text(
+            f"# Test report for run {meta['name']}\n\n"
+            f"- Worktree: `{meta.get('worktree')}`\n- Zed built: {meta.get('binary_built')}\n"
+            f"- Project: `{meta.get('project')}`\n- Every command, to replay the run: [commands.log](commands.log)\n"
+            f"- Zed log: [profile/logs/Zed.log](profile/logs/Zed.log)\n")
+    number = report.read_text().count("\n## ") + 1
+    lines = [f"\n## {number}. {args.title}\n", f"- **Level:** {args.level}"]
+    for label, value in (("Steps", args.steps), ("Expected", args.expected), ("Actual", args.actual),
+                         ("Where to look", args.where), ("Unit test", args.test), ("Notes", args.notes)):
+        if value:
+            lines.append(f"- **{label}:** {value}")
+    lines.append("")
+    lines += [f"![{shot.name}](artifacts/{shot.name})" for shot in shots]
+    with open(report, "a") as output:
+        output.write("\n".join(lines) + "\n")
+    say(f"added finding {number} to {report}")
+    return 0
+
+
+def reports():
+    """Write one index of every run's REPORT.md."""
+    index = Path("/tmp/zedtest-reports.md")
+    entries = []
+    for directory in sorted(RUNS.iterdir()) if RUNS.is_dir() else []:
+        try:
+            meta = json.loads((directory / "meta.json").read_text())
+            text = report_path(meta).read_text()
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        titles = [line[3:] for line in text.splitlines() if line.startswith("## ")]
+        entries.append(f"## [{meta['name']}]({report_path(meta)}) ({meta.get('worktree')})\n"
+                       + "".join(f"- {title}\n" for title in titles))
+    index.write_text("# Zed test reports\n\n" + ("\n".join(entries) or "No findings yet.\n"))
+    say(f"{index}: {len(entries)} report(s)")
+    return 0
+
+
+def record_command(meta, argv):
+    """Keep every driving command so a person can replay the run."""
+    if meta.get("runtime") and Path(meta["runtime"]).is_dir():
+        with open(Path(meta["runtime"]) / "commands.log", "a") as log:
+            log.write(f"{time.strftime('%H:%M:%S')}  /tmp/zt-{meta['name']} {shlex.join(argv)}\n")
+
+
+def down(meta, args):
+    problems = shutdown(meta)
+    if args.purge:
+        sample = meta.get("sample_project")
+        for path in (meta.get("runtime"), str(Path(sample).parent) if sample else None, meta["run_dir"]):
+            if path:
+                shutil.rmtree(path, ignore_errors=True)
+        with contextlib.suppress(FileNotFoundError):
+            zt_path(meta["name"]).unlink()
+        say("purged the run's files")
+    return 1 if problems else 0
+
+
+def list_runs():
+    if not RUNS.is_dir():
+        say("no runs")
+        return 0
+    for directory in sorted(RUNS.iterdir()):
+        try:
+            meta = json.loads((directory / "meta.json").read_text())
+        except (OSError, ValueError):
+            continue
+        state = meta.get("state")
+        if state == "running" and not supervisor_alive(meta):
+            state = "exited (run down)"
+        started = time.strftime("%H:%M", time.localtime(meta.get("started", 0)))
+        say(f"{meta['name']}  {state}  started {started}  {meta.get('worktree')}")
+    return 0
+
+
+def status(meta):
+    state = meta.get("state")
+    if state == "running" and not supervisor_alive(meta):
+        state = "exited unexpectedly (run down for the report)"
+    say(f"run {meta['name']}: {state}; worktree {meta.get('worktree')}; runtime {meta.get('runtime')}")
+    if state == "running":
+        windows(meta)
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="zt", description=__doc__.splitlines()[0],
+                                     epilog="Coordinates are pixels in the latest screenshot of that window.")
+    parser.add_argument("--run", default=os.environ.get("ZEDTEST_RUN"), help=argparse.SUPPRESS)
+    commands = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    action = argparse.ArgumentParser(add_help=False)
+    action.add_argument("-w", "--window", type=int, help="target another window of this Zed (see `windows`)")
+    action.add_argument("--wait", type=float, default=0.6, help="seconds to wait before the screenshot")
+    action.add_argument("--no-shot", action="store_true", help="skip the screenshot after the action")
+    action.add_argument("--label", help="word added to the screenshot's file name")
+
+    start = commands.add_parser("up", help="build if needed and start a private Zed (prints the zt command)")
+    start.add_argument("--worktree", help="Zed worktree to test (default: the current one)")
+    start.add_argument("--name", help="run name (default: random)")
+    start.add_argument("--project", help="project to open (default: a fresh sample project); must be disposable")
+    start.add_argument("--opencode", choices=("none", "private", "real"), default="none",
+                       help="private: own OpenCode service with an empty history; real: the user's (only if asked)")
+    start.add_argument("--no-logins", action="store_true",
+                       help="don't copy the user's logins into the private OpenCode service (free models only)")
+    start.add_argument("--settings", help="JSON file merged into Zed's settings")
+    start.add_argument("--ask-trust", action="store_true", help="keep the project trust prompt")
+    start.add_argument("--no-build", action="store_true",
+                       help="use the existing target/debug/zed; only right after `zedtest build`, since a plain "
+                            "`cargo run` builds without the input feature the harness needs")
+    start.add_argument("--rust-log", default="info", help="RUST_LOG for Zed")
+    start.add_argument("--timeout", type=float, default=120, help="seconds for each startup step")
+    commands.add_parser("build", help="only build the worktree's Zed").add_argument("--worktree")
+    commands.add_parser("setup", help="only prepare Cage, the plugin and input devices")
+    commands.add_parser("list", help="list runs")
+
+    shot = commands.add_parser("shot", help="save a screenshot and print its path", parents=[action])
+    shot.add_argument("name", nargs="?", help="word added to the file name")
+    click = commands.add_parser("click", help="click at X Y", parents=[action])
+    click.add_argument("x", type=float)
+    click.add_argument("y", type=float)
+    click.add_argument("--double", action="store_true")
+    typing = commands.add_parser("type", help="type text", parents=[action])
+    typing.add_argument("text")
+    typing.add_argument("--enter", action="store_true", help="press return afterwards")
+    key = commands.add_parser("key", help="press keys in order: return, escape, tab, backspace, up, down, end, ctrl+s, ctrl+shift+p",
+                              parents=[action])
+    key.add_argument("keys", nargs="+")
+    command_palette = commands.add_parser("palette", help="run a command palette action, e.g. \"agent: new thread\"",
+                                          parents=[action])
+    command_palette.add_argument("action")
+    command_palette.add_argument("--search", action="store_true",
+                                 help="type the text but don't run it, to see which actions match")
+    scroll = commands.add_parser("scroll", help="scroll at X Y", parents=[action])
+    scroll.add_argument("x", type=float)
+    scroll.add_argument("y", type=float)
+    scroll.add_argument("direction", choices=("up", "down", "left", "right"))
+    scroll.add_argument("amount", type=int, nargs="?", default=3, help="wheel clicks (default 3)")
+    commands_hover = commands.add_parser("hover", help="move the pointer to X Y, to reveal hover-only controls",
+                                         parents=[action])
+    commands_hover.add_argument("x", type=float)
+    commands_hover.add_argument("y", type=float)
+    drag = commands.add_parser("drag", help="drag from X1 Y1 to X2 Y2", parents=[action])
+    for field in ("x1", "y1", "x2", "y2"):
+        drag.add_argument(field, type=float)
+    commands.add_parser("windows", help="list this Zed's windows")
+    log = commands.add_parser("log", help="show the end of Zed's log")
+    log.add_argument("-n", "--lines", type=int, default=40)
+    log.add_argument("-e", "--errors", action="store_true", help="only ERROR, WARN and panic lines")
+    log.add_argument("--all", action="store_true", help="with -e, include the known-harmless lines")
+    log.add_argument("--grep", help="only lines matching this regular expression")
+    log.add_argument("--source", choices=("zed", "stdout", "supervisor", "opencode", "build"), default="zed")
+    finding = commands.add_parser("evidence", help="add a finding with screenshots to the run's REPORT.md")
+    finding.add_argument("title")
+    finding.add_argument("shots", nargs="+", help="screenshot numbers or names, e.g. 004 011")
+    finding.add_argument("--level", required=True, choices=("unit-test", "ui-confirmed", "unconfirmed"))
+    finding.add_argument("--steps")
+    finding.add_argument("--expected")
+    finding.add_argument("--actual")
+    finding.add_argument("--where", help="where on the screenshots to look")
+    finding.add_argument("--test", help="failing test name, command and failure")
+    finding.add_argument("--notes")
+    commands.add_parser("reports", help="write /tmp/zedtest-reports.md, an index of all runs' reports")
+    request_api = commands.add_parser("api", help="call the private OpenCode service, e.g. api /api/session")
+    request_api.add_argument("path")
+    request_api.add_argument("-X", "--method", default="GET")
+    request_api.add_argument("-d", "--data", help="JSON body")
+    request_api.add_argument("--full", action="store_true", help="don't cut long output (for piping into a parser)")
+    commands.add_parser("status", help="show whether the run is alive and its windows")
+    stop = commands.add_parser("down", help="stop this run and report crashes and leftovers")
+    stop.add_argument("--purge", action="store_true", help="also delete screenshots and logs")
+
+    args = parser.parse_args()
+    if args.command == "up":
+        return up(args)
+    if args.command == "build":
+        worktree = find_worktree(args.worktree)
+        log = CACHE / f"build-{hashlib.sha256(str(worktree).encode()).hexdigest()[:8]}.log"
+        CACHE.mkdir(parents=True, exist_ok=True)
+        build_zed(worktree, log)
+        say(f"built {zed_binary(worktree)}")
+        return 0
+    if args.command == "setup":
+        tools = prepare_host()
+        say("ready: " + ", ".join(f"{key}={value}" for key, value in tools.items() if key != "cage"))
+        return 0
+    if args.command == "list":
+        return list_runs()
+    if args.command == "reports":
+        return reports()
+
+    meta = load_meta(args.run)
+    if args.command in ("shot", "click", "type", "key", "palette", "scroll", "hover", "drag"):
+        argv = sys.argv[1:]
+        if "--run" in argv:
+            del argv[argv.index("--run"):argv.index("--run") + 2]
+        record_command(meta, argv)
+    if args.command == "evidence":
+        return evidence(meta, args)
+    if args.command == "down":
+        return down(meta, args)
+    if args.command == "status":
+        return status(meta)
+    if args.command == "log":
+        return show_log(meta, args)
+    if args.command == "api":
+        return api(meta, args)
+    if args.command == "windows":
+        return windows(meta)
+    if args.command == "shot":
+        take_shot(meta, args.window, args.name or args.label)
+        return 0
+    if args.command == "palette":
+        return palette(meta, args)
+    if args.command == "click":
+        point = {"x": args.x, "y": args.y}
+        return act(meta, args, [{"tool": "double_click" if args.double else "click", "args": point}])
+    if args.command == "type":
+        quiet = argparse.Namespace(**{**vars(args), "no_shot": True})
+        chunks = text_chunks(args.text)
+        for chunk in chunks[:-1]:
+            if act(meta, quiet, [{"tool": "type_text", "args": {"text": chunk}}], report_success=False):
+                return 1
+        steps = [{"tool": "type_text", "args": {"text": chunks[-1]}}]
+        return act(meta, args, steps + ([key_step("return")] if args.enter else []))
+    if args.command == "key":
+        if len(args.keys) > 16:
+            raise Failure("at most 16 keys at a time")
+        return act(meta, args, [key_step(name) for name in args.keys])
+    if args.command == "scroll":
+        return act(meta, args, [{"tool": "scroll", "args": {"x": args.x, "y": args.y, "direction": args.direction,
+                                                            "amount": args.amount}}])
+    if args.command == "hover":
+        # The driver has no pointer-only move. A scroll moves the pointer first,
+        # and one sideways click leaves vertical lists and pages where they are.
+        return act(meta, args, [{"tool": "scroll", "args": {"x": args.x, "y": args.y, "direction": "left", "amount": 1}}])
+    if args.command == "drag":
+        return act(meta, args, [{"tool": "drag", "args": {"from_x": args.x1, "from_y": args.y1,
+                                                          "to_x": args.x2, "to_y": args.y2}}])
+    raise Failure(f"unknown command {args.command}")
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except Failure as error:
+        print(f"zedtest: {error}", file=sys.stderr)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        # The reader (such as `head`) closed early; the work itself is done.
+        os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        sys.exit(0)
