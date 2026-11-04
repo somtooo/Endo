@@ -15,6 +15,7 @@ doctest = false
 [features]
 default = ["wayland", "x11"]
 test-support = ["gpui/test-support"]
+wayland-first-seat = ["wayland"]
 wayland = [
     "dep:accesskit_unix",
     "gpui_wgpu",
