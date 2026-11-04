@@ -1581,6 +1581,7 @@ impl ConversationView {
             .clone()
             .downcast::<agent::NativeAgentConnection>()
             .map(|native_connection| native_available_skills(&native_connection, &session_id, cx))
+            .or_else(|| crate::agent_menu_providers::provided_skills(&connection, &session_id, cx))
             .unwrap_or_default();
         let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::new(
             thread.read(cx).prompt_capabilities().clone(),
@@ -1656,11 +1657,30 @@ impl ConversationView {
             // Use config options - don't create mode_selector or model_selector
             let agent_server = self.agent.clone();
             let fs = self.project.read(cx).fs().clone();
+            // An agent whose options leave out the model can offer the
+            // native model picker instead.
+            let has_model_option = config_options.config_options().iter().any(|option| {
+                option.category == Some(acp_v2::SessionConfigOptionCategory::Model)
+            });
             config_options_view =
                 Some(cx.new(|cx| {
                     ConfigOptionsView::new(config_options, agent_server, fs, window, cx)
                 }));
-            model_selector = None;
+            model_selector = if has_model_option {
+                None
+            } else {
+                connection.model_selector(&session_id).map(|selector| {
+                    cx.new(|cx| {
+                        ModelSelectorPopover::new(
+                            selector,
+                            PopoverMenuHandle::default(),
+                            self.focus_handle(cx),
+                            window,
+                            cx,
+                        )
+                    })
+                })
+            };
             mode_selector = None;
         } else {
             // Fall back to dedicated mode/model selectors
@@ -2327,6 +2347,14 @@ impl ConversationView {
                         .downcast::<agent::NativeAgentConnection>()
                         .map(|native_connection| {
                             native_available_skills(&native_connection, &session_id, cx)
+                        })
+                        .or_else(|| {
+                            let connection = thread.read(cx).connection();
+                            crate::agent_menu_providers::provided_skills(
+                                connection,
+                                &session_id,
+                                cx,
+                            )
                         })
                         .unwrap_or_default();
                     let has_slash_completions =

@@ -28,6 +28,7 @@ use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCo
 use editor::actions::OpenExcerpts;
 use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 
+use crate::agent_menu_providers::AgentThinking;
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
 use crate::entry_view_state::TerminalCardPresentation;
 use crate::message_editor::SharedSessionCapabilities;
@@ -5687,7 +5688,9 @@ impl ThreadView {
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
-                                        Some(config_view) => this.child(config_view),
+                                        Some(config_view) => this
+                                            .child(config_view)
+                                            .children(self.model_selector.clone()),
                                         None => this
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
@@ -6419,7 +6422,10 @@ impl ThreadView {
     }
 
     fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let thread = self.as_native_thread(cx)?.read(cx);
+        let Some(thread) = self.as_native_thread(cx) else {
+            return self.render_provided_thinking_control(cx);
+        };
+        let thread = thread.read(cx);
         let model = thread.model()?;
 
         let supports_thinking = model.supports_thinking();
@@ -6685,6 +6691,8 @@ impl ThreadView {
                                                     }
                                                 });
                                             });
+                                        } else if let Some(thinking) = this.provided_thinking(cx) {
+                                            thinking.set_effort(effort.to_string(), cx);
                                         }
                                     })
                                     .ok();
@@ -14129,6 +14137,7 @@ impl ThreadView {
 
     fn cycle_native_agent_thinking_effort(&mut self, cx: &mut Context<Self>) {
         let Some(thread) = self.as_native_thread(cx) else {
+            self.cycle_provided_thinking_effort(cx);
             return;
         };
 
@@ -14350,6 +14359,10 @@ impl Render for ThreadView {
                             thread.set_thinking_enabled(!thread.thinking_enabled(), cx);
                         }
                     });
+                } else if let Some(thinking) = this.provided_thinking(cx)
+                    && thinking.can_disable_thinking()
+                {
+                    thinking.set_thinking_enabled(!thinking.thinking_enabled(), cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &CycleThinkingEffort, _window, cx| {
@@ -14896,6 +14909,85 @@ fn leading_native_command(
                 == Some(acp_thread::CommandCategory::Native)
     });
     is_native.then(|| name.to_string())
+}
+
+/// The thinking control for agents that provide one through
+/// `agent_menu_providers`, drawn like the native agent's.
+impl ThreadView {
+    fn provided_thinking(&self, cx: &App) -> Option<Rc<dyn AgentThinking>> {
+        let thread = self.thread.read(cx);
+        crate::agent_menu_providers::provided_thinking(thread.connection(), thread.session_id(), cx)
+    }
+
+    fn render_provided_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thinking = self.provided_thinking(cx)?;
+        let effort_levels = thinking.effort_levels();
+        let selected_effort = thinking.selected_effort();
+
+        if !thinking.can_disable_thinking() {
+            if effort_levels.is_empty() {
+                return None;
+            }
+            return Some(
+                self.render_effort_selector(effort_levels, selected_effort, true, cx)
+                    .into_any_element(),
+            );
+        }
+
+        let enabled = thinking.thinking_enabled();
+        let (tooltip_label, icon, color) = if enabled {
+            (
+                "Disable Thinking Mode",
+                IconName::ThinkingMode,
+                Color::Accent,
+            )
+        } else {
+            (
+                "Enable Thinking Mode",
+                IconName::ThinkingModeOff,
+                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
+            )
+        };
+        let focus_handle = self.message_editor.focus_handle(cx);
+        let thinking_toggle = IconButton::new("thinking-mode", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color)
+            .tooltip(move |_, cx| {
+                Tooltip::for_action_in(tooltip_label, &ToggleThinkingMode, &focus_handle, cx)
+            })
+            .on_click(cx.listener(|this, _, _window, cx| {
+                if let Some(thinking) = this.provided_thinking(cx) {
+                    thinking.set_thinking_enabled(!thinking.thinking_enabled(), cx);
+                }
+            }));
+
+        if effort_levels.is_empty() || !enabled {
+            return Some(thinking_toggle.into_any_element());
+        }
+        let effort_selector = self.render_effort_selector(effort_levels, selected_effort, false, cx);
+        Some(
+            SplitButton::new(thinking_toggle, effort_selector.into_any_element())
+                .style(SplitButtonStyle::Transparent)
+                .into_any_element(),
+        )
+    }
+
+    fn cycle_provided_thinking_effort(&mut self, cx: &mut Context<Self>) {
+        let Some(thinking) = self.provided_thinking(cx) else {
+            return;
+        };
+        let effort_levels = thinking.effort_levels();
+        if !thinking.thinking_enabled() || effort_levels.is_empty() {
+            return;
+        }
+        let current_index = thinking
+            .selected_effort()
+            .and_then(|current| effort_levels.iter().position(|level| level.value == current));
+        let next_index = current_index.map_or(0, |index| (index + 1) % effort_levels.len());
+        if let Some(level) = effort_levels.get(next_index) {
+            thinking.set_effort(level.value.to_string(), cx);
+        }
+    }
 }
 
 /// Removes a leading `/command_name` token from `text`, returning the trimmed

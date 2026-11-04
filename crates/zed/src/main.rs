@@ -742,6 +742,7 @@ fn main() {
             false,
             cx,
         );
+        opencode_agent::init(cx.http_client(), cx);
         zed::watch_user_agents_md(app_state.fs.clone(), cx);
 
         repl::init(app_state.fs.clone(), cx);

@@ -5,13 +5,13 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context as _, Result, bail};
+use anyhow::{Context as _, Result, anyhow, bail};
 use collections::HashMap;
 use fs::{Fs, RemoveOptions};
 use futures::StreamExt;
 use github_releases::AssetKind;
 use gpui::{
-    AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
+    App, AppContext as _, AsyncApp, Context, Entity, EventEmitter, SharedString, Subscription, Task,
     TaskExt,
 };
 use http_client::HttpClient;
@@ -141,6 +141,54 @@ pub trait ExternalAgentServer {
 
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+}
+
+/// An agent that is always offered in local projects, without an
+/// `agent_servers` settings entry. Its connection is provided in-process
+/// (see `agent_servers::register_agent_connection_factory`).
+#[derive(Clone)]
+pub struct BuiltInAgent {
+    pub id: AgentId,
+    pub display_name: SharedString,
+    pub icon: Option<SharedString>,
+}
+
+#[derive(Default)]
+struct BuiltInAgents(Vec<BuiltInAgent>);
+
+impl gpui::Global for BuiltInAgents {}
+
+/// Registers before projects are created so every local agent store lists it.
+pub fn register_built_in_agent(agent: BuiltInAgent, cx: &mut App) {
+    let agents = &mut cx.default_global::<BuiltInAgents>().0;
+    agents.retain(|existing| existing.id != agent.id);
+    agents.push(agent);
+}
+
+pub fn is_built_in_agent(id: &AgentId, cx: &App) -> bool {
+    cx.try_global::<BuiltInAgents>()
+        .is_some_and(|agents| agents.0.iter().any(|agent| &agent.id == id))
+}
+
+struct BuiltInAgentServer;
+
+impl ExternalAgentServer for BuiltInAgentServer {
+    fn get_command(
+        &mut self,
+        _extra_args: Vec<String>,
+        _extra_env: HashMap<String, String>,
+        _cx: &mut AsyncApp,
+    ) -> Task<Result<AgentServerCommand>> {
+        Task::ready(Err(anyhow!("built-in agents don't run a command")))
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
+    }
 }
 
 enum AgentServerStoreState {
@@ -472,6 +520,22 @@ impl AgentServerStore {
             }
         }
 
+        let built_in_agents = cx
+            .try_global::<BuiltInAgents>()
+            .map(|agents| agents.0.clone())
+            .unwrap_or_default();
+        for agent in &built_in_agents {
+            self.external_agents.insert(
+                agent.id.clone(),
+                ExternalAgentEntry::new(
+                    Box::new(BuiltInAgentServer),
+                    ExternalAgentSource::Custom,
+                    agent.icon.clone(),
+                    Some(agent.display_name.clone()),
+                ),
+            );
+        }
+
         *old_settings = Some(new_settings);
 
         if let Some((project_id, downstream_client)) = downstream_client {
@@ -481,6 +545,7 @@ impl AgentServerStore {
                     names: self
                         .external_agents
                         .keys()
+                        .filter(|name| !built_in_agents.iter().any(|agent| &agent.id == *name))
                         .map(|name| name.to_string())
                         .collect(),
                 })

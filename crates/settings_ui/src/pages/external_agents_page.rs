@@ -80,6 +80,7 @@ fn collect_agents(store: &Entity<AgentServerStore>, cx: &App) -> Vec<AgentRow> {
     let store = store.read(cx);
     store
         .external_agents()
+        .filter(|name| !project::agent_server_store::is_built_in_agent(name, cx))
         .cloned()
         .collect::<Vec<_>>()
         .into_iter()

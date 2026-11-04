@@ -509,6 +509,9 @@ pub struct ThreadMetadataStore {
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
+    /// Sessions a backend reports as running while no panel has them loaded,
+    /// so the sidebar can show them as running too.
+    externally_running: HashSet<acp::SessionId>,
     _db_operations_task: Task<()>,
 }
 
@@ -599,6 +602,26 @@ impl ThreadMetadataStore {
     }
 
     /// Returns all threads.
+    pub fn set_externally_running(
+        &mut self,
+        session_id: acp::SessionId,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if running {
+            self.externally_running.insert(session_id)
+        } else {
+            self.externally_running.remove(&session_id)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub fn is_externally_running(&self, session_id: &acp::SessionId) -> bool {
+        self.externally_running.contains(session_id)
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
         self.threads.values()
     }
@@ -1243,6 +1266,7 @@ impl ThreadMetadataStore {
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
+            externally_running: HashSet::default(),
             _db_operations_task,
         };
         let _ = this.reload(cx);

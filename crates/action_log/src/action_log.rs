@@ -191,6 +191,7 @@ impl ActionLog {
                 TrackedBuffer {
                     buffer: buffer.clone(),
                     diff_base,
+                    external_diff_base: None,
                     unreviewed_edits,
                     snapshot: text_snapshot,
                     status,
@@ -339,6 +340,13 @@ impl ActionLog {
                 .get_mut(buffer)
                 .context("buffer not tracked")?;
 
+            // Agent updates are queued after any user update that a reload
+            // caused, so this base also replaces whatever that one rebases.
+            if let ChangeAuthor::Agent = author
+                && let Some(external_diff_base) = tracked_buffer.external_diff_base.take()
+            {
+                tracked_buffer.diff_base = external_diff_base;
+            }
             let rebase = cx.background_spawn({
                 let mut base_text = tracked_buffer.diff_base.clone();
                 let old_snapshot = tracked_buffer.snapshot.clone();
@@ -604,6 +612,73 @@ impl ActionLog {
 
         tracked_buffer.version = new_version;
         tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+    }
+
+    /// Records an edit made outside Zed, such as by an agent's own process.
+    /// The buffer must already hold the result. `revert` undoes the edit in a
+    /// text, or returns `None` if the edit doesn't apply to it.
+    pub fn buffer_edited_externally(
+        &mut self,
+        buffer: Entity<Buffer>,
+        kind: ExternalEditKind,
+        revert: &dyn Fn(&str) -> Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(linked_action_log) = &self.linked_action_log {
+            linked_action_log.update(cx, |log, cx| {
+                log.buffer_edited_externally(buffer.clone(), kind, revert, cx);
+            });
+        }
+        if kind == ExternalEditKind::Deleted {
+            if let Some(tracked_buffer) = self.tracked_buffers.get(&buffer)
+                && matches!(tracked_buffer.status, TrackedBufferStatus::Created { .. })
+            {
+                self.tracked_buffers.remove(&buffer);
+                cx.notify();
+                return;
+            }
+            buffer.update(cx, |buffer, cx| buffer.set_text("", cx));
+        }
+        let base = match self.tracked_buffers.get(&buffer) {
+            // Reloading the buffer may already have counted this edit as the
+            // user's and moved it into the base. Otherwise it doesn't apply.
+            Some(tracked_buffer) => {
+                let current = tracked_buffer
+                    .external_diff_base
+                    .as_ref()
+                    .unwrap_or(&tracked_buffer.diff_base);
+                revert(&current.to_string())
+                    .map(|base| Rope::from(base.as_str()))
+                    .unwrap_or_else(|| current.clone())
+            }
+            None => {
+                let Some(base) = revert(&buffer.read(cx).text()) else {
+                    log::warn!("external edit doesn't apply to its buffer");
+                    return;
+                };
+                Rope::from(base.as_str())
+            }
+        };
+        let was_tracked = self.tracked_buffers.contains_key(&buffer);
+        let version = buffer.read(cx).version();
+        let tracked_buffer = self.track_buffer_internal(buffer, false, cx);
+        match kind {
+            ExternalEditKind::Created if !was_tracked => {
+                tracked_buffer.status = TrackedBufferStatus::Created {
+                    existing_file_content: None,
+                };
+            }
+            ExternalEditKind::Deleted => tracked_buffer.status = TrackedBufferStatus::Deleted,
+            _ => {
+                if let TrackedBufferStatus::Deleted = tracked_buffer.status {
+                    tracked_buffer.status = TrackedBufferStatus::Modified;
+                }
+            }
+        }
+        tracked_buffer.external_diff_base = Some(base);
+        tracked_buffer.version = version;
+        tracked_buffer.schedule_diff_update(ChangeAuthor::Agent, cx);
+        cx.notify();
     }
 
     pub fn will_delete_buffer(&mut self, buffer: Entity<Buffer>, cx: &mut Context<Self>) {
@@ -1269,6 +1344,8 @@ enum TrackedBufferStatus {
 pub struct TrackedBuffer {
     buffer: Entity<Buffer>,
     diff_base: Rope,
+    /// Replaces `diff_base` at the next agent update, for edits made outside Zed.
+    external_diff_base: Option<Rope>,
     unreviewed_edits: Patch<u32>,
     status: TrackedBufferStatus,
     version: clock::Global,
@@ -1307,6 +1384,14 @@ impl TrackedBuffer {
     }
 }
 
+/// How an edit made outside Zed changed its file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExternalEditKind {
+    Modified,
+    Created,
+    Deleted,
+}
+
 pub struct ChangedBuffer {
     pub diff: Entity<BufferDiff>,
 }
@@ -1335,6 +1420,68 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[gpui::test]
+    async fn test_external_edits(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/dir"), json!({"file": "one\nTWO\nthree\n"}))
+            .await;
+        let project = Project::test(fs.clone(), [path!("/dir").as_ref()], cx).await;
+        let action_log = cx.new(|_| ActionLog::new(project.clone()));
+        let file_path = project
+            .read_with(cx, |project, cx| project.find_project_path("dir/file", cx))
+            .unwrap();
+        let buffer = project
+            .update(cx, |project, cx| project.open_buffer(file_path, cx))
+            .await
+            .unwrap();
+
+        // The file already holds the edit, which the agent made on its own.
+        action_log.update(cx, |log, cx| {
+            log.buffer_edited_externally(
+                buffer.clone(),
+                ExternalEditKind::Modified,
+                &|text| Some(text.replace("TWO", "two")),
+                cx,
+            );
+        });
+        cx.run_until_parked();
+        assert_eq!(
+            unreviewed_hunks(&action_log, cx),
+            vec![(
+                buffer.clone(),
+                vec![HunkStatus {
+                    range: Point::new(1, 0)..Point::new(2, 0),
+                    diff_status: DiffHunkStatusKind::Modified,
+                    old_text: "two\n".into(),
+                }],
+            )]
+        );
+
+        // A later edit to the same file keeps the first base. It isn't in the
+        // base, so its revert doesn't apply.
+        buffer.update(cx, |buffer, cx| buffer.set_text("one\nTWO\nTHREE\n", cx));
+        action_log.update(cx, |log, cx| {
+            log.buffer_edited_externally(buffer.clone(), ExternalEditKind::Modified, &|_| None, cx);
+        });
+        cx.run_until_parked();
+        let hunks = unreviewed_hunks(&action_log, cx);
+        assert_eq!(hunks[0].1.len(), 1);
+        assert_eq!(hunks[0].1[0].old_text, "two\nthree\n");
+
+        // Rejecting restores the text from before the first edit.
+        action_log
+            .update(cx, |log, cx| log.reject_all_edits(None, cx))
+            .await;
+        cx.run_until_parked();
+        assert_eq!(
+            buffer.read_with(cx, |buffer, _| buffer.text()),
+            "one\ntwo\nthree\n"
+        );
+        assert_eq!(unreviewed_hunks(&action_log, cx), vec![]);
     }
 
     #[gpui::test(iterations = 10)]
