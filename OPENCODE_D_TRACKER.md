@@ -17,20 +17,16 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
-| 25 | Steering queued messages | The native agent can send a queued message into the running turn. OpenCode D has no steering yet. | Code | To do |
-| 26 | Split token display and limit warning | The native agent shows input and output tokens separately and warns near the context limit. OpenCode D shows only the circle. | Code | To do |
-| 27 | Open as Markdown from the sidebar | Hidden for every non-Zed agent when the thread isn't open (`sidebar.rs`). Fix: load the thread, then export. Helps every agent. | Code | To do |
-| 28 | Effort labels | Effort levels show the capitalized variant ID ("Xhigh"). Compare with the native names for the same levels. | Code | To do |
-| 29 | Model picker Configure footer | The native picker has a Configure footer. Add one that opens an OpenCode section in Zed's AI settings, once that section exists. | Code | To do |
-| 30 | OpenCode settings page | Global instructions, compaction, MCP setup and similar. Needs a design: OpenCode reads config from many places. | Code | To do |
+| 29 | Model picker Configure footer | Part of #30: add the footer when the OpenCode settings page exists. | You | Plan needed |
+| 30 | OpenCode settings page | A UI to change OpenCode's config without editing the JSON file: global instructions, compaction, MCP setup and similar. Includes the model picker's Configure footer (#29). Needs a design: OpenCode reads config from many places. | Code | Plan needed |
 | 31 | Background subagent management | No UI to list or stop background subagents. | Code | To do |
-| 32 | Install OpenCode button untested | The install flow was tested on its own but never in the running app. | Code | To do |
-| 33 | Clippy error in `install.rs` | `install.rs:78` uses the disallowed `Command::output`. | Code | To do |
 
 ## Needs checking
 
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
+| 25 | Steering queued messages | Steering can't be supported: OpenCode has no way to add a message to a running turn. Whether queued messages (sent after the turn ends) work in OpenCode D hasn't been checked. | You | Needs check |
+| 32 | Install OpenCode button untested | The install flow was tested on its own but never in the running app. The user will test it. | You | Needs check |
 
 ## Done or closed
 
@@ -60,6 +56,10 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 | 22 | Symbol picker shows nothing | Works for the user. The test run probably had no language server. | You | Won't fix |
 | 23 | Image attachments | Work. | You | Done |
 | 24 | Deleting a thread | Deletes the OpenCode session too. | You | Done |
+| 26 | Split token display and limit warning | Not a gap: Zed shows one circle or two depending on the provider and model. One circle is fine. | You | Won't fix |
+| 27 | Open as Markdown from the sidebar | Not useful enough. Comes for free if upstream Zed enables it for external agents. | You | Won't fix |
+| 28 | Effort labels | Keep the names OpenCode's API returns; don't rename them to Zed's labels. | You | Won't fix |
+| 33 | Clippy error in `install.rs` | `is_musl` used the blocking `std::process::Command::output`. It now runs `ldd` through `util::command::new_command` and awaits it. | Code | Done |
 
 ## Notifications
 
