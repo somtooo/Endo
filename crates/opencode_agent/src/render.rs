@@ -746,7 +746,9 @@ fn tool_locations(
         .iter()
         .filter_map(|key| input.get(*key).and_then(Value::as_str))
         .map(|path| directory.join(path))
-        .filter(|path| path.is_absolute())
+        // A folder can't be opened as a buffer, and the output may not say
+        // it was one.
+        .filter(|path| path.is_absolute() && !path.is_dir())
         .take(1)
         .map(acp::ToolCallLocation::new)
         .collect()
@@ -1500,6 +1502,8 @@ mod tests {
             vec![PathBuf::from("/elsewhere/a.rs")]
         );
         assert!(tool_locations("read", &json!({"path": "a.rs"}), None, Path::new("")).is_empty());
+        let folder = std::env::temp_dir();
+        assert!(tool_locations("read", &json!({"path": "."}), None, &folder).is_empty());
         assert!(
             tool_locations(
                 "read",
