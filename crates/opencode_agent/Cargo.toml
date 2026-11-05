@@ -37,6 +37,7 @@ language_model.workspace = true
 log.workspace = true
 menu.workspace = true
 paths.workspace = true
+percent-encoding.workspace = true
 picker.workspace = true
 project.workspace = true
 rand.workspace = true

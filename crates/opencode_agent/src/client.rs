@@ -2,6 +2,7 @@ use crate::service::ServiceRegistration;
 use crate::types::{
     ConfigEntry, AgentInfo, Event, Message, ModelInfo, ModelRef, NamedItem, ProviderInfo, ServerInfo, SessionInfo, Skill,
     SessionPage,
+    AttemptStatus, CommandAttempt, Integration, OAuthAttempt, PluginInfo,
 };
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
@@ -30,6 +31,21 @@ pub struct ShellOutput {
     pub cursor: u64,
     /// Bytes captured so far.
     pub size: u64,
+}
+
+/// Well-known integrations use their URL as their ID, so it has to be escaped.
+fn connect_path(integration_id: &str, rest: &str) -> String {
+    let integration_id =
+        percent_encoding::utf8_percent_encode(integration_id, percent_encoding::NON_ALPHANUMERIC);
+    format!("/api/integration/{integration_id}/connect/{rest}")
+}
+
+fn method_body(method_id: &str, answer: Option<&Value>) -> Value {
+    let mut body = serde_json::json!({ "methodID": method_id });
+    if let Some(answer) = answer {
+        body["answer"] = answer.clone();
+    }
+    body
 }
 
 fn skill_attachments(skills: &[String]) -> Vec<Value> {
@@ -257,6 +273,152 @@ impl OpenCodeClient {
 
     pub async fn agents(&self, directory: &str) -> Result<Vec<AgentInfo>> {
         self.located_data("/api/agent", directory).await
+    }
+
+    pub async fn integrations(&self, directory: &str) -> Result<Vec<Integration>> {
+        self.located_data("/api/integration", directory).await
+    }
+
+    pub async fn plugins(&self, directory: &str) -> Result<Vec<PluginInfo>> {
+        self.located_data("/api/plugin", directory).await
+    }
+
+    pub async fn connect_with_key(
+        &self,
+        directory: &str,
+        integration_id: &str,
+        key: &str,
+        answer: Option<&Value>,
+    ) -> Result<()> {
+        let mut body = serde_json::json!({ "key": key });
+        if let Some(answer) = answer {
+            body["answer"] = answer.clone();
+        }
+        self.post_located(&connect_path(integration_id, "key"), directory, &body)
+            .await
+    }
+
+    pub async fn connect_external(
+        &self,
+        directory: &str,
+        integration_id: &str,
+        method_id: &str,
+        answer: Option<&Value>,
+    ) -> Result<()> {
+        let body = method_body(method_id, answer);
+        self.post_located(&connect_path(integration_id, "external"), directory, &body)
+            .await
+    }
+
+    pub async fn start_oauth(
+        &self,
+        directory: &str,
+        integration_id: &str,
+        method_id: &str,
+        answer: Option<&Value>,
+    ) -> Result<OAuthAttempt> {
+        self.post_located_data(
+            &connect_path(integration_id, "oauth"),
+            directory,
+            &method_body(method_id, answer),
+        )
+        .await
+    }
+
+    pub async fn oauth_status(
+        &self,
+        directory: &str,
+        integration_id: &str,
+        attempt_id: &str,
+    ) -> Result<AttemptStatus> {
+        let path = connect_path(integration_id, &format!("oauth/{attempt_id}"));
+        self.located_data(&path, directory).await
+    }
+
+    pub async fn complete_oauth(
+        &self,
+        directory: &str,
+        integration_id: &str,
+        attempt_id: &str,
+        code: &str,
+    ) -> Result<()> {
+        let path = connect_path(integration_id, &format!("oauth/{attempt_id}/complete"));
+        self.post_located(&path, directory, &serde_json::json!({ "code": code }))
+            .await
+    }
+
+    pub async fn cancel_oauth(
+        &self,
+        directory: &str,
+        integration_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        let path = connect_path(integration_id, &format!("oauth/{attempt_id}"));
+        self.delete_located(&path, directory).await
+    }
+
+    pub async fn start_command(
+        &self,
+        directory: &str,
+        integration_id: &str,
+        method_id: &str,
+    ) -> Result<CommandAttempt> {
+        self.post_located_data(
+            &connect_path(integration_id, "command"),
+            directory,
+            &method_body(method_id, None),
+        )
+        .await
+    }
+
+    pub async fn command_status(
+        &self,
+        directory: &str,
+        integration_id: &str,
+        attempt_id: &str,
+    ) -> Result<AttemptStatus> {
+        let path = connect_path(integration_id, &format!("command/{attempt_id}"));
+        self.located_data(&path, directory).await
+    }
+
+    pub async fn cancel_command(
+        &self,
+        directory: &str,
+        integration_id: &str,
+        attempt_id: &str,
+    ) -> Result<()> {
+        let path = connect_path(integration_id, &format!("command/{attempt_id}"));
+        self.delete_located(&path, directory).await
+    }
+
+    pub async fn activate_credential(&self, credential_id: &str) -> Result<()> {
+        let path = format!("/api/credential/{credential_id}/activate");
+        let _: Value = self
+            .post_json(self.url(&path, &[])?, &serde_json::json!({}))
+            .await?;
+        Ok(())
+    }
+
+    pub async fn rename_credential(&self, credential_id: &str, label: &str) -> Result<()> {
+        let path = format!("/api/credential/{credential_id}");
+        let url = self.url(&path, &[])?;
+        let request = self
+            .request(Method::PATCH, url)
+            .header("Content-Type", "application/json")
+            .body(AsyncBody::from(serde_json::to_string(
+                &serde_json::json!({ "label": label }),
+            )?))?;
+        let _: Value = self.send_json(request, &path).await?;
+        Ok(())
+    }
+
+    pub async fn remove_credential(&self, credential_id: &str) -> Result<()> {
+        let path = format!("/api/credential/{credential_id}");
+        let request = self
+            .request(Method::DELETE, self.url(&path, &[])?)
+            .body(AsyncBody::empty())?;
+        let _: Value = self.send_json(request, &path).await?;
+        Ok(())
     }
 
     pub async fn config_entries(&self, directory: &str) -> Result<Vec<ConfigEntry>> {
@@ -553,6 +715,36 @@ impl OpenCodeClient {
             .get_json(self.url(path, &[("location[directory]", directory)])?)
             .await?;
         Ok(response.data)
+    }
+
+    async fn post_located(&self, path: &str, directory: &str, body: &Value) -> Result<()> {
+        let url = self.url(path, &[("location[directory]", directory)])?;
+        let _: Value = self.post_json(url, body).await?;
+        Ok(())
+    }
+
+    async fn post_located_data<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        directory: &str,
+        body: &Value,
+    ) -> Result<T> {
+        #[derive(Deserialize)]
+        struct Response<T> {
+            data: T,
+        }
+        let url = self.url(path, &[("location[directory]", directory)])?;
+        let response: Response<T> = self.post_json(url, body).await?;
+        Ok(response.data)
+    }
+
+    async fn delete_located(&self, path: &str, directory: &str) -> Result<()> {
+        let url = self.url(path, &[("location[directory]", directory)])?;
+        let request = self
+            .request(Method::DELETE, url)
+            .body(AsyncBody::empty())?;
+        let _: Value = self.send_json(request, path).await?;
+        Ok(())
     }
 
     /// Subscribes to every event on the server. The server drops a subscriber

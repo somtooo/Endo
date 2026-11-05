@@ -46,6 +46,9 @@ pub struct ServerInfo {
 #[derive(Clone, Debug, Deserialize)]
 pub struct ModelInfo {
     pub id: String,
+    /// What the model produces. Only `chat` models can run sessions.
+    #[serde(default, rename = "type")]
+    pub kind: Option<String>,
     #[serde(rename = "providerID")]
     pub provider_id: String,
     pub name: String,
@@ -524,4 +527,161 @@ impl Event {
             None => self.id.clone(),
         }
     }
+}
+
+/// A provider or other service OpenCode can connect to.
+#[derive(Clone, Debug, Deserialize)]
+pub struct Integration {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub methods: Vec<IntegrationMethod>,
+    #[serde(default)]
+    pub connections: Vec<IntegrationConnection>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum IntegrationMethod {
+    #[serde(rename = "oauth")]
+    OAuth {
+        id: String,
+        label: String,
+        #[serde(default)]
+        form: Vec<FormField>,
+    },
+    Command {
+        id: String,
+        label: String,
+    },
+    Key {
+        label: Option<String>,
+        #[serde(default)]
+        form: Vec<FormField>,
+    },
+    External {
+        id: String,
+        label: String,
+        #[serde(default)]
+        form: Vec<FormField>,
+    },
+    /// Read from the service's environment, so there's nothing to connect.
+    Env {
+        #[serde(default)]
+        names: Vec<String>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum IntegrationConnection {
+    Credential {
+        id: String,
+        label: String,
+        method: String,
+        status: Option<ConnectionStatus>,
+    },
+    Env {
+        name: String,
+        status: Option<ConnectionStatus>,
+    },
+    #[serde(other)]
+    Other,
+}
+
+/// A problem the integration reported with a connection.
+#[derive(Clone, Debug, Deserialize)]
+pub struct ConnectionStatus {
+    pub message: String,
+}
+
+/// One question in the form a connection method asks before it starts.
+#[derive(Clone, Debug, Deserialize)]
+pub struct FormField {
+    pub key: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub required: bool,
+    /// Answered with the default instead of being asked.
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub when: Vec<FormCondition>,
+    pub placeholder: Option<String>,
+    pub default: Option<Value>,
+    #[serde(default)]
+    pub options: Vec<FormOption>,
+    /// A link the user follows instead of answering.
+    pub url: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct FormCondition {
+    pub key: String,
+    pub op: String,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct FormOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// A started OAuth sign-in.
+#[derive(Clone, Debug, Deserialize)]
+pub struct OAuthAttempt {
+    #[serde(rename = "attemptID")]
+    pub attempt_id: String,
+    pub url: String,
+    pub instructions: String,
+    /// `code` when the user has to paste a code back, `auto` otherwise.
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct CommandAttempt {
+    #[serde(rename = "attemptID")]
+    pub attempt_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct AttemptStatus {
+    /// `pending`, `complete`, `failed` or `expired`.
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PluginInfo {
+    pub id: Option<String>,
+    pub source: PluginSource,
+    pub state: PluginState,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum PluginSource {
+    Builtin,
+    Package {
+        target: String,
+        version: Option<String>,
+    },
+    Local {
+        path: String,
+    },
+    #[serde(other)]
+    Other,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct PluginState {
+    /// `active` or `failed`.
+    pub status: String,
+    pub error: Option<String>,
 }

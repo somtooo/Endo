@@ -18,12 +18,12 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
 | 29 | Model picker Configure footer | Part of #30: add the footer when the OpenCode settings page exists. | You | Plan needed |
-| 30 | OpenCode settings page | A UI to change OpenCode's config without editing the JSON file: global instructions, compaction, MCP setup and similar. Includes the model picker's Configure footer (#29). Needs a design: OpenCode reads config from many places. | Code | Plan needed |
 
 ## Needs checking
 
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
+| 30 | OpenCode D settings page | AI > External Agents has an OpenCode D row. Its page has: Providers (connect with an API key, sign-in or command; switch, rename and disconnect accounts; search all providers), Plugins (add, turn on or off, remove), Compaction, Warming, and Defaults (model, agent, web search). Writes OpenCode's global config and calls the service's API. UI-tested by the agent against a private service, with a fake API key and a Copilot sign-in that was started and cancelled, not completed. | You | Needs check |
 | 34 | Shell output shows twice | A short shell command showed its output twice. A finished foreground call has no shell ID, so the step that stops its output stream was skipped, and the stream added the output again. Fixed. Quick, streaming, failing and background commands each show their output once. UI-tested by the agent. | Tester | Needs check |
 | 31 | Background subagent management | Subagent cards already showed the work. Their Stop button now works, for background and foreground subagents, through OpenCode's interrupt. A stopped card shows Zed's native cancelled state. Limit: after restarting Zed, a stopped background subagent's card shows as completed, because only this run saw the interrupt. UI-tested by the agent. | You | Needs check |
 | 25 | Steering queued messages | The native Steer button and Ctrl-Alt-S now work in OpenCode D threads. Steering hands the front queued message to OpenCode with `delivery: "steer"`, which adds it to the running turn at the next step. Undo, Stop, Clear All, delete and editing take it back (`DELETE inbox/:id`); OpenCode's `session.inbox.delivered` or `cancelled` event says which happened, so a late undo never sends it twice. Queued messages already worked. UI-tested by the agent: steer, undo, Stop, Send Now, edit, delete, and a steer at the end of a turn. | You | Needs check |

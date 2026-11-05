@@ -5,7 +5,7 @@ mod form;
 mod history;
 mod install;
 mod mcp;
-mod opencode_config;
+pub mod opencode_config;
 mod render;
 mod service;
 mod session_sync;
@@ -23,7 +23,7 @@ pub use session_sync::{
 };
 pub use types::*;
 
-use gpui::{App, TaskExt as _};
+use gpui::{App, Global, Task, TaskExt as _};
 use util::ResultExt as _;
 use project::agent_server_store::{AgentId, BuiltInAgent, register_built_in_agent};
 use std::rc::Rc;
@@ -46,9 +46,26 @@ fn write_icon(cx: &App) -> Option<gpui::SharedString> {
     Some(path.to_string_lossy().into_owned().into())
 }
 
+struct ServiceHttpClient(Arc<dyn http_client::HttpClient>);
+
+impl Global for ServiceHttpClient {}
+
+/// A client for the OpenCode service, starting the service if needed.
+pub fn service_client(cx: &mut App) -> Task<anyhow::Result<OpenCodeClient>> {
+    let Some(http) = cx
+        .try_global::<ServiceHttpClient>()
+        .map(|http| http.0.clone())
+    else {
+        return Task::ready(Err(anyhow::anyhow!("OpenCode D isn't available here")));
+    };
+    let hub = Hub::get(http, cx);
+    cx.spawn(async move |_| Ok(hub.await?.client().clone()))
+}
+
 /// Registers OpenCode D: always offered in the agent picker for local
 /// projects, backed by the shared OpenCode service instead of ACP.
 pub fn init(http: Arc<dyn http_client::HttpClient>, cx: &mut App) {
+    cx.set_global(ServiceHttpClient(http.clone()));
     // Thread history syncs whenever OpenCode is installed, even if OpenCode D
     // is never opened.
     let installed = find_system_binary().is_some()

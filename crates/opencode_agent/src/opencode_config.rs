@@ -239,6 +239,20 @@ fn lookup<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
     path.iter().try_fold(value, |value, key| value.get(*key))
 }
 
+/// The value at `path`, for settings the config file stores directly.
+pub fn value_at<'a>(config: &'a Value, path: &[&str]) -> Option<&'a Value> {
+    lookup(config, path)
+}
+
+/// Sets the value at `path`, or removes it for `None`. Removing what isn't
+/// there changes nothing.
+pub fn set_value(text: &str, path: &[&str], value: Option<&Value>) -> Result<String> {
+    if value.is_none() && lookup(&parse(text)?, path).is_none() {
+        return Ok(text.to_string());
+    }
+    replace(text, path, value)
+}
+
 /// Replaces the value at `path`, or removes it for `None`, keeping the rest
 /// of the text as it is.
 fn replace(text: &str, path: &[&str], value: Option<&Value>) -> Result<String> {
