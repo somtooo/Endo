@@ -19,12 +19,12 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 |---|---|---|---|---|
 | 29 | Model picker Configure footer | Part of #30: add the footer when the OpenCode settings page exists. | You | Plan needed |
 | 30 | OpenCode settings page | A UI to change OpenCode's config without editing the JSON file: global instructions, compaction, MCP setup and similar. Includes the model picker's Configure footer (#29). Needs a design: OpenCode reads config from many places. | Code | Plan needed |
-| 31 | Background subagent management | No UI to list or stop background subagents. | Code | To do |
 
 ## Needs checking
 
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
+| 31 | Background subagent management | Subagent cards already showed the work. Their Stop button now works, for background and foreground subagents, through OpenCode's interrupt. A stopped card shows Zed's native cancelled state. Limit: after restarting Zed, a stopped background subagent's card shows as completed, because only this run saw the interrupt. UI-tested by the agent. | You | Needs check |
 | 25 | Steering queued messages | The native Steer button and Ctrl-Alt-S now work in OpenCode D threads. Steering hands the front queued message to OpenCode with `delivery: "steer"`, which adds it to the running turn at the next step. Undo, Stop, Clear All, delete and editing take it back (`DELETE inbox/:id`); OpenCode's `session.inbox.delivered` or `cancelled` event says which happened, so a late undo never sends it twice. Queued messages already worked. UI-tested by the agent: steer, undo, Stop, Send Now, edit, delete, and a steer at the end of a turn. | You | Needs check |
 | 32 | Install OpenCode button untested | The install flow was tested on its own but never in the running app. The user will test it. | You | Needs check |
 

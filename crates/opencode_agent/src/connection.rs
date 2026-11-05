@@ -141,6 +141,9 @@ pub struct Hub {
     sessions: RefCell<HashMap<String, SessionEntry>>,
     open_session_ids: Arc<Mutex<HashSet<String>>>,
     activity: RefCell<HashMap<String, Activity>>,
+    /// Sessions whose latest run was interrupted, so a stopped background
+    /// subagent's card shows it was cancelled.
+    interrupted: RefCell<HashSet<String>>,
     activity_listeners: RefCell<Vec<Box<dyn Fn(&str, Activity, &mut App)>>>,
     rename_listeners: RefCell<Vec<Box<dyn Fn(&str, &str, &mut App)>>>,
     mcp: Rc<mcp::McpSync>,
@@ -221,6 +224,7 @@ impl Hub {
             sessions: RefCell::default(),
             open_session_ids: Arc::default(),
             activity: RefCell::default(),
+            interrupted: RefCell::default(),
             activity_listeners: RefCell::default(),
             rename_listeners: RefCell::default(),
             catalog_versions: RefCell::default(),
@@ -356,6 +360,11 @@ impl Hub {
             _ => None,
         };
         if let Some(activity) = activity {
+            if event.kind == "session.execution.interrupted" {
+                self.interrupted.borrow_mut().insert(session_id.clone());
+            } else if activity == Activity::Running {
+                self.interrupted.borrow_mut().remove(&session_id);
+            }
             self.activity.borrow_mut().insert(session_id.clone(), activity);
             for listener in self.activity_listeners.borrow().iter() {
                 listener(&session_id, activity, cx);
@@ -698,6 +707,7 @@ impl Hub {
                 .filter(|(_, activity)| **activity == Activity::Running)
                 .map(|(id, _)| id.clone())
                 .collect();
+            let interrupted_sessions = self.interrupted.borrow().clone();
             let options = entry.options.clone();
             let streamed_shell_calls: HashSet<String> = entry
                 .shells
@@ -709,6 +719,7 @@ impl Hub {
             let context = render::RenderContext {
                 pending_permissions: &pending_permissions,
                 running_sessions: &running_sessions,
+                interrupted_sessions: &interrupted_sessions,
                 finished_shells: &finished_shells,
                 skills: &skills,
                 streamed_shell_calls: &streamed_shell_calls,
@@ -1069,7 +1080,7 @@ impl Hub {
             ActionLog::new(project.clone()).with_linked_action_log(parent_action_log)
         });
         let child = cx.new(|cx| {
-            AcpThread::new(
+            let mut child = AcpThread::new(
                 Some(parent_session_id),
                 None,
                 None,
@@ -1080,7 +1091,14 @@ impl Hub {
                 watch::Receiver::constant(acp::PromptCapabilities::default()),
                 cx,
             )
-            .agent_owned()
+            .agent_owned();
+            // OpenCode can interrupt any session, so Zed's Stop Subagent
+            // button may cancel it.
+            child.set_subagent_association(acp_thread::subagents::SubagentAssociation {
+                can_cancel: true,
+                ..Default::default()
+            });
+            child
         });
         hub.register_session(&child, &child_id, options, cx);
         let resync = Hub::resync(hub, child_id.clone(), cx);

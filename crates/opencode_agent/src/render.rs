@@ -79,6 +79,8 @@ pub(crate) struct RenderContext<'a> {
     /// Sessions the server is running, so a background subagent's card
     /// keeps spinning after its tool call returns.
     pub running_sessions: &'a HashSet<String>,
+    /// Sessions whose latest run was interrupted.
+    pub interrupted_sessions: &'a HashSet<String>,
     /// Background shell commands that finished, by shell ID.
     pub finished_shells: &'a HashMap<String, ShellOutcome>,
     /// The session's skills, to turn skill mentions into chips.
@@ -318,6 +320,8 @@ fn synthetic_note(synthetic: &TextMessage) -> String {
     format!("*{}*", note.trim())
 }
 
+const SUBAGENT_CANCELED_OUTPUT: &str = "User canceled";
+
 pub(crate) fn tool_call_update(tool: &ToolCall, context: &RenderContext) -> acp::ToolCallUpdate {
     let empty = Value::Null;
     let (input, mut status, output, metadata) = match &tool.state {
@@ -365,9 +369,14 @@ pub(crate) fn tool_call_update(tool: &ToolCall, context: &RenderContext) -> acp:
     } else if let Some(child_id) = subagent_session_id(&tool.name, &input, metadata) {
         // Zed's subagent card. A background subagent's call returns at once,
         // so the card follows the subagent session itself.
-        if status == acp::ToolCallStatus::Completed && context.running_sessions.contains(child_id)
-        {
-            status = acp::ToolCallStatus::InProgress;
+        if status == acp::ToolCallStatus::Completed {
+            if context.running_sessions.contains(child_id) {
+                status = acp::ToolCallStatus::InProgress;
+            } else if context.interrupted_sessions.contains(child_id) {
+                // What a stopped native subagent reports, which Zed's card
+                // shows as cancelled.
+                content.push(tool_text(SUBAGENT_CANCELED_OUTPUT));
+            }
         }
         update = update.meta(subagent_meta(child_id));
     } else if is_shell(&tool.name) {
@@ -390,7 +399,14 @@ pub(crate) fn tool_call_update(tool: &ToolCall, context: &RenderContext) -> acp:
     } else if let Some(diff) = file_diff(metadata, context.directory) {
         content.push(acp::ToolCallContent::Diff(diff));
     } else if let Some(output) = output {
-        content.push(tool_text(&output));
+        // A stopped foreground subagent's call fails with this error.
+        if matches!(tool.name.as_str(), "subagent" | "task")
+            && output.starts_with("Subagent cancelled")
+        {
+            content.push(tool_text(SUBAGENT_CANCELED_OUTPUT));
+        } else {
+            content.push(tool_text(&output));
+        }
     }
     if !content.is_empty() {
         update = update.content(content);
@@ -1180,6 +1196,75 @@ mod tests {
     }
 
     #[test]
+    fn a_background_subagent_card_follows_its_session() {
+        let call: ToolCall = serde_json::from_value(json!({
+            "id": "call_1", "name": "subagent",
+            "state": {
+                "status": "completed", "input": { "description": "Sleep", "background": true },
+                "content": [], "metadata": { "sessionID": "ses_child" },
+            },
+        }))
+        .expect("tool call");
+        let update = |running: &HashSet<String>, interrupted: &HashSet<String>| {
+            let (permissions, shells, streamed) = Default::default();
+            let context = RenderContext {
+                pending_permissions: &permissions,
+                running_sessions: running,
+                interrupted_sessions: interrupted,
+                finished_shells: &shells,
+                skills: &[],
+                streamed_shell_calls: &streamed,
+                directory: Path::new("/project"),
+            };
+            tool_call_update(&call, &context)
+        };
+        let child: HashSet<String> = ["ses_child".to_string()].into_iter().collect();
+        let none = HashSet::default();
+        let status = |update: acp::ToolCallUpdate| update.status.as_opt_ref().flatten().cloned();
+
+        assert_eq!(
+            status(update(&child, &none)),
+            Some(acp::ToolCallStatus::InProgress)
+        );
+        assert_eq!(
+            status(update(&none, &none)),
+            Some(acp::ToolCallStatus::Completed)
+        );
+        let stopped = update(&none, &child);
+        assert_eq!(
+            stopped.content.as_opt_ref().flatten(),
+            Some(&vec![tool_text(SUBAGENT_CANCELED_OUTPUT)])
+        );
+        assert_eq!(status(stopped), Some(acp::ToolCallStatus::Completed));
+
+        let foreground: ToolCall = serde_json::from_value(json!({
+            "id": "call_2", "name": "subagent",
+            "state": {
+                "status": "error", "input": { "description": "Sleep" },
+                "error": { "message": "Subagent cancelled (sessionID: ses_child)" },
+            },
+        }))
+        .expect("tool call");
+        let (permissions, shells, streamed) = Default::default();
+        let context = RenderContext {
+            pending_permissions: &permissions,
+            running_sessions: &none,
+            interrupted_sessions: &none,
+            finished_shells: &shells,
+            skills: &[],
+            streamed_shell_calls: &streamed,
+            directory: Path::new("/project"),
+        };
+        assert_eq!(
+            tool_call_update(&foreground, &context)
+                .content
+                .as_opt_ref()
+                .flatten(),
+            Some(&vec![tool_text(SUBAGENT_CANCELED_OUTPUT)])
+        );
+    }
+
+    #[test]
     fn a_streamed_shell_keeps_its_output_when_it_ends() {
         let failed = shell_call(json!({
             "status": "error", "input": { "command": "make" }, "error": { "message": "Command cancelled" },
@@ -1188,6 +1273,7 @@ mod tests {
         let context = RenderContext {
             pending_permissions: &HashSet::default(),
             running_sessions: &HashSet::default(),
+            interrupted_sessions: &HashSet::default(),
             finished_shells: &HashMap::default(),
             skills: &[],
             streamed_shell_calls: &streamed,
@@ -1254,6 +1340,7 @@ mod tests {
         let context = RenderContext {
             pending_permissions: &HashSet::default(),
             running_sessions: &HashSet::default(),
+            interrupted_sessions: &HashSet::default(),
             finished_shells: &HashMap::default(),
             skills: &[],
             streamed_shell_calls: &HashSet::default(),
@@ -1417,6 +1504,7 @@ mod tests {
         let context = RenderContext {
             pending_permissions: &permissions,
             running_sessions: &running,
+            interrupted_sessions: &HashSet::default(),
             finished_shells: &shells,
             skills: &skills,
             streamed_shell_calls: &streamed,
@@ -1437,6 +1525,7 @@ mod tests {
         let context = RenderContext {
             pending_permissions: &HashSet::default(),
             running_sessions: &HashSet::default(),
+            interrupted_sessions: &HashSet::default(),
             finished_shells: &HashMap::default(),
             skills: &[],
             streamed_shell_calls: &HashSet::default(),
