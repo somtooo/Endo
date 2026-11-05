@@ -74,7 +74,15 @@ const LIFECYCLE_EVENTS: &[&str] = &[
 /// Sent for a directory when its commands or skills change. The first request
 /// for a directory the server hasn't loaded yet can return empty lists, so
 /// these also mark the end of that load.
-const CATALOG_EVENTS: &[&str] = &["command.updated", "skill.updated", "agent.updated"];
+const CATALOG_EVENTS: &[&str] = &[
+    "command.updated",
+    "skill.updated",
+    "agent.updated",
+    "model.updated",
+    "provider.updated",
+    "integration.updated",
+    "credential.updated",
+];
 
 enum PumpMessage {
     Connected,
@@ -495,35 +503,53 @@ impl Hub {
         }
         let client = self.client.clone();
         let hub = Rc::downgrade(self);
-        let task = cx.spawn({
-            let directory = directory.clone();
-            async move |cx| {
-                let (commands, skills, agents) = futures::join!(
-                    client.commands(&directory),
-                    client.skills(&directory),
-                    client.agents(&directory)
-                );
-                // On failure the threads keep the lists they have.
-                let (Some(commands), Some(mut skills), Some(agents)) =
-                    (commands.log_err(), skills.log_err(), agents.log_err())
-                else {
-                    return;
-                };
-                let skills = cx
-                    .background_spawn({
-                        let directory = PathBuf::from(&directory);
-                        async move {
-                            prepare_skills(&mut skills, &directory);
-                            skills
-                        }
-                    })
-                    .await;
-                let Some(hub) = hub.upgrade() else {
-                    return;
-                };
-                cx.update(|cx| hub.apply_catalog(&directory, &commands, skills, agents, cx));
-            }
-        });
+        let task =
+            cx.spawn({
+                let directory = directory.clone();
+                async move |cx| {
+                    let (commands, skills, agents, models, providers) = futures::join!(
+                        client.commands(&directory),
+                        client.skills(&directory),
+                        client.agents(&directory),
+                        client.models(&directory),
+                        client.providers(&directory)
+                    );
+                    // On failure the threads keep the lists they have.
+                    let (
+                        Some(commands),
+                        Some(mut skills),
+                        Some(agents),
+                        Some(models),
+                        Some(providers),
+                    ) = (
+                        commands.log_err(),
+                        skills.log_err(),
+                        agents.log_err(),
+                        models.log_err(),
+                        providers.log_err(),
+                    )
+                    else {
+                        return;
+                    };
+                    let skills = cx
+                        .background_spawn({
+                            let directory = PathBuf::from(&directory);
+                            async move {
+                                prepare_skills(&mut skills, &directory);
+                                skills
+                            }
+                        })
+                        .await;
+                    let Some(hub) = hub.upgrade() else {
+                        return;
+                    };
+                    cx.update(|cx| {
+                        hub.apply_catalog(
+                            &directory, &commands, skills, agents, models, providers, cx,
+                        )
+                    });
+                }
+            });
         self.catalog_refreshes.borrow_mut().insert(directory, task);
     }
 
@@ -533,6 +559,8 @@ impl Hub {
         commands: &[NamedItem],
         skills: Vec<Skill>,
         agents: Vec<AgentInfo>,
+        models: Vec<ModelInfo>,
+        providers: Vec<ProviderInfo>,
         cx: &mut App,
     ) {
         let names: HashSet<String> = commands.iter().map(|command| command.name.clone()).collect();
@@ -545,7 +573,9 @@ impl Hub {
                 *entry.options.commands.borrow_mut() = names.clone();
                 *entry.options.skills.borrow_mut() = skills.clone();
                 *entry.options.agents.borrow_mut() = agents.clone();
-                // Updates the profile picker.
+                *entry.options.models.borrow_mut() = models.clone();
+                *entry.options.providers.borrow_mut() = providers.clone();
+                // Updates the profile and model pickers.
                 entry.options.tx.borrow_mut().send(()).log_err();
                 entry.thread.upgrade()
             })
@@ -1001,7 +1031,7 @@ impl Hub {
                 return;
             };
             let model = model.unwrap_or_else(|| entry.options.model.borrow().clone());
-            let models = &entry.options.models;
+            let models = entry.options.models.borrow();
             let Some(size) = models
                 .iter()
                 .find(|info| info.provider_id == model.provider_id && info.id == model.id)
@@ -1718,8 +1748,8 @@ fn state_update(activity: Activity) -> acp::StateUpdate {
 struct SessionOptions {
     session_id: String,
     client: OpenCodeClient,
-    models: Vec<ModelInfo>,
-    providers: Vec<ProviderInfo>,
+    models: RefCell<Vec<ModelInfo>>,
+    providers: RefCell<Vec<ProviderInfo>>,
     agents: RefCell<Vec<AgentInfo>>,
     model: RefCell<ModelRef>,
     agent: RefCell<String>,
@@ -1749,18 +1779,19 @@ const EFFORT_OPTION: &str = "effort";
 const MODE_OPTION: &str = "mode";
 
 impl SessionOptions {
-    fn current_model(&self) -> Option<&ModelInfo> {
+    fn current_model(&self) -> Option<ModelInfo> {
         let model = self.model.borrow();
-        find_model(&self.models, &model.provider_id, &model.id)
+        find_model(&self.models.borrow(), &model.provider_id, &model.id).cloned()
     }
 
     /// Grouped by provider like the native picker, providers and models in
     /// name order.
     fn model_list(&self) -> AgentModelList {
-        let mut models: Vec<&ModelInfo> = self.models.iter().collect();
+        let all_models = self.models.borrow();
+        let mut models: Vec<&ModelInfo> = all_models.iter().collect();
         models.sort_by(|left, right| {
             self.provider_name(&left.provider_id)
-                .cmp(self.provider_name(&right.provider_id))
+                .cmp(&self.provider_name(&right.provider_id))
                 .then_with(|| left.provider_id.cmp(&right.provider_id))
                 .then_with(|| left.name.cmp(&right.name))
         });
@@ -1768,7 +1799,7 @@ impl SessionOptions {
         for info in models {
             groups
                 .entry(AgentModelGroupName(
-                    self.provider_name(&info.provider_id).to_string().into(),
+                    self.provider_name(&info.provider_id).into(),
                 ))
                 .or_default()
                 .push(model_info(info));
@@ -1780,7 +1811,7 @@ impl SessionOptions {
     /// list, say after its provider was disconnected.
     fn selected_model_info(&self) -> AgentModelInfo {
         if let Some(info) = self.current_model() {
-            return model_info(info);
+            return model_info(&info);
         }
         let model = self.model.borrow();
         AgentModelInfo {
@@ -1794,11 +1825,13 @@ impl SessionOptions {
         }
     }
 
-    fn provider_name<'a>(&'a self, provider_id: &'a str) -> &'a str {
+    fn provider_name(&self, provider_id: &str) -> String {
         self.providers
+            .borrow()
             .iter()
             .find(|provider| provider.id == provider_id)
             .map_or(provider_id, |provider| provider.name.as_str())
+            .to_string()
     }
 
     /// Tells the pickers the session's options changed. The thread's view
@@ -2133,9 +2166,8 @@ impl AgentModelSelector for ModelPicker {
 
     fn select_model(&self, model_id: AgentModelId, cx: &mut App) -> Task<Result<()>> {
         let value = model_id.to_string();
-        let Some(info) = self
-            .options
-            .models
+        let models = self.options.models.borrow();
+        let Some(info) = models
             .iter()
             .find(|info| model_value(&info.provider_id, &info.id) == value)
         else {
@@ -2310,11 +2342,12 @@ impl OpenCodeConnection {
         let options = &sessions.get(session_id)?.options;
         let mut models: Vec<crate::agents_modal::ModelChoice> = options
             .models
+            .borrow()
             .iter()
             .map(|info| crate::agents_modal::ModelChoice {
                 value: model_value(&info.provider_id, &info.id),
                 name: info.name.clone().into(),
-                provider: options.provider_name(&info.provider_id).to_string().into(),
+                provider: options.provider_name(&info.provider_id).into(),
             })
             .collect();
         models.sort_by(|left, right| {
@@ -2457,8 +2490,8 @@ impl OpenCodeConnection {
             let options = Rc::new(SessionOptions {
                 session_id: session.id.clone(),
                 client: client.clone(),
-                models,
-                providers: providers.log_err().unwrap_or_default(),
+                models: RefCell::new(models),
+                providers: RefCell::new(providers.log_err().unwrap_or_default()),
                 agents: RefCell::new(agents),
                 model: RefCell::new(model),
                 agent: RefCell::new(agent),
@@ -3286,7 +3319,7 @@ mod tests {
                 &model_ref("opencode", "glm", Some("high")),
                 "build"
             ),
-            (current.clone(), "build".to_string())
+            (current, "build".to_string())
         );
         // The same model keeps its variant when no effort was saved.
         let with_variant = model_ref("opencode", "glm", Some("low"));
