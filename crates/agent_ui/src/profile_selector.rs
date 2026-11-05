@@ -155,6 +155,9 @@ impl ProfileSelector {
                     picker
                         .delegate
                         .refresh_profiles(profiles.clone(), query, cx);
+                    // The list keeps its old length until the picker
+                    // recounts its matches.
+                    picker.refresh(window, cx);
                 });
             }
             self.pending_refresh = false;
