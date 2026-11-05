@@ -751,21 +751,20 @@ impl Hub {
                     if !edits.is_empty() && entry.tracked_edits.insert(tool.id.clone()) && !is_history {
                         edited_files.extend(edits);
                     }
-                    let Some((shell_id, running)) = render::live_shell(tool, &finished_shells)
-                    else {
-                        continue;
-                    };
-                    match entry.shells.get_mut(&tool.id) {
+                    // A finished call may no longer name its shell, so this
+                    // can't depend on the call still having a shell ID.
+                    let live_shell =
+                        render::live_shell(tool, &finished_shells).filter(|(_, running)| *running);
+                    match (entry.shells.get_mut(&tool.id), live_shell) {
                         // The render above showed the final output, so
                         // streaming it as well would repeat it.
-                        Some(shell) if !running && !shell.streamed => shell.closed = true,
-                        Some(_) => {}
-                        None if running => new_shells.push((
+                        (Some(shell), None) if !shell.streamed => shell.closed = true,
+                        (None, Some((shell_id, _))) => new_shells.push((
                             tool.id.clone(),
                             shell_id.to_string(),
                             render::terminal_id(tool),
                         )),
-                        None => {}
+                        _ => {}
                     }
                 }
                 for child_id in subagent_children(message) {

@@ -1175,6 +1175,13 @@ mod tests {
         }));
         assert_eq!(live_shell(&foreground, &finished), Some(("sh_1", true)));
 
+        // How OpenCode reports a finished foreground command: no shell ID.
+        let finished_foreground = shell_call(json!({
+            "status": "completed", "input": { "command": "make" }, "content": [],
+            "metadata": { "status": "completed", "exit": 0 },
+        }));
+        assert_eq!(live_shell(&finished_foreground, &finished), None);
+
         let background = shell_call(json!({
             "status": "completed", "input": { "command": "make", "background": true }, "content": [],
             "metadata": { "status": "running", "shellID": "sh_2" },
