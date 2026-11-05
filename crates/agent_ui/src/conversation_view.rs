@@ -1657,30 +1657,11 @@ impl ConversationView {
             // Use config options - don't create mode_selector or model_selector
             let agent_server = self.agent.clone();
             let fs = self.project.read(cx).fs().clone();
-            // An agent whose options leave out the model can offer the
-            // native model picker instead.
-            let has_model_option = config_options.config_options().iter().any(|option| {
-                option.category == Some(acp_v2::SessionConfigOptionCategory::Model)
-            });
             config_options_view =
                 Some(cx.new(|cx| {
                     ConfigOptionsView::new(config_options, agent_server, fs, window, cx)
                 }));
-            model_selector = if has_model_option {
-                None
-            } else {
-                connection.model_selector(&session_id).map(|selector| {
-                    cx.new(|cx| {
-                        ModelSelectorPopover::new(
-                            selector,
-                            PopoverMenuHandle::default(),
-                            self.focus_handle(cx),
-                            window,
-                            cx,
-                        )
-                    })
-                })
-            };
+            model_selector = None;
             mode_selector = None;
         } else {
             // Fall back to dedicated mode/model selectors
@@ -1729,14 +1710,13 @@ impl ConversationView {
             connection.clone().downcast();
         let profile_selector = profile_selector
             .and_then(|native_connection| native_connection.thread(&session_id, cx))
-            .map(|native_thread| {
+            .map(|native_thread| Arc::new(native_thread) as Arc<dyn ProfileProvider>)
+            .or_else(|| {
+                crate::agent_menu_providers::provided_profiles(&connection, &session_id, cx)
+            })
+            .map(|provider| {
                 cx.new(|cx| {
-                    ProfileSelector::new(
-                        <dyn Fs>::global(cx),
-                        Arc::new(native_thread),
-                        self.focus_handle(cx),
-                        cx,
-                    )
+                    ProfileSelector::new(<dyn Fs>::global(cx), provider, self.focus_handle(cx), cx)
                 })
             });
 

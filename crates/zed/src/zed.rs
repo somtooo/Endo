@@ -6301,6 +6301,7 @@ mod tests {
                 "new_process_modal",
                 "notebook",
                 "onboarding",
+                "opencode_d",
                 "outline",
                 "outline_panel",
                 "pane",

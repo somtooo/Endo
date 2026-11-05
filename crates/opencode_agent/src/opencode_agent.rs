@@ -1,9 +1,11 @@
+mod agents_modal;
 mod client;
 mod connection;
 mod form;
 mod history;
 mod install;
 mod mcp;
+mod opencode_config;
 mod render;
 mod service;
 mod session_sync;
@@ -84,6 +86,17 @@ pub fn init(http: Arc<dyn http_client::HttpClient>, cx: &mut App) {
         }),
         cx,
     );
+    agent_ui::agent_menu_providers::register_profiles_provider(
+        AgentId::new(AGENT_ID),
+        Rc::new(|connection, session_id, _cx| {
+            connection
+                .clone()
+                .downcast::<OpenCodeConnection>()?
+                .profiles(&session_id.0)
+        }),
+        cx,
+    );
+    agents_modal::init(cx);
     agent_ui::agent_menu_providers::register_thread_text_provider(
         AgentId::new(AGENT_ID),
         Rc::new({

@@ -1,8 +1,9 @@
 //! Lets agents built outside this crate fill the `/` and `@` menus and drive
-//! the thinking control, which are otherwise native-only. Kept in its own
+//! the thinking control and profile picker, which are otherwise native-only. Kept in its own
 //! file so the native code paths only gain a fallback line each.
 
 use crate::completion_provider::AvailableSkill;
+use crate::profile_selector::ProfileProvider;
 use crate::thread_metadata_store::ThreadMetadataStore;
 use acp_thread::AgentConnection;
 use agent_client_protocol::v2::schema as acp;
@@ -11,7 +12,7 @@ use collections::HashMap;
 use gpui::{App, Global, Task};
 use language_model::LanguageModelEffortLevel;
 use project::AgentId;
-use std::rc::Rc;
+use std::{rc::Rc, sync::Arc};
 
 /// Lists a session's skills. Read synchronously, so the agent must have them
 /// ready before it reports its commands.
@@ -39,11 +40,17 @@ pub trait AgentThinking {
 pub type ThinkingProvider =
     Rc<dyn Fn(&Rc<dyn AgentConnection>, &acp::SessionId, &App) -> Option<Rc<dyn AgentThinking>>>;
 
+/// Gives a session's profiles, shown with the native profile picker in place
+/// of the agent's mode option.
+pub type ProfilesProvider =
+    Rc<dyn Fn(&Rc<dyn AgentConnection>, &acp::SessionId, &App) -> Option<Arc<dyn ProfileProvider>>>;
+
 #[derive(Default)]
 struct AgentMenuProviders {
     skills: HashMap<AgentId, SkillsProvider>,
     thread_text: HashMap<AgentId, ThreadTextProvider>,
     thinking: HashMap<AgentId, ThinkingProvider>,
+    profiles: HashMap<AgentId, ProfilesProvider>,
 }
 
 impl Global for AgentMenuProviders {}
@@ -68,6 +75,25 @@ pub fn register_thinking_provider(agent_id: AgentId, provider: ThinkingProvider,
     cx.default_global::<AgentMenuProviders>()
         .thinking
         .insert(agent_id, provider);
+}
+
+pub fn register_profiles_provider(agent_id: AgentId, provider: ProfilesProvider, cx: &mut App) {
+    cx.default_global::<AgentMenuProviders>()
+        .profiles
+        .insert(agent_id, provider);
+}
+
+pub(crate) fn provided_profiles(
+    connection: &Rc<dyn AgentConnection>,
+    session_id: &acp::SessionId,
+    cx: &App,
+) -> Option<Arc<dyn ProfileProvider>> {
+    let provider = cx
+        .try_global::<AgentMenuProviders>()?
+        .profiles
+        .get(&connection.agent_id())?
+        .clone();
+    provider(connection, session_id, cx)
 }
 
 pub(crate) fn provided_thinking(

@@ -5909,9 +5909,16 @@ impl AgentPanel {
                                 }
                             }
 
-                            menu = menu
-                                .separator()
-                                .action("Profiles", Box::new(ManageProfiles::default()));
+                            // Agents with their own profiles configure them their own way.
+                            let manage_profiles = conversation_view
+                                .as_ref()
+                                .and_then(|view| view.read(cx).root_thread_view())
+                                .and_then(|view| {
+                                    let selector = view.read(cx).profile_selector.as_ref()?;
+                                    Some(selector.read(cx).configure_action())
+                                })
+                                .unwrap_or_else(|| Box::new(ManageProfiles::default()));
+                            menu = menu.separator().action("Profiles", manage_profiles);
                         }
 
                         menu = menu

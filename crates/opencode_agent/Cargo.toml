@@ -27,25 +27,30 @@ chrono.workspace = true
 collections.workspace = true
 db.workspace = true
 diffy.workspace = true
+editor.workspace = true
 extension_host.workspace = true
 fs.workspace = true
 futures.workspace = true
 gpui.workspace = true
-paths.workspace = true
 http_client.workspace = true
 language_model.workspace = true
 log.workspace = true
+menu.workspace = true
+paths.workspace = true
+picker.workspace = true
 project.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
+settings_json = { workspace = true, features = ["editing"] }
 sha2.workspace = true
 smol.workspace = true
 ui.workspace = true
 util.workspace = true
 watch.workspace = true
 which.workspace = true
+workspace.workspace = true
 
 [dev-dependencies]
 reqwest_client.workspace = true

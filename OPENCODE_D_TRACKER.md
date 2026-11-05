@@ -23,10 +23,10 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
 | 6 | Agent-done notifications on Wayland | On Wayland, agent and terminal notifications go through D-Bus, for `primary_screen` and `all_screens`. User-tested on the desktop. | You, Code | Done |
-| 7 | Profiles and the Build/Plan picker | The picker isn't the native one: no search, no Configure button. The Profiles menu lists Zed's Ask, Minimal and Write, which do nothing here. Configuring means writing to OpenCode's settings. | You | Plan needed |
-| 8 | Permissions | OpenCode enforces its own `permission` config and asks through `permission.asked`, shown in the native prompt. Zed's Tool Permissions and sandbox apply only to the native agent. Decide what Settings should say or do for OpenCode D. | Tester, Code | Plan needed |
-| 9 | Todo tool UI | OpenCode has a todo tool and Zed has no native UI for it. Second goal. | You | Plan needed |
-| 10 | Checkpoint restore | Not a gap: upstream removed it for every agent (`eee7501970`, #65989). OpenCode's revert could bring it back. Second goal. | Code | Plan needed |
+| 7 | Profiles and the Build/Plan picker | OpenCode D threads use Zed's native profile picker (search, descriptions, Configure) listing OpenCode's primary agents. Configure, the panel menu's Profiles item and the Manage Profiles shortcut open an OpenCode Agents modal: fork, default model, tool permissions, delete. It writes OpenCode's global config, never Zed's profiles. The list refreshes on OpenCode's `agent.updated` event. UI-tested by agents; waiting on the user. | You | Needs check |
+| 8 | Permissions | Per agent and for all agents, each tool is Allow, Ask or Deny in the OpenCode Agents modal, written to OpenCode's global config (`agent.<id>.permission`, `permission`). Ask uses the native permission prompt. The Tool Permissions settings page now says OpenCode D uses OpenCode's own permissions and where to set them. UI-tested by agents: Ask prompts, Deny refuses. Known limit, from OpenCode: denying Edit Files doesn't stop edits made through shell commands; deny Run Shell Commands too. Waiting on the user. | Tester, Code | Needs check |
+| 9 | Todo tool UI | OpenCode has a todo tool, but Zed has no native todo UI for any agent, so there is nothing to reach parity with. Tabled by the user. | You | Archived |
+| 10 | Checkpoint restore | Not needed: upstream removed it for every agent (`eee7501970`, #65989). | Code | Won't fix |
 
 ## Needs checking
 
@@ -37,8 +37,8 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 | 13 | Token fix: multi-step turn | Tokens added up across steps, matching the service. | — | Done |
 | 14 | Thread following while streaming | Not a gap: Zed deliberately pins your message to the top while a reply streams (`ResponseAnchorPhase`), and OpenCode D uses the same view. | — | Won't fix |
 | 15 | Model turn after a failed compact | OpenCode's service, not Zed: Zed only sends `POST /compact`, and `Session.compact` then wakes its execution loop. | Tester | Won't fix |
-| 16 | `/goal` database-open error | Seen once in a private run, so it may be the test setup. | Tester | Needs check |
-| 17 | Folder reads log errors | `reading bytes of the file` in the log. Check with `zed: open log`. Low priority. | Tester | Needs check |
+| 16 | `/goal` database-open error | User confirmed `/goal` works. | Tester | Done |
+| 17 | Folder reads log errors | Zed tried to open a folder the agent read as if it were a file. OpenCode D skipped folders only when the output said "Read directory", but that's OpenCode's title, not its output. It now skips any path that is a folder on disk. Unit tested. UI-tested: no errors after reading a folder. | Tester | Done |
 | 18 | Usage meter | A tester reported none, but screenshots show a circle beside the Build picker, probably the context meter. Likely a false report. | Tester | Needs check |
 
 ## Done or closed

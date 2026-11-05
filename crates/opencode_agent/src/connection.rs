@@ -19,7 +19,7 @@ use crate::types::{
 };
 use acp_thread::{
     AcpThread, AgentConnection, AgentModelGroupName, AgentModelIcon, AgentModelId, AgentModelInfo,
-    AgentModelList, AgentModelSelector, AgentSessionConfigOptions, AgentSessionInfo, AgentSessionList,
+    AgentModelList, AgentModelSelector, AgentSessionInfo, AgentSessionList,
     AgentSessionListRequest, AgentSessionListResponse, AgentSessionSetTitle, AgentSessionTruncate,
     AuthorizationKind, ClientUserMessageId, MentionUri, PermissionOptions, ReceiptSessionSubmissions,
     ReceiptSubmission, RequestPermissionOutcome, SelectedPermissionOutcome,
@@ -27,6 +27,8 @@ use acp_thread::{
 use action_log::{ActionLog, ExternalEditKind};
 use agent_servers::{AgentServer as _, CustomAgentServer};
 use agent_ui::AvailableSkill;
+use agent_settings::{AgentProfileId, AvailableProfiles};
+use agent_ui::ProfileProvider;
 use agent_ui::agent_menu_providers::AgentThinking;
 use agent_client_protocol::v2::schema as acp;
 use anyhow::{Context as _, Result, anyhow};
@@ -72,7 +74,7 @@ const LIFECYCLE_EVENTS: &[&str] = &[
 /// Sent for a directory when its commands or skills change. The first request
 /// for a directory the server hasn't loaded yet can return empty lists, so
 /// these also mark the end of that load.
-const CATALOG_EVENTS: &[&str] = &["command.updated", "skill.updated"];
+const CATALOG_EVENTS: &[&str] = &["command.updated", "skill.updated", "agent.updated"];
 
 enum PumpMessage {
     Connected,
@@ -316,9 +318,14 @@ impl Hub {
 
     fn handle_event(self: &Rc<Self>, event: Event, cx: &mut App) {
         if CATALOG_EVENTS.contains(&event.kind.as_str()) {
+            // A change to a global config file comes tagged with the config
+            // folder, which no thread is open in, but applies to them all.
+            let open_directories = self.open_directories();
             let directories = match event.location {
-                Some(location) => vec![location.directory],
-                None => self.open_directories(),
+                Some(location) if open_directories.contains(&location.directory) => {
+                    vec![location.directory]
+                }
+                _ => open_directories,
             };
             for directory in directories {
                 *self
@@ -425,10 +432,14 @@ impl Hub {
         let task = cx.spawn({
             let directory = directory.clone();
             async move |cx| {
-                let (commands, skills) =
-                    futures::join!(client.commands(&directory), client.skills(&directory));
+                let (commands, skills, agents) = futures::join!(
+                    client.commands(&directory),
+                    client.skills(&directory),
+                    client.agents(&directory)
+                );
                 // On failure the threads keep the lists they have.
-                let (Some(commands), Some(mut skills)) = (commands.log_err(), skills.log_err())
+                let (Some(commands), Some(mut skills), Some(agents)) =
+                    (commands.log_err(), skills.log_err(), agents.log_err())
                 else {
                     return;
                 };
@@ -444,7 +455,7 @@ impl Hub {
                 let Some(hub) = hub.upgrade() else {
                     return;
                 };
-                cx.update(|cx| hub.apply_catalog(&directory, &commands, skills, cx));
+                cx.update(|cx| hub.apply_catalog(&directory, &commands, skills, agents, cx));
             }
         });
         self.catalog_refreshes.borrow_mut().insert(directory, task);
@@ -455,6 +466,7 @@ impl Hub {
         directory: &str,
         commands: &[NamedItem],
         skills: Vec<Skill>,
+        agents: Vec<AgentInfo>,
         cx: &mut App,
     ) {
         let names: HashSet<String> = commands.iter().map(|command| command.name.clone()).collect();
@@ -466,6 +478,9 @@ impl Hub {
             .filter_map(|entry| {
                 *entry.options.commands.borrow_mut() = names.clone();
                 *entry.options.skills.borrow_mut() = skills.clone();
+                *entry.options.agents.borrow_mut() = agents.clone();
+                // Updates the profile picker.
+                entry.options.tx.borrow_mut().send(()).log_err();
                 entry.thread.upgrade()
             })
             .collect();
@@ -1631,7 +1646,7 @@ struct SessionOptions {
     client: OpenCodeClient,
     models: Vec<ModelInfo>,
     providers: Vec<ProviderInfo>,
-    agents: Vec<AgentInfo>,
+    agents: RefCell<Vec<AgentInfo>>,
     model: RefCell<ModelRef>,
     agent: RefCell<String>,
     /// The effort to return to when thinking is turned back on.
@@ -1660,33 +1675,6 @@ const EFFORT_OPTION: &str = "effort";
 const MODE_OPTION: &str = "mode";
 
 impl SessionOptions {
-    /// Only the agent: the model and effort have native controls.
-    fn options(&self) -> Vec<acp::SessionConfigOption> {
-        let agents: Vec<&AgentInfo> = self
-            .agents
-            .iter()
-            .filter(|agent| is_selectable_agent(agent))
-            .collect();
-        if agents.is_empty() {
-            return Vec::new();
-        }
-        vec![
-            acp::SessionConfigOption::select(
-                MODE_OPTION,
-                "Session Mode",
-                self.agent.borrow().clone(),
-                agents
-                    .into_iter()
-                    .map(|agent| {
-                        acp::SessionConfigSelectOption::new(agent.id.as_str(), agent.name.as_str())
-                            .description(agent.description.clone())
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .category(acp::SessionConfigOptionCategory::Mode),
-        ]
-    }
-
     fn current_model(&self) -> Option<&ModelInfo> {
         let model = self.model.borrow();
         find_model(&self.models, &model.provider_id, &model.id)
@@ -1739,12 +1727,14 @@ impl SessionOptions {
             .map_or(provider_id, |provider| provider.name.as_str())
     }
 
+    /// Tells the pickers the session's options changed. The thread's view
+    /// redraws on `ConfigOptionsUpdated`; OpenCode D has no ACP config
+    /// options, so the list is empty.
     fn publish(&self, thread: &WeakEntity<AcpThread>, cx: &mut App) {
         self.tx.borrow_mut().send(()).log_err();
-        let options = self.options();
         thread
             .update(cx, |_, cx| {
-                cx.emit(acp_thread::AcpThreadEvent::ConfigOptionsUpdated(options))
+                cx.emit(acp_thread::AcpThreadEvent::ConfigOptionsUpdated(Vec::new()))
             })
             .log_err();
     }
@@ -1787,6 +1777,20 @@ impl SessionOptions {
         });
         model
     }
+}
+
+/// OpenCode names a custom agent by its ID, like `code-review`, which reads
+/// better as "Code Review".
+pub(crate) fn agent_display_name(agent: &AgentInfo) -> String {
+    if agent.name == agent.id {
+        title_case(&agent.id)
+    } else {
+        agent.name.clone()
+    }
+}
+
+pub(crate) fn agent_display_name_for_id(agent_id: &str) -> String {
+    title_case(agent_id)
 }
 
 fn is_selectable_agent(agent: &AgentInfo) -> bool {
@@ -1874,41 +1878,116 @@ fn title_case(value: &str) -> String {
         .join(" ")
 }
 
-struct SessionConfig {
+/// Agents OpenCode ships with, listed ahead of the user's own.
+const BUILT_IN_AGENTS: &[&str] = &["build", "plan"];
+
+/// Feeds Zed's native profile picker with OpenCode's primary agents.
+struct AgentProfiles {
     options: Rc<SessionOptions>,
     thread: WeakEntity<AcpThread>,
 }
 
-impl AgentSessionConfigOptions for SessionConfig {
-    fn config_options(&self) -> Vec<acp::SessionConfigOption> {
-        self.options.options()
+impl ProfileProvider for AgentProfiles {
+    fn profile_id(&self, _cx: &App) -> AgentProfileId {
+        AgentProfileId(self.options.agent.borrow().clone().into())
     }
 
-    fn watch(&self, _cx: &mut App) -> Option<watch::Receiver<()>> {
-        Some(self.options.rx.clone())
-    }
-
-    fn set_config_option(
-        &self,
-        config_id: acp::SessionConfigId,
-        value: acp::SessionConfigOptionValue,
-        cx: &mut App,
-    ) -> Task<Result<Vec<acp::SessionConfigOption>>> {
-        let acp::SessionConfigOptionValue::Id { value } = value else {
-            return Task::ready(Err(anyhow!("unsupported option value")));
-        };
-        if config_id.0.as_ref() != MODE_OPTION {
-            return Task::ready(Err(anyhow!("unknown option {config_id}")));
+    /// Shows the pick right away, and goes back if the server refuses it.
+    fn set_profile(&self, profile_id: AgentProfileId, cx: &mut App) {
+        let agent = profile_id.0.to_string();
+        let previous = self.options.agent.replace(agent.clone());
+        if previous == agent {
+            return;
         }
-        let agent = value.0.to_string();
+        self.options.publish(&self.thread, cx);
         let options = self.options.clone();
         let thread = self.thread.clone();
         cx.spawn(async move |cx| {
-            options.client.set_agent(&options.session_id, &agent).await?;
-            *options.agent.borrow_mut() = agent;
-            cx.update(|cx| options.publish(&thread, cx));
-            Ok(options.options())
+            let result = options.client.set_agent(&options.session_id, &agent).await;
+            if result.is_err() {
+                cx.update(|cx| {
+                    // A later pick stands.
+                    if *options.agent.borrow() == agent {
+                        *options.agent.borrow_mut() = previous;
+                        options.publish(&thread, cx);
+                    }
+                });
+            }
+            result
         })
+        .detach_and_log_err(cx);
+    }
+
+    fn profiles_supported(&self, _cx: &App) -> bool {
+        true
+    }
+
+    fn model_selected(&self, _cx: &App) -> bool {
+        true
+    }
+
+    /// The session's agent is listed even when it can't be picked, say after
+    /// it was deleted, so the picker can still name it.
+    fn available_profiles(&self, _cx: &App) -> AvailableProfiles {
+        let mut profiles: AvailableProfiles = self
+            .options
+            .agents
+            .borrow()
+            .iter()
+            .filter(|agent| is_selectable_agent(agent))
+            .map(|agent| {
+                (
+                    AgentProfileId(agent.id.clone().into()),
+                    SharedString::from(agent_display_name(agent)),
+                )
+            })
+            .collect();
+        let current = self.options.agent.borrow().clone();
+        let current_id = AgentProfileId(current.clone().into());
+        if !profiles.contains_key(&current_id) {
+            let name = self
+                .options
+                .agents
+                .borrow()
+                .iter()
+                .find(|agent| agent.id == current)
+                .map_or_else(|| title_case(&current), agent_display_name);
+            profiles.insert(current_id, name.into());
+        }
+        // Built-in agents first, like Zed's own profiles.
+        profiles.sort_by_cached_key(|id, _| !BUILT_IN_AGENTS.contains(&id.as_str()));
+        profiles
+    }
+
+    fn is_builtin_profile(&self, profile_id: &AgentProfileId) -> bool {
+        BUILT_IN_AGENTS.contains(&profile_id.as_str())
+    }
+
+    fn profile_description(&self, profile_id: &AgentProfileId, _cx: &App) -> Option<SharedString> {
+        self.options
+            .agents
+            .borrow()
+            .iter()
+            .find(|agent| agent.id == profile_id.as_str())
+            .and_then(|agent| agent.description.clone())
+            .map(SharedString::from)
+    }
+
+    fn save_default_profile(&self, profile_id: AgentProfileId, fs: Arc<dyn Fs>, cx: &mut App) {
+        agent_server().set_default_config_option(
+            MODE_OPTION,
+            Some(AgentConfigOptionValue::ValueId(profile_id.0.to_string())),
+            fs,
+            cx,
+        );
+    }
+
+    fn configure_action(&self) -> Box<dyn gpui::Action> {
+        Box::new(crate::agents_modal::ManageAgents)
+    }
+
+    fn profiles_changed(&self) -> Option<watch::Receiver<()>> {
+        Some(self.options.rx.clone())
     }
 }
 
@@ -2152,6 +2231,42 @@ impl OpenCodeConnection {
         })
     }
 
+    pub(crate) fn modal_source(&self, session_id: &str) -> Option<crate::agents_modal::ModalSource> {
+        let sessions = self.hub.sessions.borrow();
+        let options = &sessions.get(session_id)?.options;
+        let mut models: Vec<crate::agents_modal::ModelChoice> = options
+            .models
+            .iter()
+            .map(|info| crate::agents_modal::ModelChoice {
+                value: model_value(&info.provider_id, &info.id),
+                name: info.name.clone().into(),
+                provider: options.provider_name(&info.provider_id).to_string().into(),
+            })
+            .collect();
+        models.sort_by(|left, right| {
+            left.provider
+                .cmp(&right.provider)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        Some(crate::agents_modal::ModalSource {
+            client: options.client.clone(),
+            directory: options.directory.clone(),
+            models,
+        })
+    }
+
+    pub fn profiles(&self, session_id: &str) -> Option<Arc<dyn ProfileProvider>> {
+        let sessions = self.hub.sessions.borrow();
+        let entry = sessions.get(session_id)?;
+        // The picker's trait takes an `Arc`, though it only ever runs on the
+        // main thread.
+        #[allow(clippy::arc_with_non_send_sync)]
+        Some(Arc::new(AgentProfiles {
+            options: entry.options.clone(),
+            thread: entry.thread.clone(),
+        }))
+    }
+
     /// The skills Zed shows in its `/` and `@` menus for a session.
     pub fn session_skills(&self, session_id: &str) -> Vec<AvailableSkill> {
         let sessions = self.hub.sessions.borrow();
@@ -2262,7 +2377,7 @@ impl OpenCodeConnection {
                 client: client.clone(),
                 models,
                 providers: providers.log_err().unwrap_or_default(),
-                agents,
+                agents: RefCell::new(agents),
                 model: RefCell::new(model),
                 agent: RefCell::new(agent),
                 effort_before_off: RefCell::new(None),
@@ -2871,19 +2986,6 @@ impl AgentConnection for OpenCodeConnection {
         }))
     }
 
-    fn session_config_options(
-        &self,
-        session_id: &acp::SessionId,
-        _cx: &App,
-    ) -> Option<Rc<dyn AgentSessionConfigOptions>> {
-        let sessions = self.hub.sessions.borrow();
-        let entry = sessions.get(session_id.0.as_ref())?;
-        Some(Rc::new(SessionConfig {
-            options: entry.options.clone(),
-            thread: entry.thread.clone(),
-        }))
-    }
-
     fn model_selector(&self, session_id: &acp::SessionId) -> Option<Rc<dyn AgentModelSelector>> {
         let sessions = self.hub.sessions.borrow();
         let entry = sessions.get(session_id.0.as_ref())?;
@@ -2971,6 +3073,9 @@ mod tests {
             mode: mode.map(str::to_string),
             description: None,
             hidden: false,
+            model: None,
+            system: None,
+            permissions: Vec::new(),
         }
     }
 

@@ -82,7 +82,7 @@ pub struct ModelVariant {
     pub id: String,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct AgentInfo {
     pub id: String,
     pub name: String,
@@ -90,6 +90,39 @@ pub struct AgentInfo {
     pub description: Option<String>,
     #[serde(default)]
     pub hidden: bool,
+    /// The agent's own model, used instead of the session's.
+    pub model: Option<ModelRef>,
+    /// The agent's prompt, when it replaces OpenCode's default.
+    pub system: Option<String>,
+    /// Every rule that applies to the agent, global ones included, in the
+    /// order OpenCode checks them: the last match wins.
+    #[serde(default)]
+    pub permissions: Vec<PermissionRule>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+pub struct PermissionRule {
+    pub action: String,
+    pub resource: String,
+    pub effect: PermissionEffect,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PermissionEffect {
+    Allow,
+    Ask,
+    Deny,
+}
+
+/// One of the configuration sources the service read, lowest priority first.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum ConfigEntry {
+    Document { path: Option<String> },
+    Directory { path: String },
+    #[serde(other)]
+    Other,
 }
 
 /// A command: invoked by name.

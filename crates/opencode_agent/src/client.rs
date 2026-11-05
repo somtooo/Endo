@@ -1,6 +1,6 @@
 use crate::service::ServiceRegistration;
 use crate::types::{
-    AgentInfo, Event, Message, ModelInfo, ModelRef, NamedItem, ProviderInfo, ServerInfo, SessionInfo, Skill,
+    ConfigEntry, AgentInfo, Event, Message, ModelInfo, ModelRef, NamedItem, ProviderInfo, ServerInfo, SessionInfo, Skill,
     SessionPage,
 };
 use anyhow::{Context as _, Result, anyhow};
@@ -227,6 +227,11 @@ impl OpenCodeClient {
 
     pub async fn agents(&self, directory: &str) -> Result<Vec<AgentInfo>> {
         self.located_data("/api/agent", directory).await
+    }
+
+    pub async fn config_entries(&self, directory: &str) -> Result<Vec<ConfigEntry>> {
+        self.get_json(self.url("/api/config", &[("location[directory]", directory)])?)
+            .await
     }
 
     pub async fn commands(&self, directory: &str) -> Result<Vec<NamedItem>> {

@@ -14435,6 +14435,17 @@ impl Render for ThreadView {
             .on_action(cx.listener(|this, _: &ClearMessageQueue, _, cx| {
                 this.clear_queue(cx);
             }))
+            .on_action(cx.listener(|this, _: &crate::ManageProfiles, window, cx| {
+                let custom_action = this
+                    .profile_selector
+                    .as_ref()
+                    .map(|selector| selector.read(cx).configure_action())
+                    .filter(|action| !action.partial_eq(&crate::ManageProfiles::default()));
+                match custom_action {
+                    Some(action) => window.dispatch_action(action, cx),
+                    None => cx.propagate(),
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleProfileSelector, window, cx| {
                 if let Some(config_options_view) = this.config_options_view.clone() {
                     let handled = config_options_view.update(cx, |view, cx| {
