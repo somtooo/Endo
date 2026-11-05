@@ -2208,6 +2208,17 @@ impl AgentModelSelector for ModelPicker {
         );
     }
 
+    fn should_render_footer(&self) -> bool {
+        true
+    }
+
+    fn footer_action(&self) -> Option<Box<dyn gpui::Action>> {
+        Some(Box::new(zed_actions::OpenSettingsAt {
+            path: zed_actions::OPENCODE_PROVIDERS_SETTINGS_PATH.to_string(),
+            target: None,
+        }))
+    }
+
     fn watch(&self, _cx: &mut App) -> Option<watch::Receiver<()>> {
         Some(self.options.rx.clone())
     }

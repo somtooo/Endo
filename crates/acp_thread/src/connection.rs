@@ -732,6 +732,11 @@ pub trait AgentModelSelector: 'static {
     fn should_render_footer(&self) -> bool {
         false
     }
+
+    /// What the footer's Configure button does, when not the agent settings.
+    fn footer_action(&self) -> Option<Box<dyn gpui::Action>> {
+        None
+    }
 }
 
 /// Icon for a model in the model selector.

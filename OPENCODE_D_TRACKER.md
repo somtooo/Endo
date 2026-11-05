@@ -17,12 +17,12 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
-| 29 | Model picker Configure footer | Part of #30: add the footer when the OpenCode settings page exists. | You | Plan needed |
 
 ## Needs checking
 
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
+| 29 | Model picker Configure footer | OpenCode D's model picker shows Zed's Configure footer. It opens the settings page's Providers section, like the native picker opens LLM Providers. A newly connected provider's models appear in open threads without a restart. UI-tested by the agent. | You | Needs check |
 | 30 | OpenCode D settings page | AI > External Agents has an OpenCode D row. Its page has: Providers (connect with an API key, sign-in or command; switch, rename and disconnect accounts; search all providers), Plugins (add, turn on or off, remove), Compaction, Warming, and Defaults (model, agent, web search). Writes OpenCode's global config and calls the service's API. UI-tested by the agent against a private service, with a fake API key and a Copilot sign-in that was started and cancelled, not completed. | You | Needs check |
 | 34 | Shell output shows twice | A short shell command showed its output twice. A finished foreground call has no shell ID, so the step that stops its output stream was skipped, and the stream added the output again. Fixed. Quick, streaming, failing and background commands each show their output once. UI-tested by the agent. | Tester | Needs check |
 | 31 | Background subagent management | Subagent cards already showed the work. Their Stop button now works, for background and foreground subagents, through OpenCode's interrupt. A stopped card shows Zed's native cancelled state. Limit: after restarting Zed, a stopped background subagent's card shows as completed, because only this run saw the interrupt. UI-tested by the agent. | You | Needs check |

@@ -792,6 +792,11 @@ fn open_settings_editor_at_target(
             return;
         }
 
+        if path == zed_actions::OPENCODE_PROVIDERS_SETTINGS_PATH {
+            pages::open_opencode_providers_at(settings_window, window, cx);
+            return;
+        }
+
         let query = format!("#{path}");
         let indices = settings_window.filter_by_json_path(&query);
 

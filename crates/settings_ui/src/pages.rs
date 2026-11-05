@@ -29,7 +29,9 @@ pub(crate) use mcp_servers_page::{
     McpServerForm, render_add_server_popover, render_mcp_servers_page,
 };
 pub(crate) use opencode_plugins_page::{PLUGINS_PAGE_PATH, render_add_plugin_button};
-pub(crate) use opencode_settings_page::{OpenCodeSettings, render_opencode_row};
+pub(crate) use opencode_settings_page::{
+    OpenCodeSettings, open_opencode_providers_at, render_opencode_row,
+};
 pub(crate) use sandbox_settings::render_sandbox_settings_page;
 pub use skill_creator::SkillCreatorOpenMode;
 pub(crate) use skill_creator::{

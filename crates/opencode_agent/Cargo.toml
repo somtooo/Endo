@@ -51,6 +51,7 @@ ui.workspace = true
 util.workspace = true
 watch.workspace = true
 which.workspace = true
+zed_actions.workspace = true
 workspace.workspace = true
 
 [dev-dependencies]

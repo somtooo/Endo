@@ -21,7 +21,7 @@ use super::opencode_plugins_page::{PluginForm, open_plugins_page};
 use super::opencode_providers_page::{
     ConnectForm, RenameForm, new_provider_filter, open_providers_page,
 };
-use crate::{SettingsWindow, components::SettingsSectionHeader};
+use crate::{SettingsPageItem, SettingsWindow, components::SettingsSectionHeader};
 
 const SECTION: &str = "External Agents";
 
@@ -121,6 +121,31 @@ pub(crate) fn open_opencode_settings(
         window,
         cx,
     );
+}
+
+/// Opens the Providers page with its parents behind it, so the back button
+/// walks up the way it would have from clicking through.
+pub(crate) fn open_opencode_providers_at(
+    settings_window: &mut SettingsWindow,
+    window: &mut Window,
+    cx: &mut Context<SettingsWindow>,
+) {
+    let ai_page_entry = settings_window.navbar_entries.iter().position(|entry| {
+        entry.is_root
+            && settings_window.pages[entry.page_index]
+                .items
+                .iter()
+                .any(|item| match item {
+                    SettingsPageItem::SubPageLink(link) => link.json_path == Some("agent_servers"),
+                    _ => false,
+                })
+    });
+    if let Some(ai_page_entry) = ai_page_entry {
+        settings_window.open_and_scroll_to_navbar_entry(ai_page_entry, None, false, window, cx);
+    }
+    settings_window.navigate_to_sub_page("agent_servers", window, cx);
+    open_opencode_settings(settings_window, window, cx);
+    open_providers_page(settings_window, window, cx);
 }
 
 /// Fetches everything the pages show. Each part that can't load is reported,

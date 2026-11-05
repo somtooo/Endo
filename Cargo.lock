@@ -12672,6 +12672,7 @@ dependencies = [
  "watch",
  "which",
  "workspace",
+ "zed_actions",
 ]
 
 [[package]]
