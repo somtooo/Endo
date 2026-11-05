@@ -817,6 +817,8 @@ pub struct ThreadView {
     pub entry_view_state: Entity<EntryViewState>,
     pub title_editor: Entity<Editor>,
     title_editor_sync_version: Option<(gpui::EntityId, clock::Global)>,
+    /// The title when the title editor gained focus, restored by Escape.
+    title_before_edit: Option<SharedString>,
     pub config_options_view: Option<Entity<ConfigOptionsView>>,
     pub mode_selector: Option<Entity<ModeSelector>>,
     pub model_selector: Option<Entity<ModelSelectorPopover>>,
@@ -1343,6 +1345,7 @@ impl ThreadView {
             entry_view_state,
             title_editor,
             title_editor_sync_version,
+            title_before_edit: None,
             config_options_view,
             mode_selector,
             model_selector,
@@ -3412,12 +3415,27 @@ impl ThreadView {
                 }
                 self.apply_renamed_title(SharedString::from(new_title), cx);
             }
+            EditorEvent::Focused => {
+                self.title_before_edit = Some(title_editor.read(cx).text(cx).into());
+            }
             EditorEvent::Blurred => {
+                self.title_before_edit = None;
                 if title_editor.read(cx).text(cx).is_empty() {
                     self.sync_title_editor(DEFAULT_THREAD_TITLE.into(), window, cx);
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Undoes edits made since the title editor gained focus. Each keystroke
+    /// already renamed the thread, so this renames it back.
+    pub fn revert_title_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(title) = self.title_before_edit.take() else {
+            return;
+        };
+        if self.title_editor.read(cx).text(cx) != title.as_ref() {
+            self.rename(title, window, cx);
         }
     }
 
