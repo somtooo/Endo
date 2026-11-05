@@ -89,6 +89,7 @@ use crate::completion_provider::{AgentContextSelection, AvailableSkill};
 use crate::entry_view_state::{EntryViewEvent, ViewEvent};
 use crate::message_editor::{InputAttempt, MessageEditor, MessageEditorEvent};
 use crate::profile_selector::{ProfileProvider, ProfileSelector};
+use crate::system_notifications;
 
 use crate::thread_metadata_store::{ThreadId, ThreadMetadataStore};
 use crate::ui::{AgentNotification, AgentNotificationEvent};
@@ -106,6 +107,7 @@ use crate::{
 
 const STOPWATCH_THRESHOLD: Duration = Duration::from_secs(30);
 const TOKEN_THRESHOLD: u64 = 250;
+const SYSTEM_NOTIFICATION_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 pub(crate) const DRAFT_PROMPT_PERSIST_DEBOUNCE: Duration = Duration::from_millis(250);
 
@@ -822,6 +824,10 @@ pub struct ConversationView {
     focus_handle: FocusHandle,
     notifications: Vec<WindowHandle<AgentNotification>>,
     notification_subscriptions: HashMap<WindowHandle<AgentNotification>, Vec<Subscription>>,
+    /// The tag of the system notification on screen, if any.
+    system_notification: Option<SharedString>,
+    system_notification_shown_at: Option<Instant>,
+    system_notification_subscription: Option<Subscription>,
     auth_task: Option<Task<()>>,
     loading_status: Option<SharedString>,
     /// When settings change, use this to see if the theme has changed (which
@@ -1152,6 +1158,9 @@ impl ConversationView {
             pending_selections: Vec::new(),
             notifications: Vec::new(),
             notification_subscriptions: HashMap::default(),
+            system_notification: None,
+            system_notification_shown_at: None,
+            system_notification_subscription: None,
             auth_task: None,
             loading_status: None,
             last_theme_id: Some(cx.theme().id.clone()),
@@ -3519,6 +3528,22 @@ impl ConversationView {
             .clone()
             .unwrap_or_else(|| self.agent.agent_id().0);
 
+        if system_notifications::preferred(cx)
+            && settings.notify_when_agent_waiting != NotifyWhenAgentWaiting::Never
+        {
+            window.request_attention();
+            self.show_system_notification(
+                caption.into(),
+                title,
+                root_thread_id,
+                root_work_dirs,
+                root_title,
+                window,
+                cx,
+            );
+            return;
+        }
+
         match settings.notify_when_agent_waiting {
             NotifyWhenAgentWaiting::PrimaryScreen => {
                 window.request_attention();
@@ -3557,6 +3582,107 @@ impl ConversationView {
                 // Don't show anything
             }
         }
+    }
+
+    fn open_notified_thread(
+        handle: WindowHandle<MultiWorkspace>,
+        workspace: WeakEntity<Workspace>,
+        agent: Agent,
+        thread_id: ThreadId,
+        work_dirs: Option<PathList>,
+        title: Option<SharedString>,
+        cx: &mut App,
+    ) {
+        cx.defer(move |cx| {
+            handle
+                .update(cx, |multi_workspace, window, cx| {
+                    window.activate_window();
+                    if let Some(workspace) = workspace.upgrade() {
+                        multi_workspace.activate(workspace.clone(), None, window, cx);
+                        workspace.update(cx, |workspace, cx| {
+                            workspace.reveal_panel::<AgentPanel>(window, cx);
+                            if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                                panel.update(cx, |panel, cx| {
+                                    panel.load_agent_thread(
+                                        agent,
+                                        thread_id,
+                                        work_dirs,
+                                        title,
+                                        true,
+                                        AgentThreadSource::AgentPanel,
+                                        window,
+                                        cx,
+                                    );
+                                });
+                            }
+                            workspace.focus_panel::<AgentPanel>(window, cx);
+                        });
+                    }
+                })
+                .log_err();
+        });
+    }
+
+    fn show_system_notification(
+        &mut self,
+        caption: SharedString,
+        title: SharedString,
+        thread_id: ThreadId,
+        work_dirs: Option<PathList>,
+        thread_title: Option<SharedString>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // System notifications age out, so a later event in this thread gets
+        // its own. One turn can raise several events at once, though.
+        let shown_recently = self
+            .system_notification_shown_at
+            .is_some_and(|shown_at| shown_at.elapsed() < SYSTEM_NOTIFICATION_MIN_INTERVAL);
+        if shown_recently {
+            return;
+        }
+        let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+            log::error!("root view should be a MultiWorkspace");
+            return;
+        };
+        let project_name = self.workspace.upgrade().and_then(|workspace| {
+            workspace
+                .read(cx)
+                .project()
+                .read(cx)
+                .visible_worktrees(cx)
+                .next()
+                .map(|worktree| worktree.read(cx).root_name_str().to_string())
+        });
+        let body = match project_name {
+            Some(project_name) => format!("{project_name} · {caption}").into(),
+            None => caption,
+        };
+        let tag: SharedString = format!("agent-thread-{thread_id:?}").into();
+        let this = cx.weak_entity();
+        let workspace = self.workspace.clone();
+        let agent = self.connection_key.clone();
+        system_notifications::show(cx, tag.clone(), title, body, move |cx| {
+            cx.activate(true);
+            Self::open_notified_thread(
+                handle,
+                workspace,
+                agent,
+                thread_id,
+                work_dirs,
+                thread_title,
+                cx,
+            );
+            this.update(cx, |this, cx| this.dismiss_notifications(cx)).ok();
+        });
+        self.system_notification = Some(tag);
+        self.system_notification_shown_at = Some(Instant::now());
+        self.system_notification_subscription =
+            Some(cx.observe_window_activation(window, |this, window, cx| {
+                if this.agent_status_visible(window, cx) {
+                    this.dismiss_notifications(cx);
+                }
+            }));
     }
 
     fn pop_up(
@@ -3605,46 +3731,15 @@ impl ConversationView {
                             };
                             cx.activate(true);
 
-                            let workspace_handle = this.workspace.clone();
-                            let agent = this.connection_key.clone();
-                            let root_work_dirs = root_work_dirs.clone();
-                            let root_title = root_title.clone();
-
-                            cx.defer(move |cx| {
-                                handle
-                                    .update(cx, |multi_workspace, window, cx| {
-                                        window.activate_window();
-                                        if let Some(workspace) = workspace_handle.upgrade() {
-                                            multi_workspace.activate(
-                                                workspace.clone(),
-                                                None,
-                                                window,
-                                                cx,
-                                            );
-                                            workspace.update(cx, |workspace, cx| {
-                                                workspace.reveal_panel::<AgentPanel>(window, cx);
-                                                if let Some(panel) =
-                                                    workspace.panel::<AgentPanel>(cx)
-                                                {
-                                                    panel.update(cx, |panel, cx| {
-                                                        panel.load_agent_thread(
-                                                            agent.clone(),
-                                                            root_thread_id,
-                                                            root_work_dirs.clone(),
-                                                            root_title.clone(),
-                                                            true,
-                                                            AgentThreadSource::AgentPanel,
-                                                            window,
-                                                            cx,
-                                                        );
-                                                    });
-                                                }
-                                                workspace.focus_panel::<AgentPanel>(window, cx);
-                                            });
-                                        }
-                                    })
-                                    .log_err();
-                            });
+                            Self::open_notified_thread(
+                                handle,
+                                this.workspace.clone(),
+                                this.connection_key.clone(),
+                                root_thread_id,
+                                root_work_dirs.clone(),
+                                root_title.clone(),
+                                cx,
+                            );
 
                             this.dismiss_notifications(cx);
                         }
@@ -3716,7 +3811,14 @@ impl ConversationView {
     }
 
     pub(crate) fn dismiss_notifications(&mut self, cx: &mut Context<Self>) -> bool {
-        let had_notifications = !self.notifications.is_empty();
+        let had_system_notification = if let Some(tag) = self.system_notification.take() {
+            system_notifications::dismiss(cx, &tag);
+            self.system_notification_subscription = None;
+            true
+        } else {
+            false
+        };
+        let had_notifications = !self.notifications.is_empty() || had_system_notification;
         for window in self.notifications.drain(..) {
             window
                 .update(cx, |_, window, _| {
