@@ -37,7 +37,7 @@ fn binary_name() -> &'static str {
 }
 
 /// The npm package suffix for this machine, as the install script picks it.
-fn target() -> Result<String> {
+async fn target() -> Result<String> {
     let os = match std::env::consts::OS {
         "linux" => "linux",
         "macos" => "darwin",
@@ -53,7 +53,7 @@ fn target() -> Result<String> {
     if arch == "x64" && !has_avx2() {
         target.push_str("-baseline");
     }
-    if os == "linux" && is_musl() {
+    if os == "linux" && is_musl().await {
         target.push_str("-musl");
     }
     Ok(target)
@@ -69,13 +69,14 @@ fn has_avx2() -> bool {
     true
 }
 
-fn is_musl() -> bool {
+async fn is_musl() -> bool {
     if std::path::Path::new("/etc/alpine-release").exists() {
         return true;
     }
-    std::process::Command::new("ldd")
+    util::command::new_command("ldd")
         .arg("--version")
         .output()
+        .await
         .map(|output| {
             let text = [output.stdout, output.stderr].concat();
             String::from_utf8_lossy(&text).to_lowercase().contains("musl")
@@ -134,7 +135,7 @@ fn verify_integrity(bytes: &[u8], integrity: &str) -> Result<()> {
 
 /// Downloads and installs the latest OpenCode, returning the binary's path.
 pub async fn install(http: Arc<dyn HttpClient>) -> Result<PathBuf> {
-    let target = target()?;
+    let target = target().await?;
     let latest: Latest = serde_json::from_slice(&get_bytes(&http, LATEST_URL).await?)
         .context("reading the latest OpenCode version")?;
     let scope = latest
