@@ -153,6 +153,10 @@ fn terminal_program_to_report(
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct TerminalId(uuid::Uuid);
 
+fn terminal_notification_tag(terminal_id: TerminalId) -> SharedString {
+    format!("agent-terminal-{}", terminal_id.0).into()
+}
+
 impl TerminalId {
     pub(crate) fn new() -> Self {
         Self(uuid::Uuid::new_v4())
@@ -2696,6 +2700,13 @@ impl AgentPanel {
             return;
         }
         let settings = AgentSettings::get_global(cx);
+        if crate::system_notifications::preferred(cx)
+            && settings.notify_when_agent_waiting != NotifyWhenAgentWaiting::Never
+        {
+            window.request_attention();
+            self.show_terminal_system_notification(terminal_id, title, window, cx);
+            return;
+        }
         match settings.notify_when_agent_waiting {
             NotifyWhenAgentWaiting::PrimaryScreen => {
                 window.request_attention();
@@ -2711,6 +2722,62 @@ impl AgentPanel {
             }
             NotifyWhenAgentWaiting::Never => {}
         }
+    }
+
+    fn show_terminal_system_notification(
+        &mut self,
+        terminal_id: TerminalId,
+        title: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(handle) = window.window_handle().downcast::<MultiWorkspace>() else {
+            log::error!("root view should be a MultiWorkspace");
+            return;
+        };
+        let body = self
+            .workspace
+            .upgrade()
+            .and_then(|workspace| {
+                workspace
+                    .read(cx)
+                    .project()
+                    .read(cx)
+                    .visible_worktrees(cx)
+                    .next()
+                    .map(|worktree| worktree.read(cx).root_name_str().to_string())
+            })
+            .unwrap_or_default();
+        let workspace = self.workspace.clone();
+        crate::system_notifications::show(
+            cx,
+            terminal_notification_tag(terminal_id),
+            title,
+            body.into(),
+            move |cx| {
+                cx.activate(true);
+                cx.defer(move |cx| {
+                    handle
+                        .update(cx, |multi_workspace, window, cx| {
+                            window.activate_window();
+                            let Some(workspace) = workspace.upgrade() else {
+                                return;
+                            };
+                            multi_workspace.activate(workspace.clone(), None, window, cx);
+                            workspace.update(cx, |workspace, cx| {
+                                workspace.reveal_panel::<AgentPanel>(window, cx);
+                                if let Some(panel) = workspace.panel::<AgentPanel>(cx) {
+                                    panel.update(cx, |panel, cx| {
+                                        panel.activate_terminal(terminal_id, true, window, cx);
+                                    });
+                                }
+                                workspace.focus_panel::<AgentPanel>(window, cx);
+                            });
+                        })
+                        .log_err();
+                });
+            },
+        );
     }
 
     fn pop_up_terminal_notification(
@@ -2836,6 +2903,9 @@ impl AgentPanel {
         };
         let windows = std::mem::take(&mut terminal.notification_windows);
         terminal.notification_subscriptions.clear();
+        if crate::system_notifications::preferred(cx) {
+            crate::system_notifications::dismiss(cx, &terminal_notification_tag(terminal_id));
+        }
         for window in windows {
             window
                 .update(cx, |_, window, _| {
