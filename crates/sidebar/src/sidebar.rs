@@ -793,6 +793,8 @@ pub struct Sidebar {
     active_entry: Option<ActiveEntry>,
     hovered_thread_index: Option<usize>,
     rename_target: Option<RenameTarget>,
+    /// The title when the rename started, restored by Escape.
+    title_before_rename: Option<SharedString>,
     /// Threads in the database-backed regeneration path need their own loading
     /// state because they do not have a live `agent::Thread` to report it.
     regenerating_titles: HashSet<ThreadId>,
@@ -957,6 +959,7 @@ impl Sidebar {
             active_entry: None,
             hovered_thread_index: None,
             rename_target: None,
+            title_before_rename: None,
             regenerating_titles: HashSet::new(),
             suppress_next_rename_edit: false,
 
@@ -3359,8 +3362,7 @@ impl Sidebar {
     }
 
     fn cancel(&mut self, _: &Cancel, window: &mut Window, cx: &mut Context<Self>) {
-        if self.rename_target.is_some() {
-            self.finish_entry_rename(window, cx);
+        if self.cancel_entry_rename(window, cx) {
             return;
         }
 
@@ -3445,6 +3447,7 @@ impl Sidebar {
 
         self.selection = Some(ix);
         self.rename_target = Some(target);
+        self.title_before_rename = Some(title.clone());
         self.suppress_next_rename_edit = true;
         self.list_state.scroll_to_reveal_item(ix);
         self.rename_editor.update(cx, |editor, cx| {
@@ -3553,6 +3556,26 @@ impl Sidebar {
                 store.rename_terminal(terminal_id, title, cx);
             });
         }
+    }
+
+    /// Each keystroke already renamed the entry, so this renames it back.
+    fn cancel_entry_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some(target) = self.rename_target else {
+            return false;
+        };
+        if let Some(title) = self.title_before_rename.take()
+            && self.rename_editor.read(cx).text(cx) != title.as_ref()
+        {
+            match target {
+                RenameTarget::Thread(thread_id) => {
+                    self.apply_thread_rename(thread_id, title, window, cx);
+                }
+                RenameTarget::Terminal(terminal_id) => {
+                    self.apply_terminal_rename(terminal_id, title, cx);
+                }
+            }
+        }
+        self.finish_entry_rename(window, cx)
     }
 
     fn finish_entry_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
@@ -6274,7 +6297,7 @@ impl Sidebar {
             }))
             .on_action(
                 cx.listener(|this, _: &editor::actions::Cancel, window, cx| {
-                    this.finish_entry_rename(window, cx);
+                    this.cancel_entry_rename(window, cx);
                 }),
             )
             .child(self.rename_editor.clone())

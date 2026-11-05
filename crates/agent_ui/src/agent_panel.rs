@@ -5473,6 +5473,13 @@ impl AgentPanel {
                                 let conversation_view = conversation_view.downgrade();
                                 move |_: &editor::actions::Cancel, window, cx| {
                                     if let Some(conversation_view) = conversation_view.upgrade() {
+                                        if let Some(thread_view) =
+                                            conversation_view.read(cx).root_thread_view()
+                                        {
+                                            thread_view.update(cx, |thread_view, cx| {
+                                                thread_view.revert_title_edit(window, cx);
+                                            });
+                                        }
                                         conversation_view
                                             .read(cx)
                                             .activation_focus_handle(cx)
