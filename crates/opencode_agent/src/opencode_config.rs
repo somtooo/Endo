@@ -1,8 +1,9 @@
 //! Reads and edits OpenCode's global config file for the agents modal.
 //!
-//! Writes the documented V1 shape (`agent`, `permission`), which OpenCode
-//! reads alongside its V2 keys, and leaves the rest of the file's text and
-//! comments alone. The service watches the file and reloads on change.
+//! Writes V2's `agents` and `permissions`, and moves a V1 `agent` or
+//! `permission` across when it's about to change one, since OpenCode reads
+//! both. The rest of the file's text and comments stay as they are. The service
+//! watches the file and reloads on change.
 
 use crate::types::{ConfigEntry, PermissionEffect, PermissionRule};
 use anyhow::{Context as _, Result, anyhow};
@@ -215,7 +216,14 @@ pub enum Scope {
 }
 
 impl Scope {
-    fn permission_path(&self) -> Vec<&str> {
+    fn permissions_path(&self) -> Vec<&str> {
+        match self {
+            Scope::Global => vec!["permissions"],
+            Scope::Agent(id) => vec!["agents", id, "permissions"],
+        }
+    }
+
+    fn legacy_permission_path(&self) -> Vec<&str> {
         match self {
             Scope::Global => vec!["permission"],
             Scope::Agent(id) => vec!["agent", id, "permission"],
@@ -270,54 +278,200 @@ fn replace(text: &str, path: &[&str], value: Option<&Value>) -> Result<String> {
     Ok(text)
 }
 
-/// The `permission` value with `tool` set to `effect`. Built whole, because
-/// order matters: OpenCode applies the last matching rule, so `*` has to stay
-/// ahead of the per-tool rules.
-fn updated_permission(current: Option<&Value>, tool: &Tool, effect: PermissionEffect) -> Value {
-    let mut object = match current {
-        Some(Value::Object(object)) => object.clone(),
-        Some(value @ Value::String(_)) if tool.action != "*" => {
-            let mut object = Map::new();
-            object.insert("*".into(), value.clone());
-            object
-        }
-        _ => Map::new(),
+fn rule_value(rule: &PermissionRule) -> Value {
+    serde_json::json!({
+        "action": rule.action,
+        "resource": rule.resource,
+        "effect": effect_value(rule.effect),
+    })
+}
+
+/// `rules` with `tool`'s catch-all set to `effect`. Order matters, because
+/// OpenCode applies the last matching rule: it goes before any of the tool's
+/// patterns so they still win, and the rule for every tool goes first.
+fn updated_rules(
+    mut rules: Vec<PermissionRule>,
+    tool: &Tool,
+    effect: PermissionEffect,
+) -> Vec<PermissionRule> {
+    rules.retain(|rule| !(rule.action == tool.action && rule.resource == "*"));
+    let position = if tool.action == "*" {
+        0
+    } else {
+        rules
+            .iter()
+            .position(|rule| rule.action == tool.action)
+            .unwrap_or(rules.len())
     };
-    if tool.action == "*" && object.is_empty() {
-        return effect_value(effect);
+    rules.insert(
+        position,
+        PermissionRule {
+            action: tool.action.to_string(),
+            resource: "*".to_string(),
+            effect,
+        },
+    );
+    rules
+}
+
+/// The rules the file itself sets for `scope`, in the order OpenCode reads
+/// them. Global rules from V1 and V2 add up, but an agent in V2's `agents`
+/// replaces the same agent in V1's `agent`.
+pub fn file_rules(text: &str, scope: &Scope) -> Result<Vec<PermissionRule>> {
+    let config = parse(text)?;
+    let native = lookup(&config, &scope.permissions_path());
+    let legacy_applies = match scope {
+        Scope::Global => true,
+        Scope::Agent(id) => lookup(&config, &["agents", id]).is_none(),
+    };
+    let mut rules = Vec::new();
+    if legacy_applies {
+        if let Scope::Agent(id) = scope
+            && let Some(tools) = lookup(&config, &["agent", id, "tools"])
+        {
+            rules.extend(rules_from_tools(tools));
+        }
+        if let Some(legacy) = lookup(&config, &scope.legacy_permission_path()) {
+            rules.extend(rules_from_value(legacy));
+        }
     }
-    let existing_key = object
-        .keys()
-        .rfind(|key| tool.keys.contains(&key.as_str()))
-        .cloned();
-    match existing_key {
-        // Patterns stay; their catch-all changes.
-        Some(key) if object.get(&key).is_some_and(Value::is_object) => {
-            if let Some(Value::Object(patterns)) = object.get_mut(&key) {
-                if patterns.contains_key("*") {
-                    patterns.insert("*".into(), effect_value(effect));
+    if let Some(Value::Array(native)) = native {
+        rules.extend(
+            native
+                .iter()
+                .filter_map(|rule| serde_json::from_value(rule.clone()).ok()),
+        );
+    }
+    Ok(rules)
+}
+
+/// V1's `tools` map, where `true` allows a tool and `false` denies it.
+fn rules_from_tools(tools: &Value) -> Vec<PermissionRule> {
+    tools
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter_map(|(tool, enabled)| {
+            Some(PermissionRule {
+                action: normalize_action(tool).to_string(),
+                resource: "*".to_string(),
+                effect: if enabled.as_bool()? {
+                    PermissionEffect::Allow
                 } else {
-                    let mut reordered = Map::new();
-                    reordered.insert("*".into(), effect_value(effect));
-                    reordered.extend(std::mem::take(patterns));
-                    *patterns = reordered;
-                }
-            }
-        }
-        Some(key) => {
-            object.insert(key, effect_value(effect));
-        }
-        None if tool.action == "*" => {
-            let mut reordered = Map::new();
-            reordered.insert("*".into(), effect_value(effect));
-            reordered.extend(object);
-            object = reordered;
-        }
-        None => {
-            object.insert(tool.keys[0].into(), effect_value(effect));
+                    PermissionEffect::Deny
+                },
+            })
+        })
+        .collect()
+}
+
+/// A V1 agent in V2's shape, the way OpenCode itself converts one when it
+/// loads the file.
+fn migrated_agent(legacy: &Map<String, Value>) -> Value {
+    const CONVERTED: &[&str] = &[
+        "model",
+        "variant",
+        "prompt",
+        "description",
+        "mode",
+        "hidden",
+        "color",
+        "steps",
+        "maxSteps",
+        "disable",
+        "permission",
+        "tools",
+        "options",
+        "temperature",
+        "top_p",
+        "name",
+    ];
+    let mut agent = Map::new();
+    if let Some(model) = legacy.get("model").and_then(Value::as_str) {
+        let reference = match legacy.get("variant").and_then(Value::as_str) {
+            Some(variant) if !variant.is_empty() => format!("{model}#{variant}"),
+            _ => model.to_string(),
+        };
+        agent.insert("model".into(), Value::String(reference));
+    }
+    for (from, to) in [
+        ("prompt", "system"),
+        ("description", "description"),
+        ("mode", "mode"),
+        ("hidden", "hidden"),
+        ("disable", "disabled"),
+    ] {
+        if let Some(value) = legacy.get(from) {
+            agent.insert(to.into(), value.clone());
         }
     }
-    Value::Object(object)
+    if let Some(color) = legacy.get("color").and_then(Value::as_str) {
+        // V2 only takes hex colors. OpenCode loads V1's theme color names as grey.
+        let color = if color.starts_with('#') {
+            color
+        } else {
+            "#aaaaaa"
+        };
+        agent.insert("color".into(), Value::String(color.into()));
+    }
+    if let Some(steps) = legacy.get("steps").or_else(|| legacy.get("maxSteps")) {
+        agent.insert("steps".into(), steps.clone());
+    }
+    let mut rules = legacy
+        .get("tools")
+        .map(rules_from_tools)
+        .unwrap_or_default();
+    if let Some(permission) = legacy.get("permission") {
+        rules.extend(rules_from_value(permission));
+    }
+    if !rules.is_empty() {
+        agent.insert(
+            "permissions".into(),
+            Value::Array(rules.iter().map(rule_value).collect()),
+        );
+    }
+    // V1 keeps request settings in `options`, in `temperature` and `top_p`, and
+    // in any key it doesn't otherwise know.
+    let mut body = legacy
+        .get("options")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in legacy {
+        if matches!(key.as_str(), "temperature" | "top_p") || !CONVERTED.contains(&key.as_str()) {
+            body.insert(key.clone(), value.clone());
+        }
+    }
+    if !body.is_empty() {
+        agent.insert("request".into(), serde_json::json!({ "body": body }));
+    }
+    Value::Object(agent)
+}
+
+/// Moves an agent from V1's `agent` to V2's `agents`. An existing V2 entry is
+/// the one OpenCode already uses, so it's kept and the V1 one has no effect.
+fn with_agent_migrated(text: &str, agent_id: &str) -> Result<String> {
+    let config = parse(text)?;
+    let Some(legacy) = lookup(&config, &["agent", agent_id]).and_then(Value::as_object) else {
+        return Ok(text.to_string());
+    };
+    let mut text = text.to_string();
+    if lookup(&config, &["agents", agent_id]).is_none() {
+        text = replace(&text, &["agents", agent_id], Some(&migrated_agent(legacy)))?;
+    }
+    remove_agent_entry(&text, "agent", agent_id)
+}
+
+/// Removes an agent from `key`, and `key` too once nothing is left in it.
+fn remove_agent_entry(text: &str, key: &str, agent_id: &str) -> Result<String> {
+    let text = set_value(text, &[key, agent_id], None)?;
+    if lookup(&parse(&text)?, &[key])
+        .and_then(Value::as_object)
+        .is_some_and(Map::is_empty)
+    {
+        return replace(&text, &[key], None);
+    }
+    Ok(text)
 }
 
 pub fn set_permission(
@@ -326,64 +480,47 @@ pub fn set_permission(
     tool: &Tool,
     effect: PermissionEffect,
 ) -> Result<String> {
-    let path = scope.permission_path();
-    let config = parse(text)?;
-    let permission = updated_permission(lookup(&config, &path), tool, effect);
-    replace(text, &path, Some(&permission))
-}
-
-/// The rules the file itself sets for `scope`.
-pub fn file_rules(text: &str, scope: &Scope) -> Result<Vec<PermissionRule>> {
-    let config = parse(text)?;
-    Ok(lookup(&config, &scope.permission_path())
-        .map(rules_from_value)
-        .unwrap_or_default())
+    let text = match scope {
+        Scope::Global => text.to_string(),
+        Scope::Agent(id) => with_agent_migrated(text, id)?,
+    };
+    let rules = updated_rules(file_rules(&text, scope)?, tool, effect);
+    let rules = Value::Array(rules.iter().map(rule_value).collect());
+    let text = replace(&text, &scope.permissions_path(), Some(&rules))?;
+    set_value(&text, &scope.legacy_permission_path(), None)
 }
 
 /// Sets an agent's model, as `provider/model`, or clears it.
 pub fn set_agent_model(text: &str, agent_id: &str, model: Option<&str>) -> Result<String> {
-    let path = ["agent", agent_id, "model"];
-    let config = parse(text)?;
-    if model.is_none() && lookup(&config, &path).is_none() {
-        return Ok(text.to_string());
-    }
-    replace(
-        text,
-        &path,
+    let text = with_agent_migrated(text, agent_id)?;
+    set_value(
+        &text,
+        &["agents", agent_id, "model"],
         model.map(|model| Value::String(model.into())).as_ref(),
     )
 }
 
 /// Whether the file defines the agent, so deleting it there removes it.
 pub fn defines_agent(text: &str, agent_id: &str) -> bool {
-    parse(text)
-        .ok()
-        .is_some_and(|config| lookup(&config, &["agent", agent_id]).is_some())
+    parse(text).is_ok_and(|config| {
+        lookup(&config, &["agents", agent_id]).is_some()
+            || lookup(&config, &["agent", agent_id]).is_some()
+    })
 }
 
 pub fn create_agent(text: &str, agent_id: &str, agent: &Value) -> Result<String> {
     if defines_agent(text, agent_id) {
         return Err(anyhow!("An agent named \"{agent_id}\" already exists"));
     }
-    replace(text, &["agent", agent_id], Some(agent))
+    replace(text, &["agents", agent_id], Some(agent))
 }
 
 pub fn delete_agent(text: &str, agent_id: &str) -> Result<String> {
-    let config = parse(text)?;
-    if lookup(&config, &["agent", agent_id]).is_none() {
+    if !defines_agent(text, agent_id) {
         return Err(anyhow!("\"{agent_id}\" isn't defined in this file"));
     }
-    let text = replace(text, &["agent", agent_id], None)?;
-    // An emptied `agent` object is left out too.
-    let config = parse(&text)?;
-    if config
-        .get("agent")
-        .and_then(Value::as_object)
-        .is_some_and(Map::is_empty)
-    {
-        return replace(&text, &["agent"], None);
-    }
-    Ok(text)
+    let text = remove_agent_entry(text, "agents", agent_id)?;
+    remove_agent_entry(&text, "agent", agent_id)
 }
 
 /// The ID OpenCode would give an agent named `name`: lowercase words joined
@@ -408,28 +545,27 @@ pub fn forked_agent(base: Option<&crate::types::AgentInfo>) -> Value {
         agent.insert("description".into(), Value::String(description.clone()));
     }
     if let Some(model) = &base.model {
-        agent.insert(
-            "model".into(),
-            Value::String(format!("{}/{}", model.provider_id, model.id)),
-        );
+        let mut reference = format!("{}/{}", model.provider_id, model.id);
         if let Some(variant) = &model.variant {
-            agent.insert("variant".into(), Value::String(variant.clone()));
+            reference = format!("{reference}#{variant}");
         }
+        agent.insert("model".into(), Value::String(reference));
     }
     if let Some(system) = &base.system {
-        agent.insert("prompt".into(), Value::String(system.clone()));
+        agent.insert("system".into(), Value::String(system.clone()));
     }
-    let mut permission = Map::new();
-    if let Some(effect) = effective(&base.permissions, "*") {
-        permission.insert("*".into(), effect_value(effect));
-    }
-    for tool in TOOLS {
+    let mut permissions = Vec::new();
+    for tool in std::iter::once(&ALL_TOOLS).chain(TOOLS) {
         if let Some(effect) = effective(&base.permissions, tool.action) {
-            permission.insert(tool.keys[0].into(), effect_value(effect));
+            permissions.push(rule_value(&PermissionRule {
+                action: tool.action.to_string(),
+                resource: "*".to_string(),
+                effect,
+            }));
         }
     }
-    if !permission.is_empty() {
-        agent.insert("permission".into(), Value::Object(permission));
+    if !permissions.is_empty() {
+        agent.insert("permissions".into(), Value::Array(permissions));
     }
     Value::Object(agent)
 }
@@ -475,69 +611,154 @@ mod tests {
 
     #[test]
     fn setting_a_tool_keeps_the_catch_all_first() {
-        let text = "{\n  // mine\n  \"permission\": \"allow\",\n  \"plugin\": []\n}\n";
-        let text = set_permission(text, &Scope::Global, tool("edit"), PermissionEffect::Ask)
-            .expect("edit");
-        assert!(text.contains("// mine"), "{text}");
-        assert_eq!(
-            parse(&text).expect("valid")["permission"],
-            json!({"*": "allow", "edit": "ask"})
-        );
-        let rules = file_rules(&text, &Scope::Global).expect("rules");
-        assert_eq!(effective(&rules, "edit"), Some(PermissionEffect::Ask));
-        assert_eq!(effective(&rules, "read"), Some(PermissionEffect::Allow));
-
-        // The catch-all goes ahead of existing tools, so it doesn't override them.
-        let text = "{\"permission\": {\"edit\": \"deny\"}}";
-        let text =
+        let text = "{\n  // mine\n  \"permissions\": [{\"action\": \"edit\", \"resource\": \"*\", \"effect\": \"deny\"}]\n}\n";
+        let updated =
             set_permission(text, &Scope::Global, &ALL_TOOLS, PermissionEffect::Ask).expect("all");
+        assert!(updated.contains("// mine"));
         assert_eq!(
-            parse(&text).expect("valid")["permission"],
-            json!({"*": "ask", "edit": "deny"})
+            parse(&updated).expect("valid")["permissions"],
+            json!([
+                {"action": "*", "resource": "*", "effect": "ask"},
+                {"action": "edit", "resource": "*", "effect": "deny"},
+            ])
         );
     }
 
     #[test]
-    fn setting_a_tool_updates_its_existing_key_and_patterns() {
-        let text =
-            r#"{"agent": {"build": {"permission": {"bash": {"git *": "allow"}, "task": "ask"}}}}"#;
+    fn setting_a_tool_keeps_its_patterns_winning() {
+        let text = r#"{"agents": {"build": {"permissions": [
+            {"action": "shell", "resource": "git *", "effect": "allow"},
+            {"action": "subagent", "resource": "*", "effect": "ask"}
+        ]}}}"#;
         let scope = Scope::Agent("build".into());
         let text =
             set_permission(text, &scope, tool("shell"), PermissionEffect::Deny).expect("shell");
         let text = set_permission(&text, &scope, tool("subagent"), PermissionEffect::Allow)
             .expect("subagent");
         assert_eq!(
-            parse(&text).expect("valid")["agent"]["build"]["permission"],
-            json!({"bash": {"*": "deny", "git *": "allow"}, "task": "allow"})
+            parse(&text).expect("valid")["agents"]["build"]["permissions"],
+            json!([
+                {"action": "shell", "resource": "*", "effect": "deny"},
+                {"action": "shell", "resource": "git *", "effect": "allow"},
+                {"action": "subagent", "resource": "*", "effect": "allow"},
+            ])
         );
     }
 
     #[test]
+    fn a_change_moves_v1_permissions_to_v2() {
+        let text = "{\n  // mine\n  \"permission\": {\"*\": \"allow\", \"bash\": {\"git *\": \"ask\"}},\n  \"permissions\": [{\"action\": \"read\", \"resource\": \"*\", \"effect\": \"deny\"}]\n}\n";
+        let updated = set_permission(text, &Scope::Global, tool("edit"), PermissionEffect::Ask)
+            .expect("edit");
+        assert!(updated.contains("// mine"));
+        let config = parse(&updated).expect("valid");
+        assert!(config.get("permission").is_none());
+        assert_eq!(
+            config["permissions"],
+            json!([
+                {"action": "*", "resource": "*", "effect": "allow"},
+                {"action": "shell", "resource": "git *", "effect": "ask"},
+                {"action": "read", "resource": "*", "effect": "deny"},
+                {"action": "edit", "resource": "*", "effect": "ask"},
+            ])
+        );
+    }
+
+    #[test]
+    fn a_change_to_a_v1_agent_moves_all_of_it() {
+        let text = r##"{"agent": {"review": {
+            "mode": "primary",
+            "description": "Reviews",
+            "prompt": "Be strict",
+            "model": "openai/gpt-5",
+            "variant": "high",
+            "color": "#ff0000",
+            "maxSteps": 8,
+            "disable": false,
+            "temperature": 0.2,
+            "custom": 1,
+            "tools": {"write": false},
+            "permission": {"bash": {"git *": "ask"}}
+        }}}"##;
+        let scope = Scope::Agent("review".into());
+        let text = set_permission(text, &scope, tool("read"), PermissionEffect::Ask).expect("read");
+        let config = parse(&text).expect("valid");
+        assert!(config.get("agent").is_none());
+        assert_eq!(
+            config["agents"]["review"],
+            json!({
+                "mode": "primary",
+                "description": "Reviews",
+                "system": "Be strict",
+                "model": "openai/gpt-5#high",
+                "color": "#ff0000",
+                "steps": 8,
+                "disabled": false,
+                "request": {"body": {"temperature": 0.2, "custom": 1}},
+                "permissions": [
+                    {"action": "edit", "resource": "*", "effect": "deny"},
+                    {"action": "shell", "resource": "git *", "effect": "ask"},
+                    {"action": "read", "resource": "*", "effect": "ask"},
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn a_v2_agent_wins_over_the_same_v1_agent() {
+        let text = r#"{
+            "agent": {"review": {"permission": {"edit": "allow"}}, "other": {"mode": "all"}},
+            "agents": {"review": {"description": "Mine", "permissions": [
+                {"action": "edit", "resource": "*", "effect": "deny"}
+            ]}}
+        }"#;
+        let scope = Scope::Agent("review".into());
+        assert_eq!(
+            effective(&file_rules(text, &scope).expect("rules"), "edit"),
+            Some(PermissionEffect::Deny)
+        );
+        let updated = set_agent_model(text, "review", Some("openai/gpt-5")).expect("model");
+        let config = parse(&updated).expect("valid");
+        assert_eq!(config["agents"]["review"]["description"], json!("Mine"));
+        assert!(lookup(&config, &["agent", "review"]).is_none());
+        assert_eq!(config["agent"]["other"], json!({"mode": "all"}));
+    }
+
+    #[test]
     fn agents_are_created_and_deleted_in_an_empty_file() {
-        let agent = json!({"mode": "primary", "permission": {"edit": "deny"}});
+        let agent = json!({"mode": "primary", "permissions": []});
         let text = create_agent("", "review", &agent).expect("create");
-        assert_eq!(parse(&text).expect("valid")["agent"]["review"], agent);
+        assert_eq!(parse(&text).expect("valid")["agents"]["review"], agent);
         assert!(defines_agent(&text, "review"));
         assert!(create_agent(&text, "review", &agent).is_err());
 
         let text = set_agent_model(&text, "review", Some("openai/gpt-5")).expect("model");
         assert_eq!(
-            parse(&text).expect("valid")["agent"]["review"]["model"],
+            parse(&text).expect("valid")["agents"]["review"]["model"],
             json!("openai/gpt-5")
         );
         let text = set_agent_model(&text, "review", None).expect("clear");
         assert!(
-            parse(&text).expect("valid")["agent"]["review"]
+            parse(&text).expect("valid")["agents"]["review"]
                 .get("model")
                 .is_none()
         );
-
         let text = delete_agent(&text, "review").expect("delete");
-        assert!(
-            parse(&text).expect("valid").get("agent").is_none(),
-            "{text}"
-        );
+        assert!(parse(&text).expect("valid").get("agents").is_none());
         assert!(delete_agent(&text, "review").is_err());
+    }
+
+    #[test]
+    fn v1_agents_can_be_changed_and_deleted() {
+        let text = r#"{"agent": {"review": {"model": "openai/old"}}}"#;
+        assert!(defines_agent(text, "review"));
+        let updated = set_agent_model(text, "review", Some("openai/new")).expect("model");
+        let config = parse(&updated).expect("valid");
+        assert!(config.get("agent").is_none());
+        assert_eq!(config["agents"]["review"]["model"], json!("openai/new"));
+
+        let deleted = delete_agent(text, "review").expect("delete");
+        assert!(parse(&deleted).expect("valid").get("agent").is_none());
     }
 
     #[test]
@@ -585,11 +806,18 @@ mod tests {
         }))
         .expect("agent");
         let agent = forked_agent(Some(&base));
-        assert_eq!(agent["model"], json!("openai/gpt-5"));
-        assert_eq!(agent["variant"], json!("high"));
-        assert_eq!(agent["permission"]["*"], json!("allow"));
-        assert_eq!(agent["permission"]["edit"], json!("deny"));
-        assert_eq!(agent["permission"]["bash"], json!("allow"));
+        assert_eq!(agent["model"], json!("openai/gpt-5#high"));
+        let permissions = agent["permissions"].as_array().expect("permissions");
+        assert_eq!(
+            permissions[0],
+            json!({"action": "*", "resource": "*", "effect": "allow"})
+        );
+        assert!(
+            permissions.contains(&json!({"action": "edit", "resource": "*", "effect": "deny"}))
+        );
+        assert!(
+            permissions.contains(&json!({"action": "shell", "resource": "*", "effect": "allow"}))
+        );
         assert_eq!(agent_id_for_name("My Review  Agent!"), "my-review-agent");
     }
 }
