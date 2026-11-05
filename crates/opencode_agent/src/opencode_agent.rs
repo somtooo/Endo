@@ -97,6 +97,16 @@ pub fn init(http: Arc<dyn http_client::HttpClient>, cx: &mut App) {
         cx,
     );
     agents_modal::init(cx);
+    agent_ui::agent_menu_providers::register_steering_provider(
+        AgentId::new(AGENT_ID),
+        Rc::new(|connection, session_id, _cx| {
+            connection
+                .clone()
+                .downcast::<OpenCodeConnection>()?
+                .steering(&session_id.0)
+        }),
+        cx,
+    );
     agent_ui::agent_menu_providers::register_thread_text_provider(
         AgentId::new(AGENT_ID),
         Rc::new({

@@ -29,7 +29,7 @@ use agent_servers::{AgentServer as _, CustomAgentServer};
 use agent_ui::AvailableSkill;
 use agent_settings::{AgentProfileId, AvailableProfiles};
 use agent_ui::ProfileProvider;
-use agent_ui::agent_menu_providers::AgentThinking;
+use agent_ui::agent_menu_providers::{AgentSteering, AgentThinking};
 use agent_client_protocol::v2::schema as acp;
 use anyhow::{Context as _, Result, anyhow};
 use collections::{HashMap, HashSet, IndexMap};
@@ -38,7 +38,7 @@ use language_model::{LanguageModelCostInfo, LanguageModelEffortLevel};
 use settings::AgentConfigOptionValue;
 use ui::IconName;
 use std::collections::VecDeque;
-use futures::channel::mpsc;
+use futures::channel::{mpsc, oneshot};
 use futures::future::Shared;
 use futures::{FutureExt as _, StreamExt as _};
 use gpui::{App, AppContext as _, AsyncApp, Context, Entity, SharedString, Subscription, Task, TaskExt as _, WeakEntity};
@@ -150,6 +150,11 @@ pub struct Hub {
     /// The latest refetch of commands and skills per directory. Replacing one
     /// cancels the older fetch.
     catalog_refreshes: RefCell<HashMap<String, Task<()>>>,
+    /// Steered prompts not yet delivered or cancelled, by message ID, with
+    /// their session and who to tell which happened.
+    steers: RefCell<HashMap<String, (String, oneshot::Sender<bool>)>>,
+    /// Steered prompts taken back, possibly before OpenCode had them.
+    cancelled_steers: RefCell<HashSet<String>>,
     _pump: RefCell<Option<Task<()>>>,
 }
 
@@ -220,6 +225,8 @@ impl Hub {
             rename_listeners: RefCell::default(),
             catalog_versions: RefCell::default(),
             catalog_refreshes: RefCell::default(),
+            steers: RefCell::default(),
+            cancelled_steers: RefCell::default(),
             _pump: RefCell::new(None),
         });
         let pump = cx.update(|cx| Self::start_pump(&hub, cx));
@@ -299,6 +306,7 @@ impl Hub {
                 cx.update(|cx| match message {
                     PumpMessage::Connected => {
                         hub.mcp.reconnected(cx);
+                        Hub::recheck_steers(&hub, cx);
                         let session_ids: Vec<String> =
                             hub.sessions.borrow().keys().cloned().collect();
                         for session_id in session_ids {
@@ -362,6 +370,15 @@ impl Hub {
             }
         }
 
+        if let Some(delivered) = match event.kind.as_str() {
+            "session.inbox.delivered" => Some(true),
+            "session.inbox.cancelled" => Some(false),
+            _ => None,
+        } && let Some(inbox_id) = event.data.get("inboxID").and_then(Value::as_str)
+        {
+            self.settle_steer(inbox_id, delivered);
+        }
+
         match event.kind.as_str() {
             "permission.asked" => return self.permission_asked(&session_id, &event.data, cx),
             "permission.replied" => return self.permission_replied(&session_id, &event.data, cx),
@@ -418,6 +435,46 @@ impl Hub {
 
     /// Refetches the commands and skills of `directory` for the threads open
     /// in it.
+    fn settle_steer(&self, message_id: &str, delivered: bool) {
+        self.cancelled_steers.borrow_mut().remove(message_id);
+        if let Some((_, settled)) = self.steers.borrow_mut().remove(message_id) {
+            settled.send(delivered).ok();
+        }
+    }
+
+    /// Missed events aren't replayed, so after a reconnect each steered
+    /// prompt that left the inbox is settled by whether it reached the
+    /// session.
+    fn recheck_steers(self: &Rc<Self>, cx: &mut App) {
+        let steers: Vec<(String, String)> = self
+            .steers
+            .borrow()
+            .iter()
+            .map(|(message_id, (session_id, _))| (message_id.clone(), session_id.clone()))
+            .collect();
+        for (message_id, session_id) in steers {
+            let hub = Rc::downgrade(self);
+            let client = self.client.clone();
+            cx.spawn(async move |cx| {
+                if client.inbox_ids(&session_id).await?.contains(&message_id) {
+                    return Ok(());
+                }
+                let delivered = client
+                    .all_messages(&session_id)
+                    .await?
+                    .iter()
+                    .any(|message| message.id == message_id);
+                cx.update(|_| {
+                    if let Some(hub) = hub.upgrade() {
+                        hub.settle_steer(&message_id, delivered);
+                    }
+                });
+                anyhow::Ok(())
+            })
+            .detach_and_log_err(cx);
+        }
+    }
+
     fn refresh_catalog(self: &Rc<Self>, directory: String, cx: &mut App) {
         let has_sessions = self
             .sessions
@@ -2255,6 +2312,14 @@ impl OpenCodeConnection {
         })
     }
 
+    pub fn steering(&self, session_id: &str) -> Option<Rc<dyn AgentSteering>> {
+        self.hub.sessions.borrow().get(session_id)?;
+        Some(Rc::new(Steering {
+            hub: self.hub.clone(),
+            session_id: session_id.to_string(),
+        }))
+    }
+
     pub fn profiles(&self, session_id: &str) -> Option<Arc<dyn ProfileProvider>> {
         let sessions = self.hub.sessions.borrow();
         let entry = sessions.get(session_id)?;
@@ -2742,6 +2807,7 @@ impl ReceiptSessionSubmissions for Submissions {
                             &files,
                             &skills,
                             display_metadata,
+                            None,
                         )
                         .await?
                 }
@@ -2762,6 +2828,88 @@ impl ReceiptSessionSubmissions for Submissions {
             Ok(acp::PromptResponse::new(message_id.as_str()))
         })
         .into()
+    }
+}
+
+/// Sends a queued message into the running turn. OpenCode adds it at the
+/// next step, and until then it can be taken back.
+struct Steering {
+    hub: Rc<Hub>,
+    session_id: String,
+}
+
+impl AgentSteering for Steering {
+    /// Commands run as their own turn, so they wait.
+    fn can_steer(&self, content: &[acp::ContentBlock]) -> bool {
+        !prompt_parts(content).text.starts_with('/')
+    }
+
+    fn steer(
+        &self,
+        content: Vec<acp::ContentBlock>,
+        cx: &mut App,
+    ) -> (SharedString, Task<Result<bool>>) {
+        let message_id = new_message_id();
+        let PromptParts {
+            text,
+            files,
+            skills,
+        } = prompt_parts(&content);
+        let metadata = render::display_metadata(&content);
+        let (settled_tx, settled_rx) = oneshot::channel();
+        // Registered first: the delivery event can beat the response.
+        self.hub
+            .steers
+            .borrow_mut()
+            .insert(message_id.clone(), (self.session_id.clone(), settled_tx));
+        let hub = self.hub.clone();
+        let session_id = self.session_id.clone();
+        let task = cx.spawn({
+            let message_id = message_id.clone();
+            async move |cx| {
+                let sent = hub
+                    .client
+                    .prompt(
+                        &session_id,
+                        &message_id,
+                        &text,
+                        &files,
+                        &skills,
+                        metadata,
+                        Some("steer"),
+                    )
+                    .await;
+                if let Err(error) = sent {
+                    cx.update(|_| {
+                        hub.steers.borrow_mut().remove(&message_id);
+                        hub.cancelled_steers.borrow_mut().remove(&message_id);
+                    });
+                    return Err(error);
+                }
+                // A cancel sent before OpenCode had the prompt did nothing.
+                let cancelled = cx.update(|_| hub.cancelled_steers.borrow().contains(&message_id));
+                if cancelled {
+                    hub.client.cancel_inbox(&session_id, &message_id).await?;
+                }
+                settled_rx
+                    .await
+                    .map_err(|_| anyhow!("OpenCode D closed before the message was delivered"))
+            }
+        });
+        (message_id.into(), task)
+    }
+
+    fn cancel_steer(&self, id: SharedString, cx: &mut App) {
+        self.hub
+            .cancelled_steers
+            .borrow_mut()
+            .insert(id.to_string());
+        let client = self.hub.client.clone();
+        let session_id = self.session_id.clone();
+        // The outcome comes from OpenCode's events: `cancelled`, or
+        // `delivered` when the cancel came too late.
+        cx.background_spawn(async move { client.cancel_inbox(&session_id, &id).await })
+            .detach_and_log_err(cx);
     }
 }
 

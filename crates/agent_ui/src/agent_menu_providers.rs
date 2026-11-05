@@ -1,5 +1,6 @@
 //! Lets agents built outside this crate fill the `/` and `@` menus and drive
-//! the thinking control and profile picker, which are otherwise native-only. Kept in its own
+//! the thinking control, profile picker and queue steering, which are
+//! otherwise native-only. Kept in its own
 //! file so the native code paths only gain a fallback line each.
 
 use crate::completion_provider::AvailableSkill;
@@ -9,7 +10,7 @@ use acp_thread::AgentConnection;
 use agent_client_protocol::v2::schema as acp;
 use anyhow::Result;
 use collections::HashMap;
-use gpui::{App, Global, Task};
+use gpui::{App, Global, SharedString, Task};
 use language_model::LanguageModelEffortLevel;
 use project::AgentId;
 use std::{rc::Rc, sync::Arc};
@@ -45,12 +46,32 @@ pub type ThinkingProvider =
 pub type ProfilesProvider =
     Rc<dyn Fn(&Rc<dyn AgentConnection>, &acp::SessionId, &App) -> Option<Arc<dyn ProfileProvider>>>;
 
+/// Adds a queued message to the agent's running turn at its next step, for
+/// agents that take messages mid-turn rather than ending the turn early as
+/// the native agent does.
+pub trait AgentSteering {
+    /// Content that can't be steered waits for the turn to end.
+    fn can_steer(&self, content: &[acp::ContentBlock]) -> bool;
+    /// Hands `content` to the agent. The task resolves to true once the agent
+    /// adds it to the thread, or false once `cancel_steer` takes it back.
+    fn steer(
+        &self,
+        content: Vec<acp::ContentBlock>,
+        cx: &mut App,
+    ) -> (SharedString, Task<Result<bool>>);
+    fn cancel_steer(&self, id: SharedString, cx: &mut App);
+}
+
+pub type SteeringProvider =
+    Rc<dyn Fn(&Rc<dyn AgentConnection>, &acp::SessionId, &App) -> Option<Rc<dyn AgentSteering>>>;
+
 #[derive(Default)]
 struct AgentMenuProviders {
     skills: HashMap<AgentId, SkillsProvider>,
     thread_text: HashMap<AgentId, ThreadTextProvider>,
     thinking: HashMap<AgentId, ThinkingProvider>,
     profiles: HashMap<AgentId, ProfilesProvider>,
+    steering: HashMap<AgentId, SteeringProvider>,
 }
 
 impl Global for AgentMenuProviders {}
@@ -91,6 +112,25 @@ pub(crate) fn provided_profiles(
     let provider = cx
         .try_global::<AgentMenuProviders>()?
         .profiles
+        .get(&connection.agent_id())?
+        .clone();
+    provider(connection, session_id, cx)
+}
+
+pub fn register_steering_provider(agent_id: AgentId, provider: SteeringProvider, cx: &mut App) {
+    cx.default_global::<AgentMenuProviders>()
+        .steering
+        .insert(agent_id, provider);
+}
+
+pub(crate) fn provided_steering(
+    connection: &Rc<dyn AgentConnection>,
+    session_id: &acp::SessionId,
+    cx: &App,
+) -> Option<Rc<dyn AgentSteering>> {
+    let provider = cx
+        .try_global::<AgentMenuProviders>()?
+        .steering
         .get(&connection.agent_id())?
         .clone();
     provider(connection, session_id, cx)

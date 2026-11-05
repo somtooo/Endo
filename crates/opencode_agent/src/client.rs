@@ -192,17 +192,47 @@ impl OpenCodeClient {
         files: &[Value],
         skills: &[String],
         metadata: Value,
+        delivery: Option<&str>,
     ) -> Result<()> {
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "id": message_id,
             "text": text,
             "files": files,
             "skills": skill_attachments(skills),
             "metadata": metadata,
         });
+        if let Some(delivery) = delivery {
+            body["delivery"] = Value::String(delivery.into());
+        }
         let path = format!("/api/session/{session_id}/prompt");
         let _: Value = self.post_json(self.url(&path, &[])?, &body).await?;
         Ok(())
+    }
+
+    /// Takes back a prompt the session hasn't delivered yet. A delivered one
+    /// is left alone.
+    pub async fn cancel_inbox(&self, session_id: &str, inbox_id: &str) -> Result<()> {
+        let path = format!("/api/session/{session_id}/inbox/{inbox_id}");
+        let request = self
+            .request(Method::DELETE, self.url(&path, &[])?)
+            .body(AsyncBody::empty())?;
+        let _: Value = self.send_json(request, &path).await?;
+        Ok(())
+    }
+
+    /// The IDs of prompts waiting in the session's inbox.
+    pub async fn inbox_ids(&self, session_id: &str) -> Result<HashSet<String>> {
+        #[derive(Deserialize)]
+        struct Item {
+            id: String,
+        }
+        #[derive(Deserialize)]
+        struct Response {
+            data: Vec<Item>,
+        }
+        let path = format!("/api/session/{session_id}/inbox");
+        let response: Response = self.get_json(self.url(&path, &[])?).await?;
+        Ok(response.data.into_iter().map(|item| item.id).collect())
     }
 
     pub async fn interrupt(&self, session_id: &str) -> Result<()> {

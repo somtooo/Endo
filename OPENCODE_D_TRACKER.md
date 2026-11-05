@@ -25,7 +25,7 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
-| 25 | Steering queued messages | Steering can't be supported: OpenCode has no way to add a message to a running turn. Whether queued messages (sent after the turn ends) work in OpenCode D hasn't been checked. | You | Needs check |
+| 25 | Steering queued messages | The native Steer button and Ctrl-Alt-S now work in OpenCode D threads. Steering hands the front queued message to OpenCode with `delivery: "steer"`, which adds it to the running turn at the next step. Undo, Stop, Clear All, delete and editing take it back (`DELETE inbox/:id`); OpenCode's `session.inbox.delivered` or `cancelled` event says which happened, so a late undo never sends it twice. Queued messages already worked. UI-tested by the agent: steer, undo, Stop, Send Now, edit, delete, and a steer at the end of a turn. | You | Needs check |
 | 32 | Install OpenCode button untested | The install flow was tested on its own but never in the running app. The user will test it. | You | Needs check |
 
 ## Done or closed
