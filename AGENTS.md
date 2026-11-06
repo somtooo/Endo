@@ -136,6 +136,11 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 - Use `./script/clippy` instead of `cargo clippy`
 
+# Commit messages
+
+- Review recent project commit history before writing a commit message and follow its conventions.
+- Use `area: Imperative description`, naming the relevant crate or project area (for example, `agent_ui: Fix thread title restoration`). Do not use conventional commit types such as `feat:` or `fix:` as the prefix.
+
 # Pull request hygiene
 
 When an agent opens or updates a pull request, it must:
