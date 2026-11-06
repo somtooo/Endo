@@ -271,6 +271,7 @@ impl AgentConnection for InstallConnection {
         cx.spawn(async move |cx| {
             let binary = cx.background_spawn(install(http.clone())).await?;
             log::info!("installed OpenCode at {}", binary.display());
+            cx.update(|cx| cx.set_global(crate::Installed(true)));
             cx.update(|cx| Hub::get(http, cx)).await?;
             Ok(())
         })

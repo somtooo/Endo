@@ -54,8 +54,12 @@ pub(crate) fn render_external_agents_page(
                 .size(LabelSize::Small)
                 .color(Color::Muted),
         )
-        .child(super::render_opencode_row(cx))
-        .child(Divider::horizontal())
+        // OpenCode D offers to install OpenCode when it's picked in the
+        // agent panel. Until then, there's nothing to configure.
+        .when(opencode_agent::is_installed(cx), |this| {
+            this.child(super::render_opencode_row(cx))
+                .child(Divider::horizontal())
+        })
         .child(agent_list)
         .into_any_element()
 }

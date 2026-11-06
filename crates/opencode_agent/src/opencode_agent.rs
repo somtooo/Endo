@@ -48,6 +48,17 @@ fn write_icon(cx: &App) -> Option<gpui::SharedString> {
 
 struct ServiceHttpClient(Arc<dyn http_client::HttpClient>);
 
+pub(crate) struct Installed(pub(crate) bool);
+
+impl Global for Installed {}
+
+/// Whether OpenCode was on this machine when Zed started, or has been
+/// installed from an OpenCode D thread since.
+pub fn is_installed(cx: &App) -> bool {
+    cx.try_global::<Installed>()
+        .is_some_and(|installed| installed.0)
+}
+
 impl Global for ServiceHttpClient {}
 
 /// A client for the OpenCode service, starting the service if needed.
@@ -70,6 +81,7 @@ pub fn init(http: Arc<dyn http_client::HttpClient>, cx: &mut App) {
     // is never opened.
     let installed = find_system_binary().is_some()
         || read_registration(&registration_path()).ok().flatten().is_some();
+    cx.set_global(Installed(installed));
     if installed {
         Hub::get(http.clone(), cx).detach_and_log_err(cx);
     }
