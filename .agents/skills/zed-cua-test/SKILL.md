@@ -22,6 +22,33 @@ under test, or pass `--worktree DIR`; using the script from a different
 worktree's copy of this skill is fine. The worktree must contain the "Fix
 Wayland input" commit from `develop`.
 
+## Model selection (all CUA work)
+
+This policy applies to every agent or subagent driving UI tests, including
+tests that do not use OpenCode. It also applies to models selected inside
+the application under test. These tests use the user's quota, so do not
+silently inherit an unlisted controller or harness default.
+
+Use only these models and effort levels. Resolve the exact available model
+ID and supported effort before spawning a tester, then select them explicitly
+in the delegation call. Putting a model preference in the tester's prompt
+does not change the model running that tester.
+
+| Model | Provider | Effort | When to use it |
+|---|---|---|---|
+| GPT-6 Luna | OpenAI | max | The default. It's the cheapest. |
+| Haiku 5.5 | Claude Agent | xhigh | When a test needs faster replies. It costs a little more. |
+| GPT-6.1 Terra | OpenAI | high | When a test needs a stronger model, or as a fast fallback. It costs the most of the three. |
+
+Don't use free models, the "Fast" versions, or any other model. If the
+delegation tool cannot select an allowed model and effort, report that as
+a blocker rather than using its default. Record the actual model, provider,
+and effort in the test report.
+
+A 429 or "usage limit" means that account is out of quota. Switch to an
+allowed model from the other provider. If none of the three work, report
+it as a blocker, not a Zed bug.
+
 ## The run
 
 1. **Start:** `zedtest up`. It builds the worktree's Zed if needed, prepares
@@ -141,23 +168,10 @@ and Claude Agent), so messages get real replies. Replies are part of the
 test: send messages, don't mark them blocked. Keep prompts short, because
 they use the user's quota.
 
-### Choosing a model
-
-Use only these models, set in the thread's model selector and effort
-selector. Each new thread starts on a free model, so change it before the
-first message. Don't use free models, the "Fast" versions, or any other
-model.
-
-| Model | Provider | Effort | When to use it |
-|---|---|---|---|
-| GPT-6 Luna | OpenAI | max | The default. It's the cheapest. |
-| Haiku 5.5 | Claude Agent | xhigh | When a test needs faster replies. It costs a little more. |
-| GPT-6.1 Terra | OpenAI | high | When a test needs a stronger model, or as a fast fallback. It costs the most of the three. |
-
-A 429 or "usage limit" in the thread means that account is out of quota.
-Switch to an allowed model from the other provider. If none of the three
-work, report it as a blocker, not a Zed bug. `--no-logins` leaves only the
-free models, so use it only when a test needs no replies.
+Use the model policy above for the thread's model selector and effort
+selector too. Each new thread starts on a free model, so change it before
+the first message. `--no-logins` leaves only the free models, so use it only
+when a test needs no replies.
 
 Inspect the service with `api /api/session` (sessions) and
 `api /api/session/ID/message` (a session's messages); add `--full` to pipe
@@ -175,6 +189,9 @@ service, where deleting a thread deletes a real session.
   it use the new binary, so tell testers which build they cover.
 - Repeat the hard rule above in every tester's prompt. A tester used desktop
   tools by mistake once, so spell it out.
+- Apply the model policy above when spawning each tester; do not leave model
+  selection to the harness default. Include the selected model and effort
+  in the tester's prompt so it can record them in its report.
 - Each tester runs its own `up` … `down`; runs never share a Zed, even in
   the same worktree. Give each one the skill, the worktree path, what to test
   and how to report: steps, expected and actual results, screenshot paths and
