@@ -23,7 +23,6 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
 | 39 | OpenCode D row in settings without OpenCode | The OpenCode D row on AI > External Agents now appears only when OpenCode is installed, or after installing it from an OpenCode D thread. Without OpenCode, the settings page looks the same as upstream Zed. | You | Needs check |
-| 36 | Thinking blocks stay open | With thinking display set to Auto, a thinking block stayed open when another thinking block followed it, when a tool call followed it, or when the turn ended. All three now close it, unless you opened it yourself. This is a fix in shared `agent_ui` code, so it applies to every agent. Covered by a test that fails without the fix. | Plan | Needs check |
 | 37 | No sidebar spinner for a session already running when Zed starts | Reported by the user: a session running in the TUI showed no spinner in Zed's sidebar until its row was clicked. The agent couldn't reproduce it with a private service. A session started before Zed launched and one started after both showed an animated spinner. Needs more detail about the case that failed. | You | Needs info |
 
 ## Later
@@ -63,6 +62,7 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 | 32 | Install OpenCode button untested | The install flow was tested on its own but never in the running app. The user will test it. | You | Done |
 | 35 | Formatter and update settings | Not added to the settings page, by the user's choice. | You | Won't fix |
 | 38 | Moved session stays under its old project | Moving a session to another folder left its sidebar row under the old project. OpenCode D now follows `session.moved`, and the startup sync corrects rows for sessions moved while Zed was closed. An open thread used to write its workspace's folder back over the move; it now keeps the session's folder when that's outside the workspace. UI-tested by the agent with git worktrees and the thread open: move, reply, and move back. A Zed restart wasn't UI-tested, because the test tool can't restart Zed with the same profile. | You | Done |
+| 36 | Thinking blocks stay open | With thinking display set to Auto, a thinking block stayed open when another thinking block followed it, when a tool call followed it, or when the turn ended. All three now close it, unless you opened it yourself. This is a fix in shared `agent_ui` code, so it applies to every agent. Covered by a test that fails without the fix. | Plan | Done |
 | 20 | Inline assistant and commit messages | Route to a Zed model. Left out on purpose. | You | Won't fix |
 | 21 | Raw link text after backspace | Couldn't be reproduced. | You | Won't fix |
 | 22 | Symbol picker shows nothing | Works for the user. The test run probably had no language server. | You | Won't fix |

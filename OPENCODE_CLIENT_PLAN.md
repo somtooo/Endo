@@ -1,13 +1,13 @@
 # Zed as a first-class OpenCode client
 
-Status: planning. No code has been changed.
+Status: built, on branch `feature/zed-client`. Open items are tracked in `OPENCODE_D_TRACKER.md`. Sections 1 to 14 are the original plan; notes marked **Now** say where the result differs.
 
 ## 1. Goal
 
 Make OpenCode feel like the Zed agent inside Zed's agent panel, and fix what ACP breaks.
 
 - **v1:** Zed talks to the OpenCode server directly instead of through ACP. Every agent panel feature that can work without UI changes works. Threads stay in sync with the server, and OpenCode sessions show up in Zed's sidebar automatically.
-- **Later:** UI work for things OpenCode has and Zed lacks (background subagents, OpenCode agents as profiles), plus an OpenCode settings page.
+- **Later:** UI work for things OpenCode has and Zed lacks (background subagents, OpenCode agents as profiles), plus an OpenCode settings page. **Now:** all three are done (sections 6.2 and 15d).
 
 **Constraint:** this fork merges from upstream Zed. Almost everything goes in a **new crate**. Changes to existing Zed code are kept small and listed in section 11.
 
@@ -105,16 +105,16 @@ The v2 *connection* code (`agent_servers/src/acp/v2.rs`) isn't visible to other 
 4. **Multi-folder workspaces already work.** OpenCode uses the main folder as its location. Zed records the thread under every folder in the workspace. No work needed.
 5. **New crate first.** Changes to `agent_ui` come later, and stay in this fork. They must be clean and isolated so upstream merges stay easy.
 6. **Use the shared OpenCode service** (explained in section 5.1).
-7. **Rules:** OpenCode reads the project's `AGENTS.md` itself. Zed sends nothing extra in v1. A global "OpenCode instructions" setting comes later.
+7. **Rules:** OpenCode reads the project's `AGENTS.md` itself. Zed sends nothing extra. **Now:** a global "OpenCode instructions" setting isn't planned; OpenCode reads `~/.config/opencode/AGENTS.md` itself.
 8. **MCP:** forward Zed's MCP servers the same way ACP does today, side effects included (section 5.7). Kept simple on purpose for v1.
 9. **Remote (SSH/WSL) projects keep using ACP.**
 10. **API churn:** treat experimental OpenCode routes as unstable. Use only what we need, ignore unknown events, and check the server version.
-11. **Settings UI is out of scope.** OpenCode has many config locations, so an "Edit opencode.json" button needs its own design. Later.
+11. **Settings UI is out of scope.** OpenCode has many config locations, so an "Edit opencode.json" button needs its own design. Later. **Now:** built as a page on AI > External Agents that edits OpenCode's global config and calls the service (section 9a).
 12. **Fast models stay in the model dropdown.** In OpenCode's catalog, "GPT-5.5 Fast" is its own model, not a variant, so it appears in the model dropdown next to "GPT-5.5". The effort dropdown ("Medium") holds the model's variants.
 13. **Same option IDs and values as OpenCode's ACP, and favorites keep working.** Our dropdowns use the IDs `model`, `effort` and `mode`. Model values look like `claude-agent/opus` (`cli/src/acp/config-option.ts:22-66`). Favorites and saved defaults work through the existing `CustomAgentServer` code, stored under `agent_servers."opencode-direct"` in `settings.json` (`agent_servers/src/custom.rs:80-125, 163-190`). On first use, our crate copies your existing ACP OpenCode favorites and defaults (`agent_servers.opencode`) into that entry once, so they carry over. After that the two lanes keep separate lists.
 14. **A separate, always-present "OpenCode D" entry.** The existing ACP "OpenCode" entry stays exactly as it is, untouched and in its own lane, for upstream compatibility. OpenCode D (direct) is built in, like the Zed agent: no install step, always in the agent picker. The two never share code paths, settings or agent IDs (section 4.5).
 15. **Use the system OpenCode, never Zed's ACP download.** OpenCode D connects to the running service. If none is running, it starts one with the `opencode` binary on your system. If there's no system binary, it installs one to OpenCode's standard location (section 5.2). Zed starts the service at startup when a system binary exists (section 9a).
-16. **v1 changes no UI.** The native thinking control comes in the first UI change after v1 (section 9b).
+16. **v1 changes no UI.** The native thinking control comes in the first UI change after v1 (section 9b). **Now:** the UI changes since v1 are listed in sections 11 and 15d.
 17. **Running sessions go to the sidebar, the rest to history** (section 14).
 
 ## 4. How Zed works
@@ -301,7 +301,7 @@ Zed copies this design exactly.
   - a global `~/.config/zed/AGENTS.md`
   - per project, the first file found from `.rules`, `.cursorrules`, …, `AGENTS.md`, `CLAUDE.md` (`prompt_store/src/prompts.rs:22-32`)
 - **v1:** nothing extra. OpenCode reads the project's `AGENTS.md`.
-- **Later:** a setting for global OpenCode instructions. It can be sent per session through `PUT /api/experimental/session/:id/instructions/entries/:key`.
+- **Not planned:** a setting for global OpenCode instructions (decision 7).
 - **Skills:** OpenCode scans `~/.agents/skills` and every `.agents/skills` folder from the project upward (`core/src/config/plugin/compatibility.ts:45`, `discovery.ts:152-166`). **These are the same folders Zed uses** (`agent_skills/agent_skills.rs`). OpenCode already sees Zed's skills. In v1 they appear as `/` commands from `GET /api/skill`.
 
 ### 5.7 MCP
@@ -319,7 +319,7 @@ That is the "side effect": it's the cost of pushing Zed's list into a shared ser
 
 **v1:** do exactly what ACP does, for parity. Also re-register after a reconnect, so servers survive a service restart.
 
-**Later:** a `zed-` name prefix, cleanup when the last Zed thread for a folder closes, and per-agent MCP tool selection (Zed's profile "Configure MCP Tools" maps to OpenCode agent permissions).
+**Later:** cleanup when the last Zed thread for a folder closes, and per-agent MCP tool selection (Zed's profile "Configure MCP Tools" maps to OpenCode agent permissions). Tracker #40, not needed for now. A `zed-` prefix isn't needed: Zed never sends a name OpenCode's own config already has, and only removes names it added.
 
 ### 5.8 Config
 
@@ -363,22 +363,22 @@ That is the "side effect": it's the cost of pushing Zed's list into a shared ser
 
 ### 6.2 Later
 
-| Feature | Why later |
+| Feature | Status |
 |---|---|
-| Native thinking control (lightbulb + effort) | small `agent_ui` trait (section 9b). The effort dropdown covers it in v1 unless decision 1 in section 14 says otherwise. **First UI change after v1** |
-| Profile selector → OpenCode agents | needs `agent_ui` changes. The agent dropdown covers it in v1 |
-| Steering queued messages | native-only in `agent_ui` |
-| `@thread` | native-only in `agent_ui` |
-| `@skill` mention | Zed lists native skills only. Skills work as `/` commands in v1, and OpenCode reads the same skill folders |
-| Split token display, token-limit callout | native-only in `agent_ui` |
-| Background subagent management UI | new UI |
-| Open as Markdown for threads not loaded in the panel | hidden for every non-Zed agent today, ACP included (`sidebar.rs:6490`). Fix: load, then export. Small, and helps every agent |
-| OpenCode settings page, including editing `opencode.json` | needs a design: OpenCode has many config locations (section 5.8) |
-| Global OpenCode instructions setting | section 5.6 |
-| MCP cleanup and prefixing | section 5.7 |
-| ~~Native model picker~~ | Done: see 15d |
-| ~~Native message-box layout~~ | Done for the thinking control and model picker: see 15d. The remaining `as_native_thread` checks seen so far gate native-only features (profiles, fast mode, steering, token-limit callouts); not every one has been reviewed |
-| ~~Live output for background shell commands~~ | Done: see 15d. Foreground shells stream too |
+| Native thinking control (lightbulb + effort) | Done (15d) |
+| Profile selector → OpenCode agents | Done: the native picker lists OpenCode's primary agents, and Configure opens the OpenCode Agents modal |
+| Steering queued messages | Done: `delivery: "steer"`, and clicking Steer again takes the message back |
+| `@thread` | Done (15d) |
+| `@skill` mention | Done (15d) |
+| Split token display, token-limit callout | Won't fix: Zed shows one circle or two depending on the provider and model |
+| Background subagent management UI | Done: Stop on subagent cards, with Zed's cancelled state |
+| Open as Markdown for threads not loaded in the panel | Won't fix: not useful enough |
+| OpenCode settings page | Done (section 9a) |
+| Global OpenCode instructions setting | Not planned (decision 7) |
+| MCP cleanup and per-agent MCP tools | Later, tracker #40 |
+| Native model picker | Done (15d), with the Configure footer opening the settings page's Providers section |
+| Native message-box layout | Done (15d) |
+| Live output for background shell commands | Done (15d). Foreground shells stream too, and a quick shell's output shows once |
 
 ### 6.3 Not planned
 
@@ -392,10 +392,10 @@ That is the "side effect": it's the cost of pushing Zed's list into a shared ser
 |---|---|---|
 | `context_servers` (MCP) | forwarded (section 5.7) | — |
 | Skills folders | the same folders, read by OpenCode | — |
-| `auto_compact` (enabled, threshold) | none | `compaction` in `opencode.json` |
-| `default_model`, `favorite_models` | none (favourites work for dropdown values) | `model` in `opencode.json` |
-| `profiles` | none | `agents` in `opencode.json` |
-| `tool_permissions` | none (also not applied over ACP today) | `permissions` in `opencode.json` |
+| `auto_compact` (enabled, threshold) | none | `compaction` in `opencode.json`, or the OpenCode D settings page |
+| `default_model`, `favorite_models` | none (favourites work for dropdown values) | `model` in `opencode.json`, or the OpenCode D settings page |
+| `profiles` | none | `agents` in `opencode.json`, or the OpenCode Agents modal |
+| `tool_permissions` | none (also not applied over ACP today) | `permissions` in `opencode.json`, or the OpenCode Agents modal |
 | `compaction_model`, `thread_summary_model`, `subagent_model`, `model_parameters` | none | `agents.*` in `opencode.json` |
 | Global `~/.config/zed/AGENTS.md` | none | `~/.config/opencode/AGENTS.md` |
 | Notifications, sound, layout, card expansion, `use_modifier_to_send` | yes (generic UI) | — |
@@ -456,11 +456,12 @@ New crate `crates/opencode_agent`. The name `opencode` is taken by the OpenCode 
 | `form.created` / `replied` / `cancelled` | `request_elicitation` / `respond_to_elicitation` / `cancel_elicitation` |
 | `session.usage.updated` | `update_usage` |
 | `session.renamed` | `update_session_info`, plus the sidebar title |
+| `session.moved` | the sidebar row moves to the session's new folder |
 | `session.agent.selected` / `model.selected` | config-option update |
 | `session.compaction.*` | compaction entries |
 | `session.retry.scheduled` | `update_retry_status` |
 | `session.revert.staged` / `committed` | rewind from the first hidden message |
-| `command.updated`, `skill.updated`, `agent.updated`, `model.updated` | re-fetch, then update commands or options |
+| `command.updated`, `skill.updated`, `agent.updated`, `model.updated`, `provider.updated`, `integration.updated`, `credential.updated` | re-fetch, then update commands, options and the model list |
 | stream lost | `handle_connection_lost`, reconnect, resync |
 
 ## 9. Automatic thread sync (replaces manual import)
@@ -476,6 +477,7 @@ It needs the OpenCode service running, because the sessions live in OpenCode's d
 3. **Live updates from events:**
    - `session.created` (top-level) → add a row
    - `session.renamed` → update the title
+   - `session.moved` → move the row to the new folder. An open thread keeps the session's folder when it's outside the workspace it's open in
    - activity → update `updated_at`
    - `session.archived` / `unarchived` → archive or unarchive the row
    - `session.deleted` → remove the row
@@ -514,7 +516,9 @@ Details:
 - **Zed never stops the service.** The TUI or desktop app may be using it.
 - **Synced history rows** use the ID `opencode-direct`, so they reopen through OpenCode D. Sessions that already have a row (for example, ones you made through ACP OpenCode, ID `opencode`) are skipped. The check is by session ID, as import does (`thread_import.rs:867`). So nothing appears twice.
 - **ACP OpenCode threads** keep reopening through ACP. OpenCode D doesn't take them over.
-- **Turning OpenCode D off** (if you want a machine with OpenCode installed but no Zed sync): a hidden setting, later if needed. Not in v1.
+- **Turning OpenCode D off** (if you want a machine with OpenCode installed but no Zed sync): a hidden setting, later if needed. Not built.
+
+**The settings page (built).** AI > External Agents has an OpenCode D row, shown only when OpenCode is installed or after installing it from an OpenCode D thread. Its page has Providers (connect by API key, sign-in or command; switch, rename and disconnect accounts; search), Plugins (add, turn on or off, remove), Compaction, Warming, and Defaults (model, agent, web search). It writes OpenCode's global config with V2 keys, keeping comments, and calls the service for connections and plugins. Terminal-only settings and those Zed already has (appearance, diffs, alerts, terminal, debug, MCP) are left out on purpose, and so are the formatter and update settings.
 
 ## 9b. The native thinking control (lightbulb + effort)
 
@@ -530,7 +534,7 @@ The native control is built by `render_thinking_control` (`agent_ui/src/conversa
 - Effort levels = the current model's variants (`Model.Info.variants`).
 - Turning thinking off: OpenCode has no thinking flag, only variants. If a model has a variant that turns reasoning off (e.g. `none`), the lightbulb maps to it. Otherwise the native code's own rule applies: show the effort dropdown only, no lightbulb.
 
-**Change needed (`agent_ui`, later):** a small trait on the connection, e.g. `AgentThinkingControls`, with `effort_levels`, `selected_effort`, `set_effort`, `can_disable_thinking`, `thinking_enabled`, `set_thinking_enabled`. `render_thinking_control` asks the trait instead of `as_native_thread`. The native agent and OpenCode both implement it. When OpenCode provides it, our crate stops sending the separate `effort` dropdown, so the effort control isn't shown twice. The model and agent dropdowns stay as they are.
+**Done (15d).** The plan was: a small trait on the connection, e.g. `AgentThinkingControls`, with `effort_levels`, `selected_effort`, `set_effort`, `can_disable_thinking`, `thinking_enabled`, `set_thinking_enabled`. `render_thinking_control` asks the trait instead of `as_native_thread`. The native agent and OpenCode both implement it. When OpenCode provides it, our crate stops sending the separate `effort` dropdown, so the effort control isn't shown twice. The model and agent dropdowns stay as they are.
 
 ## 9c. Archiving and the sidebar spinner
 
@@ -545,7 +549,7 @@ The native control is built by `render_thinking_control` (`agent_ui/src/conversa
 
 **Where the spinner comes from.** A sidebar row shows a spinner only if an agent panel holds a loaded view of that thread (`sidebar.rs:8100-8158`, from `AgentPanel::conversation_views()`). `ThreadMetadata` has no status field, and nothing else can feed one. So after a restart, a running OpenCode session in the sidebar shows no spinner until you open it.
 
-**Fix (first UI change after v1).** A small global status store in `agent_ui`, keyed by session ID. Our crate updates it from `session.execution.*` events. The sidebar reads it for rows that aren't loaded (`sidebar.rs:1792-1800`, plus the project header's running count at `:1780-1788`). About 30 lines across `agent_ui` and `sidebar`.
+**Done.** The plan was: A small global status store in `agent_ui`, keyed by session ID. Our crate updates it from `session.execution.*` events. The sidebar reads it for rows that aren't loaded (`sidebar.rs:1792-1800`, plus the project header's running count at `:1780-1788`). About 30 lines across `agent_ui` and `sidebar`.
 
 Rejected alternative: keep running sessions loaded in the panel in the background, so they count as "live". That needs a new public panel API (`insert_retained_thread` is private, `agent_panel.rs:4277`). Background views aren't restored after a restart (`:1184-1265`), and they only exist for open workspaces.
 
@@ -570,6 +574,17 @@ Copies the TUI and web app (section 5.4):
 | Add the crate to the workspace and call its `init` (`Cargo.toml`, `zed/src/main.rs`) | a few lines | Yes |
 | `pub` truncate or replace entries (`acp_thread`) | ~5 lines | No. Only if the rewind workaround proves fragile |
 
+**Now:** the shared changes made since v1. Each one defaults to the native behavior, so other agents are unchanged.
+
+| Change | Where |
+|---|---|
+| Hooks that let OpenCode D supply skills, `@` thread text, the thinking control, profiles, steering and a session's folder | `agent_ui/src/agent_menu_providers.rs`, plus a one-line fallback at each native call site |
+| The model picker's Configure footer can run another action | `footer_action` in `acp_thread/src/connection.rs`, used in `agent_ui/src/model_selector.rs` |
+| An open thread keeps its session's folder when the session moved out of the workspace | `agent_ui/src/thread_metadata_store.rs` |
+| Thinking blocks close when the reply moves on (a fix for every agent) | `agent_ui/src/entry_view_state.rs`, `conversation_view.rs` |
+| The OpenCode D settings page and its row on External Agents | `settings_ui/src/pages/opencode_*.rs`, `external_agents_page.rs` |
+| The settings path the Configure footer opens | `zed_actions/src/lib.rs` |
+
 ## 12. Existing bug found: thinking blocks that stay open
 
 Not caused by this project, but it shows up in OpenCode threads today, and the direct client will hit it too.
@@ -582,7 +597,7 @@ With `thinking_display: "auto"`, Zed opens a thinking block while it streams, an
 
 OpenCode makes all three more likely. It sends each reasoning part as its own message (`cli/src/acp/translate.ts:196-198`, `reasoningMessageID`), so thinking blocks often come back to back, and often end a turn.
 
-**Fix (in `entry_view_state.rs`, about 10 lines):** when switching to a new block, close the previous one unless you opened it yourself. When clearing the tracking at the end of a turn, close the tracked block under the same rule. Also run the check on new entries. This touches `agent_ui`, so it's a separate small fix, and a good candidate to send upstream.
+**Fixed** (`agent_ui: Close automatically opened thinking blocks when the reply moves on`, tracker #36). The plan was: when switching to a new block, close the previous one unless you opened it yourself. When clearing the tracking at the end of a turn, close the tracked block under the same rule. Also run the check on new entries. This touches `agent_ui`, so it's a separate small fix, and a good candidate to send upstream.
 
 ## 13. Risks
 
@@ -599,15 +614,15 @@ OpenCode makes all three more likely. It sends each reasoning part as its own me
 None right now. Resolved:
 
 - **Installing OpenCode** when you pick OpenCode D and none is on the system: ask first, then install. The thread shows "OpenCode isn't installed" with an Install button. Zed downloads the official release for your platform, checks its checksum, and puts it in `~/.opencode/bin`. Zed never runs the `curl … | bash` script.
-- **The native thinking control** comes after v1. v1 changes no UI.
+- **The native thinking control** comes after v1. v1 changes no UI. **Now:** done.
 - **Running sessions show in the sidebar; the rest go to history** (replaces decision 17). Sync writes sessions that are running with `archived: false`, so they appear in the sidebar under their project, and everything else with `archived: true`. A session that starts running later is un-archived. Writing the flag has no side effects (section 9c).
-- **The sidebar spinner after a restart** needs a small UI change, so it comes with the first UI change after v1 (section 9c). In v1, a running session shows in the sidebar without a spinner until you open it; once open, it streams live.
+- **The sidebar spinner after a restart** needs a small UI change, so it comes with the first UI change after v1 (section 9c). In v1, a running session shows in the sidebar without a spinner until you open it; once open, it streams live. **Now:** done. Zed asks the service which sessions are running at startup and marks their rows. Tracker #37 holds one report of a missing spinner that couldn't be reproduced.
 
 ## 15. Phases
 
 1. **Spike: client and sync, no UI. Done.** See section 15a.
 2. **v1 backend. Done.** See section 15b.
-3. **Later:** section 6.2.
+3. **Later:** section 6.2. Done, apart from tracker #40.
 
 ## 15b. v1 status
 
@@ -622,11 +637,7 @@ Built, and tested by hand: live sync with the TUI, reverts, the sidebar spinner 
 
 Also tested by hand: forms (the question tool), MCP forwarding, and Open as Markdown. Extension MCP servers such as GitHub's run without a `context_servers` settings entry, so the list comes from `server_ids()` filtered by `is_server_enabled()`, not `configured_server_ids()`. Each server sent is logged to `Zed.log` as `Registered MCP server <name> for <folder>`.
 
-Not tested in the running app:
-
-| Feature | How it works | How to test |
-|---|---|---|
-| Install | With no `opencode` on PATH or in `~/.opencode/bin`, OpenCode D shows Zed's sign-in prompt with an **Install OpenCode** button. It downloads the latest npm package for this platform, checks its SHA-512 hash, and writes `~/.opencode/bin/opencode`. The download path was tested on its own | Hide the binary (for example rename `~/.opencode/bin/opencode` and make sure `which opencode` finds nothing), stop the service, open OpenCode D, press Install |
+Install: with no `opencode` on PATH or in `~/.opencode/bin`, OpenCode D shows Zed's sign-in prompt with an **Install OpenCode** button. It downloads the latest npm package for this platform, checks its SHA-512 hash, and writes `~/.opencode/bin/opencode`. Tested by the user in the running app.
 
 ## 15c. Slash and @ menus (done, see 15d)
 
@@ -667,8 +678,8 @@ Fixed later:
 - Native model picker: OpenCode D implements `AgentModelSelector`, so the native picker shows its models with provider icons, groups named by provider (`/api/provider`), token prices (`in$/out$`; free models show none) and favorites (stored where the old dropdown kept them, `favorite_config_option_values.model`). `conversation_view.rs` builds the picker when an agent's config options have no model option; only OpenCode D does both.
 - Native thinking control: a thinking provider in `agent_menu_providers.rs` feeds the native lightbulb and effort selector (`thread_view.rs` gains a fallback line at each native hook). Every model gets the lightbulb beside the effort selector. Off hides the selector and, for models with a `none` variant, switches to it; models without one keep their effort, since OpenCode cannot stop them thinking. On restores the effort from before. Effort levels are the variants plus "Default" (no variant).
 - Saved defaults now apply: a new thread takes the model, effort and agent last picked in Zed (`default_config_options`). Before, they were saved but never read, so new threads used OpenCode's default model.
-- Not matched: the picker has no Recommended section (OpenCode has no such list) and no Configure footer yet.
-- Later: add the Configure footer (`should_render_footer`), but have it open an OpenCode section inside Zed's AI settings rather than the native provider settings. Do this when Zed starts supporting more OpenCode capabilities (provider setup and the like) in its settings.
+- Not matched: the picker has no Recommended section (OpenCode has no such list).
+- Configure footer: done. It opens the settings page's Providers section rather than the native provider settings (`footer_action` in `acp_thread`).
 - Placeholder reads "Message OpenCode D — @ to include context, / for commands"; the native one says "Message the Zed Agent, …". The wording is chosen per agent in `conversation_view.rs` (`placeholder_text`).
 
 Found by the Cua test pass (isolated compositor, fresh profiles, Nov 4), fixed and verified in the UI:
@@ -681,7 +692,7 @@ Found by the Cua test pass (isolated compositor, fresh profiles, Nov 4), fixed a
 Verified with no change needed: model picker (search, groups, costs, check), thinking off/on and effort, mode menu, `@` menu, title generation, live shell output and Stop (process ends), compaction divider, history reopen with diffs, add selection and selection comments, editor reload after agent edits, rewind by editing a message (files revert), Open as Markdown, `@` thread summary, question forms, subagent card and preview, skill chips, Follow, Reload Agent, thread restore after restart.
 
 Still open:
-- Effort labels capitalize the variant ID ("Xhigh"). Not yet compared with the native names for the same levels.
+- Effort labels: decided to keep OpenCode's names.
 - A new thread mentioning another can get the same generated title (OpenCode's title model copies the mention's name). Not Zed's code.
 - A directory read that is still running has a location until its output arrives, which logs one "reading bytes" error.
 
