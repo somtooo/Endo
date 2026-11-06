@@ -898,15 +898,12 @@ fn import_threads_from_other_channels_in(
     cx: &mut Context<Workspace>,
 ) {
     let current_channel = ReleaseChannel::global(cx);
-
-    let existing_thread_ids: HashSet<ThreadId> = ThreadMetadataStore::global(cx)
-        .read(cx)
-        .entries()
-        .map(|metadata| metadata.thread_id)
-        .collect();
+    let store = ThreadMetadataStore::global(cx);
+    let reload_task = store.read(cx).reload_task();
 
     let workspace_handle = cx.weak_entity();
     cx.spawn(async move |_this, cx| {
+        reload_task.await;
         let mut imported_threads = Vec::new();
 
         for channel in &ReleaseChannel::ALL {
@@ -916,10 +913,7 @@ fn import_threads_from_other_channels_in(
 
             match read_threads_from_channel(&database_dir, *channel) {
                 Ok(threads) => {
-                    let new_threads = threads
-                        .into_iter()
-                        .filter(|thread| !existing_thread_ids.contains(&thread.thread_id));
-                    imported_threads.extend(new_threads);
+                    imported_threads.extend(threads);
                 }
                 Err(error) => {
                     log::warn!(
@@ -931,11 +925,38 @@ fn import_threads_from_other_channels_in(
             }
         }
 
-        let imported_count = imported_threads.len();
-
         cx.update(|cx| {
-            ThreadMetadataStore::global(cx)
-                .update(cx, |store, cx| store.save_all(imported_threads, cx));
+            let imported_count = store.update(cx, |store, cx| {
+                // Another import can finish while this one is reading channel
+                // databases. Check the current store and this batch together.
+                let mut thread_ids: HashSet<_> =
+                    store.entries().map(|metadata| metadata.thread_id).collect();
+                let mut session_ids: HashSet<_> = store
+                    .entries()
+                    .filter_map(|metadata| metadata.session_id.clone())
+                    .collect();
+                let threads = imported_threads
+                    .into_iter()
+                    .filter(|thread| {
+                        if thread_ids.contains(&thread.thread_id)
+                            || thread
+                                .session_id
+                                .as_ref()
+                                .is_some_and(|session_id| session_ids.contains(session_id))
+                        {
+                            return false;
+                        }
+                        thread_ids.insert(thread.thread_id);
+                        if let Some(session_id) = &thread.session_id {
+                            session_ids.insert(session_id.clone());
+                        }
+                        true
+                    })
+                    .collect::<Vec<_>>();
+                let imported_count = threads.len();
+                store.save_all(threads, cx);
+                imported_count
+            });
 
             show_cross_channel_import_toast(&workspace_handle, imported_count, cx);
         })
@@ -1325,6 +1346,7 @@ mod tests {
     fn init_test(cx: &mut TestAppContext) {
         let fs = fs::FakeFs::new(cx.executor());
         cx.update(|cx| {
+            cx.set_global(db::AppDatabase::test_new());
             let settings_store = settings::SettingsStore::test(cx);
             cx.set_global(settings_store);
             theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -1466,6 +1488,179 @@ mod tests {
                 .collect();
             assert!(titles.contains("Thread A"));
             assert!(titles.contains("Thread B"));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cross_channel_import_skips_external_sessions(cx: &mut TestAppContext) {
+        init_test(cx);
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let (channel, _) = foreign_channels(cx);
+        let connection = create_channel_db(directory.path(), channel);
+        insert_thread(&connection, "Imported title", "2025-01-15T10:00:00Z", false);
+        drop(connection);
+        let imported = read_threads_from_channel(directory.path(), channel)
+            .expect("foreign thread metadata")
+            .into_iter()
+            .next()
+            .expect("foreign thread");
+        let session_id = imported.session_id.clone().expect("session ID");
+        let local = ThreadMetadata {
+            thread_id: ThreadId::new(),
+            title_override: Some("My local title".into()),
+            archived: true,
+            ..imported
+        };
+        let local_thread_id = local.thread_id;
+        cx.update(|cx| {
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(local, cx));
+        });
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |workspace, _| workspace.workspace().clone())
+            .expect("workspace");
+        let mut visual_context = gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
+        workspace.update_in(&mut visual_context, |_, _, cx| {
+            import_threads_from_other_channels_in(directory.path().to_path_buf(), cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(store.entries().count(), 1);
+            let metadata = store.entry_by_session(&session_id).expect("local session");
+            assert_eq!(metadata.thread_id, local_thread_id);
+            assert_eq!(metadata.display_title(), "My local title");
+            assert!(metadata.archived);
+
+            let sessions = vec![SessionByAgent {
+                agent_id: metadata.agent_id.clone(),
+                remote_connection: None,
+                sessions: vec![make_session(
+                    &session_id.0,
+                    Some("External title"),
+                    Some(PathList::new(&[Path::new("/project")])),
+                    None,
+                    None,
+                )],
+            }];
+            let existing_sessions = store
+                .entries()
+                .filter_map(|metadata| metadata.session_id.clone())
+                .collect();
+            assert!(collect_importable_threads(sessions, existing_sessions).is_empty());
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cross_channel_import_deduplicates_sessions_and_preserves_drafts(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let (channel_a, channel_b) = foreign_channels(cx);
+        let connection = create_channel_db(directory.path(), channel_a);
+        insert_thread(&connection, "Shared title", "2025-01-15T10:00:00Z", false);
+        drop(connection);
+        let shared = read_threads_from_channel(directory.path(), channel_a)
+            .expect("foreign thread metadata")
+            .into_iter()
+            .next()
+            .expect("foreign thread");
+        let connection = create_channel_db(directory.path(), channel_b);
+        insert_thread(&connection, "Shared title", "2025-01-15T10:00:00Z", false);
+        connection
+            .exec_bound::<(ThreadId, Option<std::sync::Arc<str>>)>(
+                "INSERT INTO sidebar_threads \
+                 (thread_id, session_id, title, updated_at, archived) \
+                 VALUES (?1, ?2, 'Shared title', '2025-01-15T10:00:00Z', 0)",
+            )
+            .expect("metadata insert")((
+            ThreadId::new(),
+            shared.session_id.map(|session_id| session_id.0),
+        ))
+        .expect("duplicate foreign session");
+        let mut insert_draft = connection
+            .exec_bound::<ThreadId>(
+                "INSERT INTO sidebar_threads \
+                 (thread_id, title, updated_at, archived) \
+                 VALUES (?1, 'Draft', '2025-01-15T10:00:00Z', 0)",
+            )
+            .expect("draft insert");
+        insert_draft(ThreadId::new()).expect("first draft");
+        insert_draft(ThreadId::new()).expect("second draft");
+        drop(insert_draft);
+        drop(connection);
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |workspace, _| workspace.workspace().clone())
+            .expect("workspace");
+        let mut visual_context = gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
+        workspace.update_in(&mut visual_context, |_, _, cx| {
+            for _ in 0..2 {
+                import_threads_from_other_channels_in(directory.path().to_path_buf(), cx);
+            }
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(store.entries().count(), 4);
+            assert_eq!(
+                store
+                    .entries()
+                    .filter(|metadata| metadata.is_draft())
+                    .count(),
+                2
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_cross_channel_import_checks_sessions_at_save_time(cx: &mut TestAppContext) {
+        init_test(cx);
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let (channel, _) = foreign_channels(cx);
+        let connection = create_channel_db(directory.path(), channel);
+        insert_thread(&connection, "Shared title", "2025-01-15T10:00:00Z", false);
+        drop(connection);
+        let mut local = read_threads_from_channel(directory.path(), channel)
+            .expect("foreign thread metadata")
+            .into_iter()
+            .next()
+            .expect("foreign thread");
+        local.thread_id = ThreadId::new();
+        let local_thread_id = local.thread_id;
+
+        let fs = fs::FakeFs::new(cx.executor());
+        let project = project::Project::test(fs, [], cx).await;
+        let multi_workspace =
+            cx.add_window(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace = multi_workspace
+            .read_with(cx, |workspace, _| workspace.workspace().clone())
+            .expect("workspace");
+        let mut visual_context = gpui::VisualTestContext::from_window(multi_workspace.into(), cx);
+        workspace.update_in(&mut visual_context, |_, _, cx| {
+            import_threads_from_other_channels_in(directory.path().to_path_buf(), cx);
+            ThreadMetadataStore::global(cx).update(cx, |store, cx| store.save(local, cx));
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            let store = ThreadMetadataStore::global(cx);
+            let store = store.read(cx);
+            assert_eq!(store.entries().count(), 1);
+            assert!(store.entry(local_thread_id).is_some());
         });
     }
 }
