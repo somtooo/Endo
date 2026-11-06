@@ -300,6 +300,12 @@ impl FromStr for ReleaseChannel {
 mod tests {
     use super::ReleaseChannel;
 
+    #[cfg(not(__do_not_set_zed_release_channel))]
+    #[test]
+    fn test_source_build_defaults_to_endo() {
+        assert_eq!(super::compile_time_release_channel_name(), "endo");
+    }
+
     #[test]
     fn test_docs_url_for_release_channel() {
         assert_eq!(

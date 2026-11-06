@@ -326,7 +326,12 @@ fn main() {
             client::telemetry::os_name(),
             client::telemetry::os_version(),
         );
-        println!("Zed System Specs (from CLI):\n{}", system_specs);
+        let app_name = if *release_channel::RELEASE_CHANNEL == ReleaseChannel::Endo {
+            "Endo"
+        } else {
+            "Zed"
+        };
+        println!("{app_name} System Specs (from CLI):\n{}", system_specs);
         return;
     }
 

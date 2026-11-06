@@ -10,6 +10,7 @@ import tarfile
 import tempfile
 import tomllib
 import unittest
+import xml.etree.ElementTree as ElementTree
 from pathlib import Path
 from unittest.mock import patch
 
@@ -18,6 +19,22 @@ install = runpy.run_path(str(ROOT / "script/install-endo"))["install"]
 
 
 class EndoBrandingTests(unittest.TestCase):
+    def test_source_build_defaults_to_endo(self):
+        self.assertEqual((ROOT / "crates/zed/RELEASE_CHANNEL").read_text().strip(), "endo")
+
+    def test_welcome_logo_matches_app_artwork(self):
+        namespace = {"svg": "http://www.w3.org/2000/svg"}
+        source = ElementTree.parse(ROOT / "crates/zed/resources/app-icon-endo.svg").getroot()
+        logo = ElementTree.parse(ROOT / "assets/images/endo_logo.svg").getroot()
+        self.assertEqual(logo.attrib["viewBox"], source.attrib["viewBox"])
+        for shape in ["path", "line", "circle"]:
+            original = source.find(f"svg:{shape}", namespace)
+            monochrome = logo.find(f"svg:{shape}", namespace)
+            self.assertIsNotNone(original)
+            self.assertIsNotNone(monochrome)
+            expected = {key: "currentColor" if value == "#ffffff" else value for key, value in original.attrib.items()}
+            self.assertEqual(monochrome.attrib, expected)
+
     def bundle(self, root, name="endo.app"):
         payload = root / "payload" / name
         for filename in ["bin/endo", "libexec/zed-editor", "share/icons/hicolor/512x512/apps/endo.png"]:
