@@ -8918,8 +8918,8 @@ impl ThreadView {
     }
 
     pub(crate) fn clear_auto_expand_tracking(&mut self, cx: &mut Context<Self>) {
-        self.entry_view_state.update(cx, |state, _cx| {
-            state.clear_auto_expand_tracking();
+        self.entry_view_state.update(cx, |state, cx| {
+            state.clear_auto_expand_tracking(cx);
         });
     }
 
