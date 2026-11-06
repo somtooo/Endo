@@ -1338,7 +1338,26 @@ impl ThreadMetadataStore {
                 )
             } else {
                 let project = thread_ref.project().read(cx);
-                let worktree_paths = project.worktree_paths(cx);
+                let mut worktree_paths = project.worktree_paths(cx);
+                // The session may have moved out of the project it's open in.
+                // A session in one of the project's folders, or below one,
+                // keeps the project's folders.
+                if let Some(folders) = crate::agent_menu_providers::provided_session_folders(
+                    thread_ref.connection(),
+                    thread_ref.session_id(),
+                    cx,
+                ) && !folders.paths().iter().all(|folder| {
+                    worktree_paths
+                        .folder_path_list()
+                        .paths()
+                        .iter()
+                        .any(|project_folder| folder.starts_with(project_folder))
+                }) {
+                    worktree_paths = existing_thread
+                        .map(|thread| thread.worktree_paths.clone())
+                        .filter(|paths| paths.folder_path_list() == &folders)
+                        .unwrap_or_else(|| WorktreePaths::from_folder_paths(&folders));
+                }
                 let remote_connection = project.remote_connection_options(cx).cloned();
 
                 (worktree_paths, remote_connection)

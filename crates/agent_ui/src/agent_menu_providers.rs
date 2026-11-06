@@ -14,6 +14,7 @@ use gpui::{App, Global, SharedString, Task};
 use language_model::LanguageModelEffortLevel;
 use project::AgentId;
 use std::{rc::Rc, sync::Arc};
+use workspace::PathList;
 
 /// Lists a session's skills. Read synchronously, so the agent must have them
 /// ready before it reports its commands.
@@ -65,6 +66,11 @@ pub trait AgentSteering {
 pub type SteeringProvider =
     Rc<dyn Fn(&Rc<dyn AgentConnection>, &acp::SessionId, &App) -> Option<Rc<dyn AgentSteering>>>;
 
+/// Gives the folders a session works in, for agents whose sessions can move
+/// to another folder than the project the thread is open in.
+pub type SessionFoldersProvider =
+    Rc<dyn Fn(&Rc<dyn AgentConnection>, &acp::SessionId, &App) -> Option<PathList>>;
+
 #[derive(Default)]
 struct AgentMenuProviders {
     skills: HashMap<AgentId, SkillsProvider>,
@@ -72,6 +78,7 @@ struct AgentMenuProviders {
     thinking: HashMap<AgentId, ThinkingProvider>,
     profiles: HashMap<AgentId, ProfilesProvider>,
     steering: HashMap<AgentId, SteeringProvider>,
+    session_folders: HashMap<AgentId, SessionFoldersProvider>,
 }
 
 impl Global for AgentMenuProviders {}
@@ -112,6 +119,29 @@ pub(crate) fn provided_profiles(
     let provider = cx
         .try_global::<AgentMenuProviders>()?
         .profiles
+        .get(&connection.agent_id())?
+        .clone();
+    provider(connection, session_id, cx)
+}
+
+pub fn register_session_folders_provider(
+    agent_id: AgentId,
+    provider: SessionFoldersProvider,
+    cx: &mut App,
+) {
+    cx.default_global::<AgentMenuProviders>()
+        .session_folders
+        .insert(agent_id, provider);
+}
+
+pub(crate) fn provided_session_folders(
+    connection: &Rc<dyn AgentConnection>,
+    session_id: &acp::SessionId,
+    cx: &App,
+) -> Option<PathList> {
+    let provider = cx
+        .try_global::<AgentMenuProviders>()?
+        .session_folders
         .get(&connection.agent_id())?
         .clone();
     provider(connection, session_id, cx)

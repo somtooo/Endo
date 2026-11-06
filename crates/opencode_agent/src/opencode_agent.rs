@@ -124,6 +124,16 @@ pub fn init(http: Arc<dyn http_client::HttpClient>, cx: &mut App) {
         }),
         cx,
     );
+    agent_ui::agent_menu_providers::register_session_folders_provider(
+        AgentId::new(AGENT_ID),
+        Rc::new(|connection, session_id, _cx| {
+            connection
+                .clone()
+                .downcast::<OpenCodeConnection>()?
+                .session_folders(&session_id.0)
+        }),
+        cx,
+    );
     agent_ui::agent_menu_providers::register_thread_text_provider(
         AgentId::new(AGENT_ID),
         Rc::new({

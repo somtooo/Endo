@@ -62,6 +62,7 @@ pub const DISPLAY_NAME: &str = "OpenCode D";
 const LIFECYCLE_EVENTS: &[&str] = &[
     "session.created",
     "session.renamed",
+    "session.moved",
     "session.deleted",
     "session.archived",
     "session.unarchived",
@@ -107,6 +108,9 @@ struct SessionEntry {
     /// Pending permission request ID to the tool call it was attached to.
     permissions: HashMap<String, String>,
     options: Rc<SessionOptions>,
+    /// The folder the session works in now. It starts as the one it was
+    /// opened in and follows the session when it moves.
+    folder: String,
     /// Thread changes not applied yet, with the message each belongs to.
     /// Once a view shows the thread, they're applied one new entry per
     /// update: the agent panel assumes each effect flush adds at most one.
@@ -154,6 +158,7 @@ pub struct Hub {
     interrupted: RefCell<HashSet<String>>,
     activity_listeners: RefCell<Vec<Box<dyn Fn(&str, Activity, &mut App)>>>,
     rename_listeners: RefCell<Vec<Box<dyn Fn(&str, &str, &mut App)>>>,
+    move_listeners: RefCell<Vec<Box<dyn Fn(&str, &str, &mut App)>>>,
     mcp: Rc<mcp::McpSync>,
     /// Counts catalog events per directory, so a thread can tell that its
     /// commands and skills changed while it was loading them.
@@ -235,6 +240,7 @@ impl Hub {
             interrupted: RefCell::default(),
             activity_listeners: RefCell::default(),
             rename_listeners: RefCell::default(),
+            move_listeners: RefCell::default(),
             catalog_versions: RefCell::default(),
             catalog_refreshes: RefCell::default(),
             steers: RefCell::default(),
@@ -264,6 +270,11 @@ impl Hub {
     /// server is renamed.
     pub fn observe_renames(&self, listener: impl Fn(&str, &str, &mut App) + 'static) {
         self.rename_listeners.borrow_mut().push(Box::new(listener));
+    }
+
+    /// Called with a session's new directory when it moves.
+    pub fn observe_moves(&self, listener: impl Fn(&str, &str, &mut App) + 'static) {
+        self.move_listeners.borrow_mut().push(Box::new(listener));
     }
 
     fn start_pump(hub: &Rc<Hub>, cx: &mut App) -> Task<()> {
@@ -384,6 +395,19 @@ impl Hub {
         {
             for listener in self.rename_listeners.borrow().iter() {
                 listener(&session_id, title, cx);
+            }
+        }
+        if event.kind == "session.moved"
+            && let Some(directory) = event
+                .data
+                .pointer("/location/directory")
+                .and_then(Value::as_str)
+        {
+            if let Some(entry) = self.sessions.borrow_mut().get_mut(&session_id) {
+                entry.folder = directory.to_string();
+            }
+            for listener in self.move_listeners.borrow().iter() {
+                listener(&session_id, directory, cx);
             }
         }
 
@@ -1626,6 +1650,7 @@ impl Hub {
                 buffered: Some(Vec::new()),
                 server_rewind: Rc::default(),
                 permissions: HashMap::default(),
+                folder: options.directory.clone(),
                 options,
                 queue: VecDeque::new(),
                 draining: false,
@@ -2371,6 +2396,12 @@ impl OpenCodeConnection {
             directory: options.directory.clone(),
             models,
         })
+    }
+
+    pub fn session_folders(&self, session_id: &str) -> Option<PathList> {
+        let sessions = self.hub.sessions.borrow();
+        let folder = &sessions.get(session_id)?.folder;
+        (!folder.is_empty()).then(|| PathList::new(&[PathBuf::from(folder)]))
     }
 
     pub fn steering(&self, session_id: &str) -> Option<Rc<dyn AgentSteering>> {

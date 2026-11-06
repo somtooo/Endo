@@ -14,8 +14,10 @@ use anyhow::Result;
 use chrono::Utc;
 use gpui::{App, AsyncApp, TaskExt as _};
 use project::AgentId;
+use std::path::PathBuf;
 use std::rc::Rc;
 use util::ResultExt as _;
+use util::path_list::PathList;
 
 const MAX_SYNCED_SESSIONS: usize = 2000;
 const PAGE_SIZE: usize = 200;
@@ -31,6 +33,7 @@ pub(crate) fn start(hub: Rc<Hub>, cx: &mut App) {
         });
     }
     hub.observe_renames(|session_id, title, cx| set_title(session_id, title, cx));
+    hub.observe_moves(|session_id, directory, cx| set_directory(session_id, directory, cx));
     cx.spawn(async move |cx| sync_all(&hub, cx).await.log_err())
         .detach();
 }
@@ -92,11 +95,14 @@ async fn sync_all(hub: &Rc<Hub>, cx: &mut AsyncApp) -> Result<()> {
             (rows, unused_rows)
         };
         log::info!("synced {} OpenCode sessions into thread history", rows.len());
-        // Rows added before their session had a title (or renamed while Zed
-        // was closed) catch up here.
+        // Rows added before their session had a title (or renamed or moved
+        // while Zed was closed) catch up here.
         for session in &sessions {
             if let Some(title) = &session.title {
                 set_title(&session.id, title, cx);
+            }
+            if let Some(location) = &session.location {
+                set_directory(&session.id, &location.directory, cx);
             }
         }
         store.update(cx, |store, cx| {
@@ -153,6 +159,25 @@ fn set_title(session_id: &str, title: &str, cx: &mut App) {
         store.update(cx, |store, cx| {
             store.set_generated_title(thread_id, title.to_string().into(), cx)
         });
+    }
+}
+
+/// Moves an OpenCode D row to the folder its session moved to, so the sidebar
+/// lists it under that project.
+fn set_directory(session_id: &str, directory: &str, cx: &mut App) {
+    let store = ThreadMetadataStore::global(cx);
+    let folder_paths = PathList::new(&[PathBuf::from(directory)]);
+    let moved = store
+        .read(cx)
+        .entry_by_session(&acp::SessionId::new(session_id))
+        .filter(|entry| entry.agent_id == AgentId::new(AGENT_ID))
+        .filter(|entry| entry.folder_paths() != &folder_paths)
+        .map(|entry| ThreadMetadata {
+            worktree_paths: WorktreePaths::from_folder_paths(&folder_paths),
+            ..entry.clone()
+        });
+    if let Some(moved) = moved {
+        store.update(cx, |store, cx| store.save(moved, cx));
     }
 }
 
