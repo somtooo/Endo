@@ -22,6 +22,8 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
+| 36 | Thinking blocks stay open | With thinking display set to Auto, a thinking block stayed open when another thinking block followed it, when a tool call followed it, or when the turn ended. All three now close it, unless you opened it yourself. This is a fix in shared `agent_ui` code, so it applies to every agent. Covered by a test that fails without the fix. | Plan | Needs check |
+| 37 | No sidebar spinner for a session already running when Zed starts | Reported by the user: a session running in the TUI showed no spinner in Zed's sidebar until its row was clicked. The agent couldn't reproduce it with a private service. A session started before Zed launched and one started after both showed an animated spinner. Needs more detail about the case that failed. | You | Needs info |
 
 ## Done or closed
 
