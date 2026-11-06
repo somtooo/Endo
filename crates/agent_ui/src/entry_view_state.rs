@@ -216,8 +216,17 @@ impl EntryViewState {
         }
     }
 
-    pub(crate) fn clear_auto_expand_tracking(&mut self) {
-        self.auto_expanded_thinking_block = None;
+    /// Forgets the block that was opened automatically, closing it first in
+    /// Auto mode unless the user has toggled it.
+    pub(crate) fn clear_auto_expand_tracking(&mut self, cx: &App) {
+        let Some(key) = self.auto_expanded_thinking_block.take() else {
+            return;
+        };
+        if AgentSettings::get_global(cx).thinking_display == ThinkingBlockDisplay::Auto
+            && !self.user_toggled_thinking_blocks.contains(&key)
+        {
+            self.expanded_thinking_blocks.remove(&key);
+        }
     }
 
     pub(crate) fn is_auto_expanded_thinking_block(&self, key: (usize, usize)) -> bool {
@@ -247,18 +256,15 @@ impl EntryViewState {
 
         if let Some(key) = key {
             if self.auto_expanded_thinking_block != Some(key) {
+                // A new block can follow the previous one directly, with no
+                // other entry in between to close it.
+                self.clear_auto_expand_tracking(cx);
                 self.auto_expanded_thinking_block = Some(key);
                 self.expanded_thinking_blocks.insert(key);
                 return true;
             }
         } else if self.auto_expanded_thinking_block.is_some() {
-            if thinking_display == ThinkingBlockDisplay::Auto
-                && let Some(key) = self.auto_expanded_thinking_block
-                && !self.user_toggled_thinking_blocks.contains(&key)
-            {
-                self.expanded_thinking_blocks.remove(&key);
-            }
-            self.auto_expanded_thinking_block = None;
+            self.clear_auto_expand_tracking(cx);
             return true;
         }
 
