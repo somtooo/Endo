@@ -385,20 +385,20 @@ pub struct AvailableCommand {
 }
 
 impl AvailableCommand {
+    // An external agent's own commands share the native group, so an agent
+    // that marks some of them native shows one "Commands" section, not two.
     fn category_order(&self) -> u8 {
         match self.category {
-            Some(acp_thread::CommandCategory::Native) => 0,
+            Some(acp_thread::CommandCategory::Native) | None => 0,
             Some(acp_thread::CommandCategory::Mcp) => 1,
-            None => 2,
         }
     }
 
     /// Completion group key and header label for this command's category.
     fn group(&self) -> CompletionGroup {
         let (key, label) = match self.category {
-            Some(acp_thread::CommandCategory::Native) => ("commands", "Commands"),
+            Some(acp_thread::CommandCategory::Native) | None => ("commands", "Commands"),
             Some(acp_thread::CommandCategory::Mcp) => ("mcp-commands", "MCP Server Commands"),
-            None => ("acp-commands", "Commands"),
         };
         CompletionGroup {
             key: key.into(),
@@ -458,6 +458,11 @@ pub trait PromptCompletionProviderDelegate: Send + Sync + 'static {
     fn available_commands(&self, cx: &App) -> Vec<AvailableCommand>;
     fn available_skills(&self, _cx: &App) -> Vec<AvailableSkill> {
         Vec::new()
+    }
+
+    /// The agent whose threads `@` offers.
+    fn thread_agent_id(&self) -> project::AgentId {
+        agent::ZED_AGENT_ID.clone()
     }
 
     fn available_local_commands(&self, _cx: &App) -> Vec<PromptLocalCommand> {
@@ -1123,7 +1128,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             }
 
             Some(PromptContextType::Thread) => {
-                let sessions = collect_session_matches(cx);
+                let sessions = collect_session_matches(&self.source.thread_agent_id(), cx);
                 if !sessions.is_empty() {
                     let search_task =
                         filter_sessions_by_query(query, cancellation_flag, sessions, cx);
@@ -1337,7 +1342,7 @@ impl<T: PromptCompletionProviderDelegate> PromptCompletionProvider<T> {
             return Task::ready(recent);
         }
 
-        let sessions = collect_session_matches(cx);
+        let sessions = collect_session_matches(&self.source.thread_agent_id(), cx);
         const RECENT_COUNT: usize = 2;
         recent.extend(
             sessions
@@ -2426,14 +2431,14 @@ pub(crate) fn search_symbols(
     })
 }
 
-fn collect_session_matches(cx: &App) -> Vec<SessionMatch> {
+fn collect_session_matches(agent_id: &project::AgentId, cx: &App) -> Vec<SessionMatch> {
     let Some(store) = ThreadMetadataStore::try_global(cx) else {
         return Vec::new();
     };
     let mut entries: Vec<&ThreadMetadata> = store
         .read(cx)
         .entries()
-        .filter(|t| !t.archived && t.agent_id == *agent::ZED_AGENT_ID)
+        .filter(|t| !t.archived && t.agent_id == *agent_id)
         .collect();
     entries.sort_by_key(|t| Reverse(t.updated_at));
     entries

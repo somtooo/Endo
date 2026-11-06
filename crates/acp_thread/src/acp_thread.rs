@@ -122,6 +122,14 @@ pub fn meta_with_tool_name(tool_name: &str) -> acp_v2::Meta {
 /// slash command, so the completion popup can group commands by category.
 pub const COMMAND_CATEGORY_META_KEY: &str = "command_category";
 
+/// Marks a prompt receipt that no user message will ever echo, such as a
+/// command that added none, so the submission doesn't wait for one.
+pub const NO_ECHO_META_KEY: &str = "no_echo";
+
+pub fn meta_with_no_echo() -> acp_v2::Meta {
+    acp_v2::Meta::from_iter([(NO_ECHO_META_KEY.into(), true.into())])
+}
+
 /// The source category of a slash command, used to group commands in the
 /// completion popup. Only the native Zed agent annotates its commands; commands
 /// from external ACP agents carry no category and are grouped on their own.
@@ -4779,7 +4787,11 @@ impl AcpThread {
                 }
                 let state = match &response {
                     Ok(Some(SubmissionResponse::Accepted(receipt))) => {
-                        let echoed = this.entries.iter().any(|entry| {
+                        let no_echo = receipt
+                            .meta
+                            .as_ref()
+                            .is_some_and(|meta| meta.contains_key(NO_ECHO_META_KEY));
+                        let echoed = no_echo || this.entries.iter().any(|entry| {
                             matches!(entry, AgentThreadEntry::UserMessage(message)
                                 if matches!(&message.identity, MessageIdentity::Keyed(id) if id == &receipt.message_id))
                         });
@@ -6251,6 +6263,17 @@ impl AcpThread {
             });
         self.token_usage = usage;
         cx.emit(AcpThreadEvent::TokenUsageUpdated(output));
+    }
+
+    /// Adds to the current turn's output-token count, for agents that report
+    /// output tokens separately from context usage.
+    pub fn add_turn_output_tokens(&mut self, output_tokens: u64, cx: &mut Context<Self>) {
+        cx.emit(AcpThreadEvent::TokenUsageUpdated(
+            OutputTokensUpdate::LegacyAdd {
+                activity_generation: self.activity.generation(),
+                output_tokens,
+            },
+        ));
     }
 
     pub fn update_usage(&mut self, update: acp_v2::UsageUpdate, cx: &mut Context<Self>) {
@@ -8027,6 +8050,7 @@ impl AcpThread {
 
         self.flush_streaming_text(cx);
         let telemetry = ActionLogTelemetry::from(&*self);
+        let restores_files = truncate.restores_files();
         cx.spawn(async move |this, cx| {
             cx.update(|cx| truncate.run(client_id.clone(), cx)).await?;
             this.update(cx, |this, cx| {
@@ -8051,6 +8075,11 @@ impl AcpThread {
                             });
                         }
                     }
+                }
+                // The agent put back only the files changed after this message.
+                // Rejecting everything would also undo unreviewed earlier edits.
+                if restores_files {
+                    return Task::ready(());
                 }
                 this.action_log().update(cx, |action_log, cx| {
                     action_log.reject_all_edits(Some(telemetry), cx)
@@ -8788,6 +8817,62 @@ mod tests {
         cursor.pending_bytes += 3;
         assert_eq!(cursor.take(&sources, usize::MAX).as_deref(), Some("aé"));
         assert_eq!(cursor.pending_bytes, 0);
+    }
+
+    #[gpui::test]
+    async fn test_rewind_rejects_edits_unless_the_agent_restores_files(cx: &mut TestAppContext) {
+        init_test(cx);
+        for (connection, expected_text) in [
+            (FakeAgentConnection::new(), "original"),
+            (
+                FakeAgentConnection::new().with_truncate_restoring_files(),
+                "edited",
+            ),
+        ] {
+            let fs = FakeFs::new(cx.executor());
+            fs.insert_tree(path!("/test"), json!({"file": "original"}))
+                .await;
+            let project = Project::test(fs, [Path::new(path!("/test"))], cx).await;
+            let connection = Rc::new(connection);
+            let thread = cx
+                .update(|cx| {
+                    connection.new_session(
+                        project.clone(),
+                        PathList::new(&[Path::new(path!("/test"))]),
+                        cx,
+                    )
+                })
+                .await
+                .expect("session should be created");
+            let file_path = project
+                .read_with(cx, |project, cx| project.find_project_path("test/file", cx))
+                .expect("project path");
+            let buffer = project
+                .update(cx, |project, cx| project.open_buffer(file_path, cx))
+                .await
+                .expect("buffer");
+            let client_id = ClientUserMessageId::new();
+            thread.update(cx, |thread, cx| {
+                thread.push_user_content_block(Some(client_id.clone()), "prompt".into(), cx);
+                thread.action_log().update(cx, |action_log, cx| {
+                    action_log.buffer_read(buffer.clone(), cx);
+                    buffer.update(cx, |buffer, cx| buffer.set_text("edited", cx));
+                    action_log.buffer_edited(buffer.clone(), cx);
+                });
+            });
+            cx.run_until_parked();
+
+            thread
+                .update(cx, |thread, cx| thread.rewind(client_id, cx))
+                .await
+                .expect("rewind");
+            cx.run_until_parked();
+
+            assert_eq!(
+                buffer.read_with(cx, |buffer, _| buffer.text()),
+                expected_text
+            );
+        }
     }
 
     #[gpui::test]
@@ -21539,6 +21624,7 @@ mod tests {
     struct FakeAgentConnection {
         auth_methods: Vec<acp_v2::AuthMethod>,
         supports_truncate: bool,
+        truncate_restores_files: bool,
         sessions: Arc<parking_lot::Mutex<HashMap<acp_v2::SessionId, WeakEntity<AcpThread>>>>,
         set_title_calls: Rc<RefCell<Vec<SharedString>>>,
         on_user_message: Option<
@@ -21559,10 +21645,16 @@ mod tests {
             Self {
                 auth_methods: Vec::new(),
                 supports_truncate: true,
+                truncate_restores_files: false,
                 on_user_message: None,
                 sessions: Arc::default(),
                 set_title_calls: Default::default(),
             }
+        }
+
+        fn with_truncate_restoring_files(mut self) -> Self {
+            self.truncate_restores_files = true;
+            self
         }
 
         fn without_truncate_support(mut self) -> Self {
@@ -21694,6 +21786,7 @@ mod tests {
             self.supports_truncate.then(|| {
                 Rc::new(FakeAgentSessionEditor {
                     _session_id: session_id.clone(),
+                    restores_files: self.truncate_restores_files,
                 }) as Rc<dyn AgentSessionTruncate>
             })
         }
@@ -21726,9 +21819,14 @@ mod tests {
 
     struct FakeAgentSessionEditor {
         _session_id: acp_v2::SessionId,
+        restores_files: bool,
     }
 
     impl AgentSessionTruncate for FakeAgentSessionEditor {
+        fn restores_files(&self) -> bool {
+            self.restores_files
+        }
+
         fn run(
             &self,
             _client_user_message_id: ClientUserMessageId,

@@ -793,6 +793,11 @@ fn open_settings_editor_at_target(
             return;
         }
 
+        if path == zed_actions::OPENCODE_PROVIDERS_SETTINGS_PATH {
+            pages::open_opencode_providers_at(settings_window, window, cx);
+            return;
+        }
+
         let query = format!("#{path}");
         let indices = settings_window.filter_by_json_path(&query);
 
@@ -1017,6 +1022,7 @@ pub struct SettingsWindow {
     pub(crate) mcp_add_server_focus_handle: FocusHandle,
     /// State for the active "add/edit custom external agent" form sub-page, if open.
     pub(crate) custom_agent_form: Option<CustomAgentForm>,
+    pub(crate) opencode_settings: Option<pages::OpenCodeSettings>,
     /// Stable focus handle for the external agents "Add Agent" button, so it can
     /// show a focus ring when the page auto-focuses it on open (which happens via
     /// mouse, where `focus_visible` styling would otherwise be suppressed).
@@ -2042,6 +2048,7 @@ impl SettingsWindow {
             mcp_server_form: None,
             mcp_add_server_focus_handle: cx.focus_handle(),
             custom_agent_form: None,
+            opencode_settings: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
         };
@@ -3834,6 +3841,8 @@ impl SettingsWindow {
                 && current_sub_page.link.title.as_ref() == "LLM Providers";
             let is_external_agents_page = current_sub_page.link.json_path == Some("agent_servers");
             let is_mcp_servers_page = current_sub_page.link.json_path == Some("context_servers");
+            let is_opencode_plugins_page =
+                current_sub_page.link.json_path == Some(pages::PLUGINS_PAGE_PATH);
 
             page_header = h_flex()
                 .w_full()
@@ -3894,6 +3903,9 @@ impl SettingsWindow {
                         })
                         .when(is_mcp_servers_page, |this| {
                             this.child(pages::render_add_server_popover(self, window, cx))
+                        })
+                        .when(is_opencode_plugins_page, |this| {
+                            this.child(pages::render_add_plugin_button(cx))
                         }),
                 )
                 .into_any_element();
@@ -5514,6 +5526,7 @@ pub mod test {
                 mcp_server_form: None,
                 mcp_add_server_focus_handle: cx.focus_handle(),
                 custom_agent_form: None,
+                opencode_settings: None,
                 external_agent_add_focus_handle: cx.focus_handle(),
                 skill_creator_page: None,
             }
@@ -5654,6 +5667,7 @@ pub mod test {
             mcp_server_form: None,
             mcp_add_server_focus_handle: cx.focus_handle(),
             custom_agent_form: None,
+            opencode_settings: None,
             external_agent_add_focus_handle: cx.focus_handle(),
             skill_creator_page: None,
         };

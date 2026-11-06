@@ -28,6 +28,7 @@ use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCo
 use editor::actions::OpenExcerpts;
 use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 
+use crate::agent_menu_providers::{AgentSteering, AgentThinking};
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
 use crate::entry_view_state::TerminalCardPresentation;
 use crate::message_editor::SharedSessionCapabilities;
@@ -94,6 +95,16 @@ pub(super) struct ThreadRecovery {
     pub submissions: Vec<SavedSubmission>,
     pub draft: Vec<acp_v2::ContentBlock>,
     queued: Vec<QueuedMessageRecovery>,
+}
+
+/// A queued message an agent with its own steering holds until it adds it
+/// to the thread or gives it back.
+struct SteerHandoff {
+    entry_id: QueueEntryId,
+    content: Vec<acp_v2::ContentBlock>,
+    id: SharedString,
+    cancelling: bool,
+    settled: futures::future::Shared<Task<()>>,
 }
 
 struct QueuedMessageRecovery {
@@ -850,6 +861,8 @@ pub struct ThreadView {
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
+    /// The queued message an agent with its own steering holds, if any.
+    steer_handoff: Option<SteerHandoff>,
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp_v2::ToolCallId>,
     pub is_loading_contents: bool,
@@ -1122,6 +1135,9 @@ impl ThreadView {
         subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| {
+            if matches!(event, AcpThreadEvent::StatusChanged) {
+                this.sync_agent_steer(cx);
+            }
             if matches!(
                 event,
                 AcpThreadEvent::ToolAuthorizationRequested(_)
@@ -1386,6 +1402,7 @@ impl ThreadView {
             should_be_following: false,
             editing_message: None,
             message_queue: MessageQueue::default(),
+            steer_handoff: None,
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
@@ -3112,6 +3129,7 @@ impl ThreadView {
                     entry.content = content;
                     entry.tracked_buffers = tracked_buffers;
                 }
+                this.sync_agent_steer(cx);
                 cx.notify();
             })?;
 
@@ -3138,7 +3156,8 @@ impl ThreadView {
         cx.notify();
     }
 
-    pub fn sync_queue_flag_to_native_thread(&self, cx: &mut Context<Self>) {
+    pub fn sync_queue_flag_to_native_thread(&mut self, cx: &mut Context<Self>) {
+        self.sync_agent_steer(cx);
         if let Some(native_thread) = self.as_native_thread(cx) {
             // By default queued messages wait for the turn to fully complete.
             // Only a "steering" front message ends the turn at the next boundary.
@@ -3175,6 +3194,33 @@ impl ThreadView {
         if self.thread.read(cx).foreground_activity() != ForegroundActivity::Idle
             || self.is_loading_contents
         {
+            return false;
+        }
+        // The agent may still add a steered message to the thread, so the
+        // queue waits until it either does or gives the message back.
+        if let Some(settled) = self
+            .steer_handoff
+            .as_ref()
+            .map(|handoff| handoff.settled.clone())
+        {
+            self.message_queue.absorb_stale_generation_stopped();
+            self.sync_agent_steer(cx);
+            cx.spawn_in(window, async move |this, cx| {
+                settled.await;
+                this.update_in(cx, |this, window, cx| {
+                    let is_first_editor_focused = this
+                        .message_queue
+                        .first()
+                        .is_some_and(|entry| entry.editor.focus_handle(cx).is_focused(window));
+                    this.send_queued_message_after_generation_stopped(
+                        is_first_editor_focused,
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+            })
+            .detach();
             return false;
         }
         if let Some(id) = self
@@ -5784,7 +5830,9 @@ impl ThreadView {
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
-                                        Some(config_view) => this.child(config_view),
+                                        Some(config_view) => this
+                                            .child(config_view)
+                                            .children(self.model_selector.clone()),
                                         None => this
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
@@ -5879,7 +5927,7 @@ impl ThreadView {
 
         let queue_len = self.message_queue.len();
         let can_fast_track = self.message_queue.can_fast_track();
-        let is_native = self.as_native_thread(cx).is_some();
+        let can_steer = self.as_native_thread(cx).is_some() || self.provided_steering(cx).is_some();
 
         v_flex()
             .id("message_queue_list")
@@ -5949,7 +5997,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -6023,7 +6071,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -6516,7 +6564,10 @@ impl ThreadView {
     }
 
     fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let thread = self.as_native_thread(cx)?.read(cx);
+        let Some(thread) = self.as_native_thread(cx) else {
+            return self.render_provided_thinking_control(cx);
+        };
+        let thread = thread.read(cx);
         let model = thread.model()?;
 
         let supports_thinking = model.supports_thinking();
@@ -6782,6 +6833,8 @@ impl ThreadView {
                                                     }
                                                 });
                                             });
+                                        } else if let Some(thinking) = this.provided_thinking(cx) {
+                                            thinking.set_effort(effort.to_string(), cx);
                                         }
                                     })
                                     .ok();
@@ -14253,6 +14306,7 @@ impl ThreadView {
 
     fn cycle_native_agent_thinking_effort(&mut self, cx: &mut Context<Self>) {
         let Some(thread) = self.as_native_thread(cx) else {
+            self.cycle_provided_thinking_effort(cx);
             return;
         };
 
@@ -14474,6 +14528,10 @@ impl Render for ThreadView {
                             thread.set_thinking_enabled(!thread.thinking_enabled(), cx);
                         }
                     });
+                } else if let Some(thinking) = this.provided_thinking(cx)
+                    && thinking.can_disable_thinking()
+                {
+                    thinking.set_thinking_enabled(!thinking.thinking_enabled(), cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &CycleThinkingEffort, _window, cx| {
@@ -14535,7 +14593,7 @@ impl Render for ThreadView {
             }))
             .on_action(
                 cx.listener(|this, _: &ToggleSteerFirstQueuedMessage, _, cx| {
-                    if this.as_native_thread(cx).is_none() {
+                    if this.as_native_thread(cx).is_none() && this.provided_steering(cx).is_none() {
                         return;
                     }
                     if let Some(id) = this.message_queue.first_id() {
@@ -14545,6 +14603,17 @@ impl Render for ThreadView {
             )
             .on_action(cx.listener(|this, _: &ClearMessageQueue, _, cx| {
                 this.clear_queue(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::ManageProfiles, window, cx| {
+                let custom_action = this
+                    .profile_selector
+                    .as_ref()
+                    .map(|selector| selector.read(cx).configure_action())
+                    .filter(|action| !action.partial_eq(&crate::ManageProfiles::default()));
+                match custom_action {
+                    Some(action) => window.dispatch_action(action, cx),
+                    None => cx.propagate(),
+                }
             }))
             .on_action(cx.listener(|this, _: &ToggleProfileSelector, window, cx| {
                 if let Some(config_options_view) = this.config_options_view.clone() {
@@ -15042,6 +15111,153 @@ fn leading_native_command(
                 == Some(acp_thread::CommandCategory::Native)
     });
     is_native.then(|| name.to_string())
+}
+
+/// The thinking control for agents that provide one through
+/// `agent_menu_providers`, drawn like the native agent's.
+impl ThreadView {
+    fn provided_steering(&self, cx: &App) -> Option<Rc<dyn AgentSteering>> {
+        let thread = self.thread.read(cx);
+        crate::agent_menu_providers::provided_steering(thread.connection(), thread.session_id(), cx)
+    }
+
+    /// Hands the front queued message to an agent with its own steering when
+    /// it's marked to steer and a turn is running, and takes it back when
+    /// that stops being true. The agent holds one message at a time.
+    fn sync_agent_steer(&mut self, cx: &mut Context<Self>) {
+        let Some(steering) = self.provided_steering(cx) else {
+            return;
+        };
+        let thread = self.thread.read(cx);
+        let wanted = self
+            .message_queue
+            .first()
+            .filter(|entry| {
+                entry.steer
+                    && thread.status() == ThreadStatus::Generating
+                    && !self.message_queue.is_paused()
+                    && steering.can_steer(&entry.content)
+                    && thread.validate_prompt_content(&entry.content).is_ok()
+            })
+            .map(|entry| (entry.id, entry.content.clone()));
+        if let Some(handoff) = &mut self.steer_handoff {
+            let still_wanted = wanted.as_ref().is_some_and(|(entry_id, content)| {
+                *entry_id == handoff.entry_id && *content == handoff.content
+            });
+            if !still_wanted && !handoff.cancelling {
+                handoff.cancelling = true;
+                steering.cancel_steer(handoff.id.clone(), cx);
+            }
+            return;
+        }
+        let Some((entry_id, content)) = wanted else {
+            return;
+        };
+        let (id, outcome) = steering.steer(content.clone(), cx);
+        let settled = cx.spawn(async move |this, cx| {
+            let result = outcome.await;
+            this.update(cx, |this, cx| {
+                this.steer_handoff = None;
+                match result {
+                    Ok(true) => {
+                        this.message_queue.remove(entry_id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if let Some(entry) = this.message_queue.entry_by_id_mut(entry_id) {
+                            entry.steer = false;
+                        }
+                        this.handle_thread_error(error, cx);
+                    }
+                }
+                this.sync_queue_flag_to_native_thread(cx);
+                cx.notify();
+            })
+            .log_err();
+        });
+        self.steer_handoff = Some(SteerHandoff {
+            entry_id,
+            content,
+            id,
+            cancelling: false,
+            settled: settled.shared(),
+        });
+    }
+
+    fn provided_thinking(&self, cx: &App) -> Option<Rc<dyn AgentThinking>> {
+        let thread = self.thread.read(cx);
+        crate::agent_menu_providers::provided_thinking(thread.connection(), thread.session_id(), cx)
+    }
+
+    fn render_provided_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let thinking = self.provided_thinking(cx)?;
+        let effort_levels = thinking.effort_levels();
+        let selected_effort = thinking.selected_effort();
+
+        if !thinking.can_disable_thinking() {
+            if effort_levels.is_empty() {
+                return None;
+            }
+            return Some(
+                self.render_effort_selector(effort_levels, selected_effort, true, cx)
+                    .into_any_element(),
+            );
+        }
+
+        let enabled = thinking.thinking_enabled();
+        let (tooltip_label, icon, color) = if enabled {
+            (
+                "Disable Thinking Mode",
+                IconName::ThinkingMode,
+                Color::Accent,
+            )
+        } else {
+            (
+                "Enable Thinking Mode",
+                IconName::ThinkingModeOff,
+                Color::Custom(cx.theme().colors().icon_disabled.opacity(0.8)),
+            )
+        };
+        let focus_handle = self.message_editor.focus_handle(cx);
+        let thinking_toggle = IconButton::new("thinking-mode", icon)
+            .icon_size(IconSize::Small)
+            .icon_color(color)
+            .tooltip(move |_, cx| {
+                Tooltip::for_action_in(tooltip_label, &ToggleThinkingMode, &focus_handle, cx)
+            })
+            .on_click(cx.listener(|this, _, _window, cx| {
+                if let Some(thinking) = this.provided_thinking(cx) {
+                    thinking.set_thinking_enabled(!thinking.thinking_enabled(), cx);
+                }
+            }));
+
+        if effort_levels.is_empty() || !enabled {
+            return Some(thinking_toggle.into_any_element());
+        }
+        let effort_selector = self.render_effort_selector(effort_levels, selected_effort, false, cx);
+        Some(
+            SplitButton::new(thinking_toggle, effort_selector.into_any_element())
+                .style(SplitButtonStyle::Transparent)
+                .into_any_element(),
+        )
+    }
+
+    fn cycle_provided_thinking_effort(&mut self, cx: &mut Context<Self>) {
+        let Some(thinking) = self.provided_thinking(cx) else {
+            return;
+        };
+        let effort_levels = thinking.effort_levels();
+        if !thinking.thinking_enabled() || effort_levels.is_empty() {
+            return;
+        }
+        let current_index = thinking
+            .selected_effort()
+            .and_then(|current| effort_levels.iter().position(|level| level.value == current));
+        let next_index = current_index.map_or(0, |index| (index + 1) % effort_levels.len());
+        if let Some(level) = effort_levels.get(next_index) {
+            thinking.set_effort(level.value.to_string(), cx);
+        }
+    }
 }
 
 /// Removes a leading `/command_name` token from `text`, returning the trimmed

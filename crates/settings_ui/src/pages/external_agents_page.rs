@@ -54,6 +54,12 @@ pub(crate) fn render_external_agents_page(
                 .size(LabelSize::Small)
                 .color(Color::Muted),
         )
+        // OpenCode D offers to install OpenCode when it's picked in the
+        // agent panel. Until then, there's nothing to configure.
+        .when(opencode_agent::is_installed(cx), |this| {
+            this.child(super::render_opencode_row(cx))
+                .child(Divider::horizontal())
+        })
         .child(agent_list)
         .into_any_element()
 }
@@ -80,6 +86,7 @@ fn collect_agents(store: &Entity<AgentServerStore>, cx: &App) -> Vec<AgentRow> {
     let store = store.read(cx);
     store
         .external_agents()
+        .filter(|name| !project::agent_server_store::is_built_in_agent(name, cx))
         .cloned()
         .collect::<Vec<_>>()
         .into_iter()

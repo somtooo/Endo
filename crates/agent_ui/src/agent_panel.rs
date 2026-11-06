@@ -1683,15 +1683,15 @@ impl AgentPanel {
         // Share links / clipboard imports enter with only a session id. If
         // this machine already has a metadata row for the session, route
         // through the normal thread-id path.
-        let existing_thread_id = ThreadMetadataStore::try_global(cx).and_then(|store| {
+        let existing_thread = ThreadMetadataStore::try_global(cx).and_then(|store| {
             store
                 .read(cx)
                 .entry_by_session(&session_id)
-                .map(|m| m.thread_id)
+                .map(|m| (m.thread_id, crate::Agent::from(m.agent_id.clone())))
         });
-        if let Some(thread_id) = existing_thread_id {
+        if let Some((thread_id, agent)) = existing_thread {
             self.load_agent_thread(
-                crate::Agent::NativeAgent,
+                agent,
                 thread_id,
                 work_dirs,
                 title,
@@ -5923,9 +5923,16 @@ impl AgentPanel {
                                 }
                             }
 
-                            menu = menu
-                                .separator()
-                                .action("Profiles", Box::new(ManageProfiles::default()));
+                            // Agents with their own profiles configure them their own way.
+                            let manage_profiles = conversation_view
+                                .as_ref()
+                                .and_then(|view| view.read(cx).root_thread_view())
+                                .and_then(|view| {
+                                    let selector = view.read(cx).profile_selector.as_ref()?;
+                                    Some(selector.read(cx).configure_action())
+                                })
+                                .unwrap_or_else(|| Box::new(ManageProfiles::default()));
+                            menu = menu.separator().action("Profiles", manage_profiles);
                         }
 
                         menu = menu

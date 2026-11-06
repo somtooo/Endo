@@ -152,6 +152,7 @@ pub type SharedLocalCommands = Arc<RwLock<Vec<PromptLocalCommand>>>;
 struct MessageEditorCompletionDelegate {
     session_capabilities: SharedSessionCapabilities,
     has_thread_store: bool,
+    agent_id: AgentId,
     message_editor: WeakEntity<MessageEditor>,
     local_commands: SharedLocalCommands,
 }
@@ -173,6 +174,10 @@ impl PromptCompletionProviderDelegate for MessageEditorCompletionDelegate {
 
     fn available_skills(&self, _cx: &App) -> Vec<AvailableSkill> {
         self.session_capabilities.read().completion_skills()
+    }
+
+    fn thread_agent_id(&self) -> AgentId {
+        self.agent_id.clone()
     }
 
     fn available_local_commands(&self, _cx: &App) -> Vec<PromptLocalCommand> {
@@ -530,7 +535,9 @@ impl MessageEditor {
         let completion_provider = Rc::new(PromptCompletionProvider::new(
             MessageEditorCompletionDelegate {
                 session_capabilities: session_capabilities.clone(),
-                has_thread_store: thread_store.is_some(),
+                has_thread_store: thread_store.is_some()
+                    || crate::agent_menu_providers::provides_thread_text(&agent_id, cx),
+                agent_id: agent_id.clone(),
                 message_editor: cx.weak_entity(),
                 local_commands: local_commands.clone(),
             },

@@ -374,13 +374,16 @@ fn open_thread(
         return;
     };
 
-    // Right now we only support loading threads in the native agent.
     panel.update(cx, |panel, cx| {
-        let thread_id = ThreadMetadataStore::try_global(cx)
-            .and_then(|store| store.read(cx).entry_by_session(&id).map(|m| m.thread_id));
-        if let Some(thread_id) = thread_id {
+        let thread = ThreadMetadataStore::try_global(cx).and_then(|store| {
+            store
+                .read(cx)
+                .entry_by_session(&id)
+                .map(|m| (m.thread_id, Agent::from(m.agent_id.clone())))
+        });
+        if let Some((thread_id, agent)) = thread {
             panel.load_agent_thread(
-                Agent::NativeAgent,
+                agent,
                 thread_id,
                 None,
                 Some(name.into()),

@@ -12630,6 +12630,53 @@ dependencies = [
 ]
 
 [[package]]
+name = "opencode_agent"
+version = "0.1.0"
+dependencies = [
+ "acp_thread",
+ "action_log",
+ "agent-client-protocol",
+ "agent_servers",
+ "agent_settings",
+ "agent_ui",
+ "anyhow",
+ "async-compression",
+ "async-tar",
+ "base64 0.22.1",
+ "chrono",
+ "collections",
+ "db",
+ "diffy",
+ "editor",
+ "extension_host",
+ "fs",
+ "futures 0.3.34",
+ "gpui",
+ "http_client",
+ "language_model",
+ "log",
+ "menu",
+ "paths",
+ "percent-encoding",
+ "picker",
+ "project",
+ "rand 0.9.4",
+ "reqwest_client",
+ "serde",
+ "serde_json",
+ "settings",
+ "settings_json",
+ "sha2",
+ "smol",
+ "ui",
+ "util",
+ "watch",
+ "which",
+ "workspace",
+ "zed_actions",
+]
+
+[[package]]
 name = "opener"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -16993,6 +17040,7 @@ dependencies = [
  "language_models",
  "log",
  "menu",
+ "opencode_agent",
  "paths",
  "picker",
  "platform_title_bar",
@@ -17000,6 +17048,7 @@ dependencies = [
  "project",
  "regex",
  "release_channel",
+ "remote_connection",
  "rodio",
  "schemars 1.0.4",
  "search",
@@ -23157,6 +23206,7 @@ dependencies = [
  "node_runtime",
  "notifications",
  "onboarding",
+ "opencode_agent",
  "outline",
  "outline_panel",
  "parking_lot",

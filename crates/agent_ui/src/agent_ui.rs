@@ -1,6 +1,7 @@
 mod agent_configuration;
 pub mod agent_connection_store;
 mod agent_diff;
+pub mod agent_menu_providers;
 mod agent_model_selector;
 mod agent_panel;
 mod system_notifications;
@@ -86,12 +87,14 @@ pub use crate::inline_assistant::InlineAssistant;
 pub use crate::message_editor::MessageEditorEvent;
 pub use crate::thread_metadata_store::ThreadId;
 pub use agent_diff::{AgentDiffPane, AgentDiffToolbar};
+pub use completion_provider::AvailableSkill;
 pub use conversation_view::open_markdown_in_workspace;
 pub use conversation_view::{ConversationView, StateChange};
 pub use external_source_prompt::ExternalSourcePrompt;
 pub(crate) use mode_selector::ModeSelector;
 pub(crate) use model_selector::ModelSelector;
 pub(crate) use model_selector_popover::ModelSelectorPopover;
+pub use profile_selector::ProfileProvider;
 pub use thread_import::{
     AcpThreadImportOnboarding, CrossChannelImportOnboarding, ThreadImportModal,
     channels_with_threads, import_threads_from_other_channels,

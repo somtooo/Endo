@@ -174,6 +174,9 @@ pub const AGENT_SKILLS_SETTINGS_PATH: &str = "agent.skills";
 /// UI.
 pub const AGENT_SANDBOX_SETTINGS_PATH: &str = "agent.sandbox_permissions";
 
+/// `OpenSettingsAt` path of OpenCode D's Providers page in the settings UI.
+pub const OPENCODE_PROVIDERS_SETTINGS_PATH: &str = "agent_servers.opencode_d.providers";
+
 #[derive(PartialEq, Clone, Debug, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum OpenSettingsAtTarget {

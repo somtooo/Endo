@@ -5,6 +5,9 @@ mod external_agents_page;
 mod feature_flags;
 mod llm_providers_page;
 mod mcp_servers_page;
+mod opencode_plugins_page;
+mod opencode_providers_page;
+mod opencode_settings_page;
 mod sandbox_settings;
 mod skill_creator;
 mod skills_setup;
@@ -24,6 +27,10 @@ pub(crate) use llm_providers_page::{
 };
 pub(crate) use mcp_servers_page::{
     McpServerForm, render_add_server_popover, render_mcp_servers_page,
+};
+pub(crate) use opencode_plugins_page::{PLUGINS_PAGE_PATH, render_add_plugin_button};
+pub(crate) use opencode_settings_page::{
+    OpenCodeSettings, open_opencode_providers_at, render_opencode_row,
 };
 pub(crate) use sandbox_settings::render_sandbox_settings_page;
 pub use skill_creator::SkillCreatorOpenMode;

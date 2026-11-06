@@ -509,6 +509,9 @@ pub struct ThreadMetadataStore {
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
+    /// Sessions a backend reports as running while no panel has them loaded,
+    /// so the sidebar can show them as running too.
+    externally_running: HashSet<acp::SessionId>,
     _db_operations_task: Task<()>,
 }
 
@@ -599,6 +602,26 @@ impl ThreadMetadataStore {
     }
 
     /// Returns all threads.
+    pub fn set_externally_running(
+        &mut self,
+        session_id: acp::SessionId,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if running {
+            self.externally_running.insert(session_id)
+        } else {
+            self.externally_running.remove(&session_id)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub fn is_externally_running(&self, session_id: &acp::SessionId) -> bool {
+        self.externally_running.contains(session_id)
+    }
+
     pub fn entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
         self.threads.values()
     }
@@ -1243,6 +1266,7 @@ impl ThreadMetadataStore {
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
+            externally_running: HashSet::default(),
             _db_operations_task,
         };
         let _ = this.reload(cx);
@@ -1314,7 +1338,26 @@ impl ThreadMetadataStore {
                 )
             } else {
                 let project = thread_ref.project().read(cx);
-                let worktree_paths = project.worktree_paths(cx);
+                let mut worktree_paths = project.worktree_paths(cx);
+                // The session may have moved out of the project it's open in.
+                // A session in one of the project's folders, or below one,
+                // keeps the project's folders.
+                if let Some(folders) = crate::agent_menu_providers::provided_session_folders(
+                    thread_ref.connection(),
+                    thread_ref.session_id(),
+                    cx,
+                ) && !folders.paths().iter().all(|folder| {
+                    worktree_paths
+                        .folder_path_list()
+                        .paths()
+                        .iter()
+                        .any(|project_folder| folder.starts_with(project_folder))
+                }) {
+                    worktree_paths = existing_thread
+                        .map(|thread| thread.worktree_paths.clone())
+                        .filter(|paths| paths.folder_path_list() == &folders)
+                        .unwrap_or_else(|| WorktreePaths::from_folder_paths(&folders));
+                }
                 let remote_connection = project.remote_connection_options(cx).cloned();
 
                 (worktree_paths, remote_connection)

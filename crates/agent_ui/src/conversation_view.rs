@@ -1581,6 +1581,7 @@ impl ConversationView {
             .clone()
             .downcast::<agent::NativeAgentConnection>()
             .map(|native_connection| native_available_skills(&native_connection, &session_id, cx))
+            .or_else(|| crate::agent_menu_providers::provided_skills(&connection, &session_id, cx))
             .unwrap_or_default();
         let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::new(
             thread.read(cx).prompt_capabilities().clone(),
@@ -1709,14 +1710,13 @@ impl ConversationView {
             connection.clone().downcast();
         let profile_selector = profile_selector
             .and_then(|native_connection| native_connection.thread(&session_id, cx))
-            .map(|native_thread| {
+            .map(|native_thread| Arc::new(native_thread) as Arc<dyn ProfileProvider>)
+            .or_else(|| {
+                crate::agent_menu_providers::provided_profiles(&connection, &session_id, cx)
+            })
+            .map(|provider| {
                 cx.new(|cx| {
-                    ProfileSelector::new(
-                        <dyn Fs>::global(cx),
-                        Arc::new(native_thread),
-                        self.focus_handle(cx),
-                        cx,
-                    )
+                    ProfileSelector::new(<dyn Fs>::global(cx), provider, self.focus_handle(cx), cx)
                 })
             });
 
@@ -2329,6 +2329,14 @@ impl ConversationView {
                         .downcast::<agent::NativeAgentConnection>()
                         .map(|native_connection| {
                             native_available_skills(&native_connection, &session_id, cx)
+                        })
+                        .or_else(|| {
+                            let connection = thread.read(cx).connection();
+                            crate::agent_menu_providers::provided_skills(
+                                connection,
+                                &session_id,
+                                cx,
+                            )
                         })
                         .unwrap_or_default();
                     let has_slash_completions =

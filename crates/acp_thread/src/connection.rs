@@ -354,6 +354,12 @@ impl dyn AgentConnection {
 }
 
 pub trait AgentSessionTruncate {
+    /// Whether truncating also restores the files changed after the message,
+    /// so the thread must not reject its tracked edits on top of that.
+    fn restores_files(&self) -> bool {
+        false
+    }
+
     fn run(&self, client_user_message_id: ClientUserMessageId, cx: &mut App) -> Task<Result<()>>;
 }
 
@@ -725,6 +731,11 @@ pub trait AgentModelSelector: 'static {
     /// Returns whether the model picker should render a footer.
     fn should_render_footer(&self) -> bool {
         false
+    }
+
+    /// What the footer's Configure button does, when not the agent settings.
+    fn footer_action(&self) -> Option<Box<dyn gpui::Action>> {
+        None
     }
 }
 
