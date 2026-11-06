@@ -5827,6 +5827,7 @@ mod tests {
 
     fn init_keymap_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
+            release_channel::init(Version::new(0, 0, 0), cx);
             let app_state = AppState::test(cx);
 
             theme_settings::init(theme::LoadThemes::JustBase, cx);
@@ -5835,6 +5836,29 @@ mod tests {
             onboarding::init(cx);
             app_state
         })
+    }
+
+    #[gpui::test]
+    fn test_app_menu_branding_follows_release_channel(cx: &mut TestAppContext) {
+        init_keymap_test(cx);
+        cx.update(|cx| {
+            for (channel, app_name) in [
+                (ReleaseChannel::Endo, "Endo"),
+                (ReleaseChannel::Stable, "Zed"),
+            ] {
+                release_channel::init_test(Version::new(0, 0, 0), channel, cx);
+                let menu = app_menus::app_menus(cx)
+                    .into_iter()
+                    .next()
+                    .expect("application menu");
+                assert_eq!(menu.name, app_name);
+                for label in [format!("About {app_name}"), format!("Quit {app_name}")] {
+                    assert!(menu.items.iter().any(|item| {
+                        matches!(item, gpui::MenuItem::Action { name, .. } if name.as_ref() == label)
+                    }));
+                }
+            }
+        });
     }
 
     actions!(test_only, [ActionA, ActionB]);
