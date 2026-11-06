@@ -9,7 +9,7 @@ use semver::Version;
 
 const ZED_DOCS_URL: &str = "https://zed.dev/docs";
 
-/// stable | dev | nightly | preview | zelda
+/// stable | dev | nightly | preview | endo
 pub static RELEASE_CHANNEL_NAME: LazyLock<String> = LazyLock::new(|| {
     if cfg!(debug_assertions) {
         env::var("ZED_RELEASE_CHANNEL").unwrap_or_else(|_| compile_time_release_channel_name())
@@ -48,7 +48,7 @@ pub fn app_identifier() -> &'static str {
         ReleaseChannel::Nightly => "Zed-Editor-Nightly",
         ReleaseChannel::Preview => "Zed-Editor-Preview",
         ReleaseChannel::Stable => "Zed-Editor-Stable",
-        ReleaseChannel::Zelda => "Zed-Editor-Zelda",
+        ReleaseChannel::Endo => "Zed-Editor-Endo",
     }
 }
 
@@ -156,7 +156,7 @@ pub enum ReleaseChannel {
     /// The fork's own release channel, updated from the fork's GitHub
     /// releases. It has its own name, app ID and icon so that it can be
     /// installed next to Zed and Zed Preview.
-    Zelda,
+    Endo,
 }
 
 struct GlobalReleaseChannel(ReleaseChannel);
@@ -190,7 +190,7 @@ impl ReleaseChannel {
         ReleaseChannel::Nightly,
         ReleaseChannel::Preview,
         ReleaseChannel::Stable,
-        ReleaseChannel::Zelda,
+        ReleaseChannel::Endo,
     ];
 
     /// Returns the global [`ReleaseChannel`].
@@ -216,8 +216,13 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "Zed Nightly",
             ReleaseChannel::Preview => "Zed Preview",
             ReleaseChannel::Stable => "Zed",
-            ReleaseChannel::Zelda => "Zelda",
+            ReleaseChannel::Endo => "Endo",
         }
+    }
+
+    /// Returns the installed command-line launcher name.
+    pub fn cli_name(&self) -> &'static str {
+        if *self == Self::Endo { "endo" } else { "zed" }
     }
 
     /// Returns the programmatic name for this [`ReleaseChannel`].
@@ -227,7 +232,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "nightly",
             ReleaseChannel::Preview => "preview",
             ReleaseChannel::Stable => "stable",
-            ReleaseChannel::Zelda => "zelda",
+            ReleaseChannel::Endo => "endo",
         }
     }
 
@@ -240,7 +245,7 @@ impl ReleaseChannel {
             ReleaseChannel::Nightly => "dev.zed.Zed-Nightly",
             ReleaseChannel::Preview => "dev.zed.Zed-Preview",
             ReleaseChannel::Stable => "dev.zed.Zed",
-            ReleaseChannel::Zelda => "dev.zed.Zelda",
+            ReleaseChannel::Endo => "dev.zed.Endo",
         }
     }
 
@@ -250,7 +255,7 @@ impl ReleaseChannel {
             Self::Dev => None,
             Self::Nightly => Some("nightly=1"),
             Self::Preview => Some("preview=1"),
-            Self::Stable | Self::Zelda => None,
+            Self::Stable | Self::Endo => None,
         }
     }
 
@@ -260,7 +265,7 @@ impl ReleaseChannel {
         let channel_path_segment = match self {
             Self::Dev | Self::Nightly => Some("nightly"),
             Self::Preview => Some("preview"),
-            Self::Stable | Self::Zelda => None,
+            Self::Stable | Self::Endo => None,
         };
 
         match channel_path_segment {
@@ -285,7 +290,7 @@ impl FromStr for ReleaseChannel {
             "nightly" => ReleaseChannel::Nightly,
             "preview" => ReleaseChannel::Preview,
             "stable" => ReleaseChannel::Stable,
-            "zelda" => ReleaseChannel::Zelda,
+            "endo" => ReleaseChannel::Endo,
             _ => return Err(InvalidReleaseChannel),
         })
     }
@@ -316,15 +321,17 @@ mod tests {
     }
 
     #[test]
-    fn test_zelda_is_distinct_from_zed_channels() {
+    fn test_endo_is_distinct_from_zed_channels() {
         use std::str::FromStr;
 
-        assert_eq!(ReleaseChannel::from_str("zelda"), Ok(ReleaseChannel::Zelda));
+        assert_eq!(ReleaseChannel::from_str("endo"), Ok(ReleaseChannel::Endo));
+        assert_eq!(ReleaseChannel::Endo.cli_name(), "endo");
+        assert!(ReleaseChannel::Endo.poll_for_updates());
         for channel in ReleaseChannel::ALL {
             assert_eq!(ReleaseChannel::from_str(channel.dev_name()), Ok(channel));
-            if channel != ReleaseChannel::Zelda {
-                assert_ne!(channel.app_id(), ReleaseChannel::Zelda.app_id());
-                assert_ne!(channel.display_name(), ReleaseChannel::Zelda.display_name());
+            if channel != ReleaseChannel::Endo {
+                assert_ne!(channel.app_id(), ReleaseChannel::Endo.app_id());
+                assert_ne!(channel.display_name(), ReleaseChannel::Endo.display_name());
             }
         }
     }

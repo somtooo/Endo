@@ -94,6 +94,11 @@ impl UpdateButton {
         self
     }
 
+    pub fn message(mut self, message: impl Into<SharedString>) -> Self {
+        self.message = message.into();
+        self
+    }
+
     pub fn progress(mut self, progress: impl Into<Option<f32>>) -> Self {
         self.progress = progress.into();
         self

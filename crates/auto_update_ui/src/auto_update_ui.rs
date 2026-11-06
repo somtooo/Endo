@@ -42,7 +42,8 @@ pub fn init(cx: &mut App) {
         if matches!(
             ReleaseChannel::global(cx),
             ReleaseChannel::Nightly | ReleaseChannel::Dev
-        ) {
+        ) || (cfg!(debug_assertions) && ReleaseChannel::global(cx) == ReleaseChannel::Endo)
+        {
             workspace.register_action(|_workspace, _: &ShowUpdateNotification, _window, cx| {
                 show_update_notification(cx);
             });
@@ -97,7 +98,7 @@ fn view_release_notes_locally(
     // release page instead.
     if matches!(
         release_channel,
-        ReleaseChannel::Nightly | ReleaseChannel::Dev | ReleaseChannel::Zelda
+        ReleaseChannel::Nightly | ReleaseChannel::Dev | ReleaseChannel::Endo
     ) {
         if let Some(url) = release_notes_url(cx) {
             cx.open_url(&url);
@@ -206,6 +207,7 @@ impl Dismissable for DeltaAnnouncement {
 fn announcement_for_version(version: &Version, cx: &App) -> Option<AnnouncementContent> {
     let version_with_delta = Version::new(1, 22, 0);
     if *version < version_with_delta
+        || ReleaseChannel::global(cx) == ReleaseChannel::Endo
         || DisableAiSettings::get_global(cx).disable_ai
         || DeltaAnnouncement::dismissed(cx)
     {

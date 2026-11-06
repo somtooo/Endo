@@ -25,11 +25,7 @@ const CANT_INSTALL_DOCS_URL: &str = "https://zed.dev/docs/macos#cant-install-cli
 /// commonly because the user is not an admin.
 async fn install_script(cx: &AsyncApp) -> Result<Option<PathBuf>> {
     let cli_path = cx.update(|cx| cx.path_for_auxiliary_executable("cli"))?;
-    // Zelda is installed next to Zed, so it must not take over Zed's `zed` link.
-    let link_name = match cx.update(|cx| ReleaseChannel::global(cx)) {
-        ReleaseChannel::Zelda => "zelda",
-        _ => "zed",
-    };
+    let link_name = cx.update(|cx| ReleaseChannel::global(cx).cli_name());
     let link_path = Path::new("/usr/local/bin").join(link_name);
     let link_path = link_path.as_path();
     let bin_dir_path = link_path.parent().unwrap();
@@ -89,11 +85,16 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
     const LINUX_PROMPT_DETAIL: &str = "If you installed Zed from our official release add ~/.local/bin to your PATH.\n\nIf you installed Zed from a different source like your package manager, then you may need to create an alias/symlink manually.\n\nDepending on your package manager, the CLI might be named zeditor, zedit, zed-editor or something else.";
 
     cx.spawn_in(window, async move |workspace, cx| {
+        let channel = cx.update(|_, cx| ReleaseChannel::global(cx))?;
+        let cli_name = channel.cli_name();
+        let app_name = channel.display_name();
         if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             let prompt = cx.prompt(
                 PromptLevel::Warning,
                 "CLI should already be installed",
-                Some(LINUX_PROMPT_DETAIL),
+                Some(if channel == ReleaseChannel::Endo {
+                    "Add Endo's bin folder to your PATH, or create a symlink named `endo` to its bin/endo launcher. Keep Zed's `zed` launcher unchanged."
+                } else { LINUX_PROMPT_DETAIL }),
                 &["OK"],
             );
             cx.background_spawn(prompt).detach();
@@ -104,7 +105,7 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
             // The user dismissed the administrator prompt; nothing to do.
             Ok(None) => return Ok(()),
             Err(error) => {
-                log::error!("failed to install zed CLI: {error:#}");
+                log::error!("failed to install {cli_name} CLI: {error:#}");
                 workspace.update(cx, |workspace, cx| {
                     struct CliInstallFailed;
 
@@ -114,10 +115,10 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
                         |cx| {
                             cx.new(|cx| {
                                 MessageNotification::new(
-                                    "You can add `zed` to your PATH manually.",
+                                    format!("You can add `{cli_name}` to your PATH manually."),
                                     cx,
                                 )
-                                .with_title("Couldn't install the Zed CLI")
+                                .with_title(format!("Couldn't install the {app_name} CLI"))
                                 .more_info_message("Show me how")
                                 .more_info_url(CANT_INSTALL_DOCS_URL)
                             })
@@ -135,7 +136,7 @@ pub fn install_cli_binary(window: &mut Window, cx: &mut Context<Workspace>) {
                 Toast::new(
                     NotificationId::unique::<InstalledZedCli>(),
                     format!(
-                        "Installed `zed` to {}. You can launch {} from your terminal.",
+                        "Installed `{cli_name}` to {}. You can launch {} from your terminal.",
                         path.to_string_lossy(),
                         ReleaseChannel::global(cx).display_name()
                     ),

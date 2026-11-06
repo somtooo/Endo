@@ -188,6 +188,7 @@ prompt_store.workspace = true
 proto.workspace = true
 recent_projects.workspace = true
 release_channel.workspace = true
+endo.workspace = true
 remote.workspace = true
 repl.workspace = true
 reqwest = { workspace = true, features = ["multipart"] }
@@ -325,14 +326,14 @@ osx_minimum_system_version = "12.0"
 osx_info_plist_exts = ["resources/info/*"]
 osx_url_schemes = ["zed"]
 
-[package.metadata.bundle-zelda]
-icon = ["resources/app-icon-zelda@2x.png", "resources/app-icon-zelda.png"]
-identifier = "dev.zed.Zelda"
-name = "Zelda"
+[package.metadata.bundle-endo]
+icon = ["resources/app-icon-endo-macos@2x.png", "resources/app-icon-endo-macos.png"]
+identifier = "dev.zed.Endo"
+name = "Endo"
 category = "Developer Tool"
-osx_minimum_system_version = "10.15.7"
+osx_minimum_system_version = "12.0"
 osx_info_plist_exts = ["resources/info/*"]
-osx_url_schemes = ["zed"]
+osx_url_schemes = ["endo"]
 
 [package.metadata.cargo-shear]
 ignored = ["profiling", "tracing"]

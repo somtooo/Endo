@@ -184,12 +184,15 @@ fi
 temp_dir=$(mktemp -d)
 trap 'rm -rf "$temp_dir"' EXIT
 zed_dir="${temp_dir}/zed$suffix.app"
+if [[ "$channel" == "endo" ]]; then
+  zed_dir="${temp_dir}/endo.app"
+fi
 
 # Cargo may reuse its outputs on the next invocation. Strip packaging copies
 # so reruns still upload full ELFs and extract complete debug companions.
 cli_name="zed"
-if [[ "$channel" == "zelda" ]]; then
-  cli_name="zelda"
+if [[ "$channel" == "endo" ]]; then
+  cli_name="endo"
 fi
 mkdir -p "${zed_dir}/bin" "${zed_dir}/libexec"
 llvm-objcopy --strip-unneeded "${target_dir}/${target_triple}/release/zed" "${zed_dir}/libexec/zed-editor"
@@ -216,9 +219,9 @@ cp $(find_libs) "${zed_dir}/lib"
 
 # Icons
 mkdir -p "${zed_dir}/share/icons/hicolor/512x512/apps"
-cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/zed.png"
+cp "crates/zed/resources/app-icon$suffix.png" "${zed_dir}/share/icons/hicolor/512x512/apps/${cli_name}.png"
 mkdir -p "${zed_dir}/share/icons/hicolor/1024x1024/apps"
-cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/zed.png"
+cp "crates/zed/resources/app-icon$suffix@2x.png" "${zed_dir}/share/icons/hicolor/1024x1024/apps/${cli_name}.png"
 
 # .desktop
 export DO_STARTUP_NOTIFY="true"
@@ -228,10 +231,11 @@ export APP_ARGS="%U"
 if [[ "$channel" == "preview" ]]; then
   export APP_NAME="Zed Preview"
   APP_ID="dev.zed.Zed-Preview"
-elif [[ "$channel" == "zelda" ]]; then
-  export APP_NAME="Zelda"
-  export APP_CLI="zelda"
-  APP_ID="dev.zed.Zelda"
+elif [[ "$channel" == "endo" ]]; then
+  export APP_NAME="Endo"
+  export APP_CLI="endo"
+  export APP_ICON="endo"
+  APP_ID="dev.zed.Endo"
 elif [[ "$channel" == "nightly" ]]; then
   export APP_NAME="Zed Nightly"
   APP_ID="dev.zed.Zed-Nightly"
@@ -245,6 +249,9 @@ fi
 
 mkdir -p "${zed_dir}/share/applications"
 envsubst < "crates/zed/resources/zed.desktop.in" > "${zed_dir}/share/applications/$APP_ID.desktop"
+if [[ "$channel" == "endo" ]]; then
+  sed -i 's/x-scheme-handler\/zed/x-scheme-handler\/endo/;s/Keywords=zed;/Keywords=endo;zed;/' "${zed_dir}/share/applications/$APP_ID.desktop"
+fi
 chmod +x "${zed_dir}/share/applications/$APP_ID.desktop"
 
 # Copy generated licenses so they'll end up in archive too
@@ -253,14 +260,14 @@ cp "assets/licenses.md" "${zed_dir}/licenses.md"
 # Create archive out of everything that's in the temp directory
 arch=$(uname -m)
 archive_name="zed"
-if [[ "$channel" == "zelda" ]]; then
-  archive_name="zelda"
+if [[ "$channel" == "endo" ]]; then
+  archive_name="endo"
 fi
 archive="${archive_name}-linux-${arch}.tar.gz"
 
 rm -rf "${archive}"
-remove_match="(zed|zelda)(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
+remove_match="${archive_name}(-[a-zA-Z0-9]+)?-linux-$(uname -m)\.tar\.gz"
 ls "${target_dir}/release" | grep -E ${remove_match} | xargs -d "\n" -I {} rm -f "${target_dir}/release/{}" || true
-tar -czvf "${target_dir}/release/$archive" -C ${temp_dir} "zed$suffix.app"
+tar -czvf "${target_dir}/release/$archive" -C "${temp_dir}" "$(basename "$zed_dir")"
 
 gzip -f --stdout --best "${temp_dir}/remote_server" > "${target_dir}/zed-remote-server-linux-${arch}.gz"

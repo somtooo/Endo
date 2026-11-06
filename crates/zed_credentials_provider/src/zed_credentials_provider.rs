@@ -57,7 +57,7 @@ fn new(cx: &App) -> Arc<dyn CredentialsProvider> {
             ReleaseChannel::Nightly
             | ReleaseChannel::Preview
             | ReleaseChannel::Stable
-            | ReleaseChannel::Zelda,
+            | ReleaseChannel::Endo,
         )
         | None => false,
     };

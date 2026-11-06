@@ -1,0 +1,13 @@
+{
+  "fill": { "solid": "srgb:0.03529,0.03922,0.05490,1.00000" },
+  "groups": [
+    {
+      "layers": [
+        { "glass": false, "image-name": "endo.svg", "name": "Endo" }
+      ],
+      "shadow": { "kind": "none", "opacity": 0.5 },
+      "translucency": { "enabled": false, "value": 0.5 }
+    }
+  ],
+  "supported-platforms": { "squares": ["macOS"] }
+}

@@ -118,7 +118,7 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
         Commands::Version => {
             let release_channel = *RELEASE_CHANNEL;
             match release_channel {
-                ReleaseChannel::Stable | ReleaseChannel::Preview | ReleaseChannel::Zelda => {
+                ReleaseChannel::Stable | ReleaseChannel::Preview | ReleaseChannel::Endo => {
                     println!("{}", env!("ZED_PKG_VERSION"))
                 }
                 ReleaseChannel::Nightly | ReleaseChannel::Dev => {
@@ -138,7 +138,7 @@ pub fn run(command: Commands) -> anyhow::Result<()> {
 }
 
 pub static VERSION: LazyLock<String> = LazyLock::new(|| match *RELEASE_CHANNEL {
-    ReleaseChannel::Stable | ReleaseChannel::Preview | ReleaseChannel::Zelda => {
+    ReleaseChannel::Stable | ReleaseChannel::Preview | ReleaseChannel::Endo => {
         env!("ZED_PKG_VERSION").to_owned()
     }
     ReleaseChannel::Nightly | ReleaseChannel::Dev => {

@@ -1541,7 +1541,7 @@ fn open_about_window(cx: &mut App) {
                 include_bytes!("../resources/app-icon-preview.png").as_slice()
             }
             ReleaseChannel::Stable => include_bytes!("../resources/app-icon.png").as_slice(),
-            ReleaseChannel::Zelda => include_bytes!("../resources/app-icon-zelda.png").as_slice(),
+            ReleaseChannel::Endo => include_bytes!("../resources/app-icon-endo.png").as_slice(),
         };
 
         Arc::new(Image::from_bytes(ImageFormat::Png, bytes.to_vec()))
@@ -1569,7 +1569,12 @@ fn open_about_window(cx: &mut App) {
             } else {
                 ""
             };
-            let message: SharedString = format!("{release_channel_name} {version} {debug}").into();
+            let message: SharedString = if release_channel == ReleaseChannel::Endo {
+                let fork_version = endo::RELEASE_TAG.unwrap_or("development");
+                format!("Endo {fork_version} (Zed {version}) {debug}").into()
+            } else {
+                format!("{release_channel_name} {version} {debug}").into()
+            };
             let commit = AppCommitSha::try_global(cx)
                 .map(|sha| sha.full())
                 .filter(|commit| !commit.is_empty())
@@ -1723,7 +1728,14 @@ fn open_about_window(cx: &mut App) {
     cx.open_window(
         WindowOptions {
             titlebar: Some(TitlebarOptions {
-                title: Some("About Zed".into()),
+                title: Some(
+                    if ReleaseChannel::global(cx) == ReleaseChannel::Endo {
+                        "About Endo"
+                    } else {
+                        "About Zed"
+                    }
+                    .into(),
+                ),
                 appears_transparent: true,
                 traffic_light_position: Some(point(px(12.), px(12.))),
             }),
