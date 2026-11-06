@@ -2015,6 +2015,8 @@ impl ConversationView {
                     active.update(cx, |active, cx| {
                         active.sync_elicitation_state_for_entry(index, window, cx);
                         active.sync_editor_mode(cx);
+                        // A tool call can follow a thought as a new entry.
+                        active.auto_expand_streaming_thought(cx);
                         active.sync_generating_indicator(cx);
                         if matches!(
                             thread.read(cx).entries().get(index),
@@ -11768,6 +11770,76 @@ pub(crate) mod tests {
 
         connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
         cx.run_until_parked();
+    }
+
+    #[gpui::test]
+    async fn test_automatic_thinking_blocks_close_when_the_reply_moves_on(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let (_conversation_view, connection, thread_view, session_id, user_message_index, cx) =
+            setup_active_response_anchor_test(cx).await;
+        let thread = thread_view.read_with(cx, |view, _| view.thread.clone());
+        let is_open = |key: (usize, usize), cx: &mut VisualTestContext| {
+            thread_view.read_with(cx, |view, cx| {
+                view.entry_view_state
+                    .read(cx)
+                    .thinking_block_state(key, cx)
+                    .0
+            })
+        };
+        let first_reply = user_message_index + 1;
+
+        for (index, id) in ["first-thought", "second-thought"].into_iter().enumerate() {
+            thread
+                .update(cx, |thread, cx| {
+                    thread.upsert_thought(
+                        acp_v2::AgentThought::new(id).content(vec![acp_v2::ContentBlock::Text(
+                            acp_v2::TextContent::new("Thinking"),
+                        )]),
+                        cx,
+                    )
+                })
+                .expect("thought");
+            cx.run_until_parked();
+            assert!(
+                is_open((first_reply, index), cx),
+                "a streaming thought opens"
+            );
+        }
+        assert!(
+            !is_open((first_reply, 0), cx),
+            "a thought followed directly by another closes"
+        );
+        assert!(is_open((first_reply, 1), cx));
+
+        send_thread_update(
+            &connection,
+            &session_id,
+            acp_v1::SessionUpdate::ToolCall(acp_v1::ToolCall::new("tool", "Read file")),
+            cx,
+        );
+        assert!(
+            !is_open((first_reply, 1), cx),
+            "a thought followed by a new tool call entry closes"
+        );
+
+        send_thread_update(
+            &connection,
+            &session_id,
+            acp_v1::SessionUpdate::AgentThoughtChunk(acp_v1::ContentChunk::new(
+                "Last thought".into(),
+            )),
+            cx,
+        );
+        let last_reply = first_reply + 2;
+        assert!(is_open((last_reply, 0), cx));
+
+        connection.end_turn(session_id, acp_v1::StopReason::EndTurn);
+        cx.run_until_parked();
+        assert!(
+            !is_open((last_reply, 0), cx),
+            "a thought still open when the turn ends closes"
+        );
     }
 
     #[gpui::test]
