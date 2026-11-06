@@ -91,4 +91,6 @@ settings = { workspace = true, features = ["test-support"] }
 workspace = { workspace = true, features = ["test-support"] }
 
 [package.metadata.cargo-shear]
-ignored = ["component"]
+# `opencode_agent` brings in `remote_connection`, which only compiles in tests
+# with its own `test-support` feature on.
+ignored = ["component", "remote_connection"]

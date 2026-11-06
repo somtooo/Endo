@@ -939,15 +939,15 @@ mod tests {
         );
         log.live(
             "session.text.delta",
-            json!({"assistantMessageID": message, "ordinal": 0, "delta": "Hel"}),
+            json!({"assistantMessageID": message, "ordinal": 0, "delta": "Good"}),
         );
         log.live(
             "session.text.delta",
-            json!({"assistantMessageID": message, "ordinal": 0, "delta": "lo"}),
+            json!({"assistantMessageID": message, "ordinal": 0, "delta": " day"}),
         );
         log.durable(
             "session.text.ended",
-            json!({"assistantMessageID": message, "ordinal": 0, "text": "Hello"}),
+            json!({"assistantMessageID": message, "ordinal": 0, "text": "Good day"}),
         );
         log.durable(
             "session.step.ended",
@@ -1020,7 +1020,7 @@ mod tests {
         ));
         assert!(matches!(
             &assistant.content[2],
-            AssistantContent::Text { text } if text == "Hello"
+            AssistantContent::Text { text } if text == "Good day"
         ));
     }
 
@@ -1036,7 +1036,7 @@ mod tests {
         let assistant = transcript.messages()[1].as_assistant().expect("assistant");
         assert!(matches!(
             &assistant.content[2],
-            AssistantContent::Text { text } if text == "Hello"
+            AssistantContent::Text { text } if text == "Good day"
         ));
         assert_eq!(transcript.activity(), Activity::Running);
     }
