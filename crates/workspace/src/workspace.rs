@@ -2763,6 +2763,9 @@ impl Workspace {
         cx: &mut App,
     ) {
         let position = dock.read(cx).position();
+        if self.expanded_agent_position(cx) == Some(position) {
+            return;
+        }
         let current_size = self.dock_size(&dock.read(cx), window, cx);
         let current_flex =
             current_size.and_then(|size| self.dock_flex_for_size(position, size, window, cx));
@@ -8539,7 +8542,9 @@ impl Workspace {
             ))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &ResetActiveDockSize, window, cx| {
-                    if let Some(dock) = workspace.active_dock(window, cx).cloned() {
+                    if let Some(dock) = workspace.active_dock(window, cx).cloned()
+                        && workspace.expanded_agent_position(cx) != Some(dock.read(cx).position())
+                    {
                         dock.update(cx, |dock, cx| {
                             dock.reset_panel_sizes(window, cx);
                         });
@@ -8549,7 +8554,10 @@ impl Workspace {
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &ResetOpenDocksSize, window, cx| {
                     for dock in workspace.all_docks() {
-                        if dock.read(cx).visible_panel().is_some() {
+                        if dock.read(cx).visible_panel().is_some()
+                            && workspace.expanded_agent_position(cx)
+                                != Some(dock.read(cx).position())
+                        {
                             dock.update(cx, |dock, cx| {
                                 dock.reset_panel_sizes(window, cx);
                             });
@@ -10064,6 +10072,8 @@ impl Render for Workspace {
                                     move |bounds, window, cx| {
                                         this.update(cx, |this, cx| {
                                             let bounds_changed = this.bounds != bounds;
+                                            let width_changed =
+                                                this.bounds.size.width != bounds.size.width;
                                             this.bounds = bounds;
 
                                             if bounds_changed {
@@ -10090,6 +10100,35 @@ impl Render for Workspace {
                                                         cx,
                                                     )
                                                 });
+                                                if width_changed
+                                                    && let Some(position) =
+                                                        this.expanded_agent_position(cx)
+                                                {
+                                                    let opposite = if position == DockPosition::Left
+                                                    {
+                                                        DockPosition::Right
+                                                    } else {
+                                                        DockPosition::Left
+                                                    };
+                                                    if this
+                                                        .dock_at_position(opposite)
+                                                        .read(cx)
+                                                        .visible_panel()
+                                                        .is_some_and(|panel| {
+                                                            panel.has_flexible_size(window, cx)
+                                                        })
+                                                    {
+                                                        // Layout-time notifications do not schedule a new frame.
+                                                        cx.defer_in(window, |workspace, _, cx| {
+                                                            if workspace
+                                                                .expanded_agent_position(cx)
+                                                                .is_some()
+                                                            {
+                                                                cx.notify();
+                                                            }
+                                                        });
+                                                    }
+                                                }
                                             }
                                         })
                                     },
@@ -17368,6 +17407,88 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_agent_focus_mode_bottom_layouts_and_opposite_resize(cx: &mut TestAppContext) {
+        init_test(cx);
+        for agent_position in [DockPosition::Left, DockPosition::Right] {
+            for bottom_layout in [
+                BottomDockLayout::Contained,
+                BottomDockLayout::Full,
+                BottomDockLayout::LeftAligned,
+                BottomDockLayout::RightAligned,
+            ] {
+                cx.update_global(|store: &mut SettingsStore, cx| {
+                    store.update_user_settings(cx, |settings| {
+                        settings.workspace.bottom_dock_layout = Some(bottom_layout)
+                    });
+                });
+                let fs = FakeFs::new(cx.executor());
+                let project = Project::test(fs, [], cx).await;
+                let (workspace, cx) =
+                    cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+                cx.simulate_resize(size(px(1200.), px(800.)));
+                let opposite_position = if agent_position == DockPosition::Left {
+                    DockPosition::Right
+                } else {
+                    DockPosition::Left
+                };
+                workspace.update_in(cx, |workspace, window, cx| {
+                    let agent = cx.new(|cx| {
+                        let mut panel = TestPanel::new_flexible(agent_position, 100, cx);
+                        panel.agent = true;
+                        panel
+                    });
+                    let opposite = cx.new(|cx| TestPanel::new_flexible(opposite_position, 100, cx));
+                    let bottom = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+                    workspace.add_panel(agent, window, cx);
+                    workspace.add_panel(opposite, window, cx);
+                    workspace.add_panel(bottom, window, cx);
+                    workspace.toggle_dock(agent_position, window, cx);
+                    workspace.toggle_dock(opposite_position, window, cx);
+                    workspace.toggle_dock(DockPosition::Bottom, window, cx);
+                    workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+                });
+                cx.run_until_parked();
+                let opposite_selector = if opposite_position == DockPosition::Left {
+                    "left-dock"
+                } else {
+                    "right-dock"
+                };
+                let agent = cx.debug_bounds("agent-focus-column").expect("agent column");
+                let opposite = cx.debug_bounds(opposite_selector).expect("opposite dock");
+                let bottom = cx.debug_bounds("bottom-dock").expect("bottom dock");
+                assert!(
+                    agent.size.width > px(0.)
+                        && opposite.size.width > px(0.)
+                        && bottom.size.height > px(0.)
+                );
+                let spans_opposite = bottom_layout == BottomDockLayout::Full
+                    || (bottom_layout == BottomDockLayout::LeftAligned
+                        && opposite_position == DockPosition::Left)
+                    || (bottom_layout == BottomDockLayout::RightAligned
+                        && opposite_position == DockPosition::Right);
+                if spans_opposite {
+                    assert!((opposite.bottom() - bottom.top()).abs() < px(2.));
+                } else {
+                    assert!((opposite.bottom() - bottom.bottom()).abs() < px(2.));
+                }
+                workspace.update_in(cx, |workspace, window, cx| {
+                    if opposite_position == DockPosition::Left {
+                        workspace.resize_left_dock(px(250.), window, cx);
+                    } else {
+                        workspace.resize_right_dock(px(250.), window, cx);
+                    }
+                });
+                cx.run_until_parked();
+                let resized = cx.debug_bounds(opposite_selector).expect("opposite dock");
+                assert!(
+                    (resized.size.width - px(250.)).abs() < px(2.),
+                    "{agent_position:?} {bottom_layout:?}: {resized:?}"
+                );
+            }
+        }
+    }
+
+    #[gpui::test]
     async fn test_agent_focus_mode_tracks_editor_occupancy(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());
@@ -17392,6 +17513,12 @@ mod tests {
                 workspace.expanded_agent_position(cx),
                 Some(DockPosition::Right)
             );
+        });
+        workspace.update_in(cx, |workspace, window, cx| {
+            agent.focus_handle(cx).focus(window, cx);
+            workspace.toggle_panel_focus::<TestPanel>(window, cx);
+            assert!(agent.focus_handle(cx).contains_focused(window, cx));
+            assert!(workspace.agent_focus_mode());
         });
         let item = add_an_item_to_active_pane(cx, &workspace, 1);
         cx.run_until_parked();
