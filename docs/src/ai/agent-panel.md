@@ -31,7 +31,7 @@ The sections below cover what you can do from here.
 
 ### Focus Mode {#focus-mode}
 
-Use the Focus Mode button in the Agent Panel or {#kb workspace::ToggleAgentFocusMode} to let the agent use the editor's space when the editor is empty. Opening an editor item makes room for it; closing the last item expands the visible agent again. Focus Mode remains enabled for the workspace session until you turn it off. Hiding the agent does not reopen it, and other panels remain available.
+Use the Focus Mode button in the Agent Panel or {#kb workspace::ToggleAgentFocusMode} to let the agent use the editor's space when the editor is empty. Opening an editor item makes room for it; closing the last item expands the visible agent again. Focus Mode remains enabled for the workspace until you turn it off, including after reopening Zed. Hiding the agent does not reopen it, and other panels remain available.
 
 ### Creating New Threads {#new-thread}
 

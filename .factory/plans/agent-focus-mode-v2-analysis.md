@@ -2,7 +2,7 @@
 
 ## Contract
 
-Focus Mode is an explicit, per-workspace preference for this session. It remains enabled until explicitly toggled off. If enabled, the agent is visible, and every center pane is empty, the agent occupies the available center area. An occupied center pane, hidden/replaced agent, or zoomed view suspends the expanded layout without disabling the mode. Showing the agent after the center becomes empty expands it again; other docks and the threads sidebar remain independently usable. Focus must not be moved to an empty, hidden center by a panel focus toggle. No auto-expand setting or file-opening request tracking is needed.
+Focus Mode is an explicit, persisted per-workspace preference. It remains enabled until explicitly toggled off. If enabled, the agent is visible, and every center pane is empty, the agent occupies the available center area. An occupied center pane, hidden/replaced agent, or zoomed view suspends the expanded layout without disabling the mode. Showing the agent after the center becomes empty expands it again; other docks and the threads sidebar remain independently usable. Focus must not be moved to an empty, hidden center by a panel focus toggle. No auto-expand setting or file-opening request tracking is needed.
 
 ## Slice 1: editor occupancy
 
@@ -21,7 +21,7 @@ Focus Mode is an explicit, per-workspace preference for this session. It remains
 - `Panel::is_agent_panel` already exists upstream; dock visibility and active panel are represented independently of workspace editor panes. This lets policy remain in workspace, without agent-specific types in the workspace crate.
 - `Workspace::toggle_panel_focus` normally focuses the center after toggling an already-focused panel. In expanded mode that center is empty and hidden, so the action must not send focus into it; opening another dock must remain possible.
 - Zoom is upstream's independent fullscreen layout. Enabling Focus Mode should not break zoom; whether zoom temporarily suppresses expansion can be derived rather than disabling the preference.
-- Initialization/restoration must not persist the temporary expansion as a panel width or forcibly show a hidden agent. The explicit preference starts off for a new workspace unless a persistence requirement is added.
+- Initialization/restoration must not persist the temporary expansion as a panel width or forcibly show a hidden agent. The preference is saved with the workspace and defaults to off for workspaces created before the migration.
 
 ## Test matrix
 
@@ -34,5 +34,5 @@ Focus Mode is an explicit, per-workspace preference for this session. It remains
 
 - The occupancy, normal-width, bottom-layout/opposite-resize, and settings-driven layout-swap tests run deterministically; the settings-driven move reproduces the real `starts_open` ordering. The V2 implementation does not change `open_paths` or add asynchronous request wrappers.
 - Isolated UI passes have covered both layout presets, file opening, closing the final item, multiple splits, hiding the agent while closing the last item, re-showing it, opposite-dock drag, the bottom terminal, and the empty-editor agent focus action. These are not a substitute for all platform, accessibility, restoration, or live-agent coverage.
-- The preference is per workspace session, like V1; restart persistence has not been implemented. In particular, re-opening a workspace starts with Focus Mode off.
+- The preference is serialized with workspace state, and restored for local, remote, and workspace-ID reopening. Dock visibility is restored separately so persistence does not force the agent open.
 - `./script/clippy -p workspace -p agent_ui` was blocked by an existing `clippy::approx_constant` error in `crates/gpui/src/geometry.rs`, before it could validate these crates.

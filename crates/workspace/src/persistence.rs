@@ -1065,6 +1065,9 @@ impl Domain for WorkspaceDb {
         sql!(
             ALTER TABLE workspaces ADD COLUMN native_window_state BLOB;
         ),
+        sql!(
+            ALTER TABLE workspaces ADD COLUMN agent_focus_mode INTEGER NOT NULL DEFAULT 0;
+        ),
     ];
 
     // Allow recovering from bad migration that was initially shipped to nightly
@@ -1121,7 +1124,7 @@ impl WorkspaceDb {
             identity_paths_order,
             window_bounds,
             display,
-            centered_layout,
+            (centered_layout, agent_focus_mode),
             docks,
             window_id,
         ): (
@@ -1132,7 +1135,7 @@ impl WorkspaceDb {
             Option<String>,
             Option<SerializedWindowBounds>,
             Option<Uuid>,
-            Option<bool>,
+            (Option<bool>, bool),
             DockStructure,
             Option<u64>,
         ) = self
@@ -1150,6 +1153,7 @@ impl WorkspaceDb {
                     window_height,
                     display,
                     centered_layout,
+                    agent_focus_mode,
                     left_dock_visible,
                     left_dock_active_panel,
                     left_dock_zoom,
@@ -1209,6 +1213,7 @@ impl WorkspaceDb {
                 .log_err()?,
             window_bounds,
             centered_layout: centered_layout.unwrap_or(false),
+            agent_focus_mode,
             display,
             docks,
             session_id: None,
@@ -1232,7 +1237,7 @@ impl WorkspaceDb {
             identity_paths_order,
             window_bounds,
             display,
-            centered_layout,
+            (centered_layout, agent_focus_mode),
             docks,
             window_id,
             remote_connection_id,
@@ -1243,7 +1248,7 @@ impl WorkspaceDb {
             Option<String>,
             Option<SerializedWindowBounds>,
             Option<Uuid>,
-            Option<bool>,
+            (Option<bool>, bool),
             DockStructure,
             Option<u64>,
             Option<i32>,
@@ -1261,6 +1266,7 @@ impl WorkspaceDb {
                     window_height,
                     display,
                     centered_layout,
+                    agent_focus_mode,
                     left_dock_visible,
                     left_dock_active_panel,
                     left_dock_zoom,
@@ -1314,6 +1320,7 @@ impl WorkspaceDb {
                 .log_err()?,
             window_bounds,
             centered_layout: centered_layout.unwrap_or(false),
+            agent_focus_mode,
             display,
             docks,
             session_id: None,
@@ -1626,9 +1633,10 @@ impl WorkspaceDb {
                         bottom_dock_zoom,
                         session_id,
                         window_id,
+                        agent_focus_mode,
                         timestamp
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, CURRENT_TIMESTAMP)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, CURRENT_TIMESTAMP)
                     ON CONFLICT DO
                     UPDATE SET
                         paths = ?2,
@@ -1647,6 +1655,7 @@ impl WorkspaceDb {
                         bottom_dock_zoom = ?15,
                         session_id = ?16,
                         window_id = ?17,
+                        agent_focus_mode = ?18,
                         timestamp = CURRENT_TIMESTAMP
                 );
                 let mut prepared_query = conn.exec_bound(query)?;
@@ -1660,6 +1669,7 @@ impl WorkspaceDb {
                     workspace.docks,
                     workspace.session_id,
                     workspace.window_id,
+                    workspace.agent_focus_mode,
                 );
 
                 prepared_query(args).context("Updating workspace")?;
@@ -2949,6 +2959,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: {
                 let mut map = collections::BTreeMap::default();
@@ -3107,6 +3118,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: {
                 let mut map = collections::BTreeMap::default();
@@ -3158,6 +3170,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: collections::BTreeMap::default(),
             session_id: None,
@@ -3251,6 +3264,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: None,
             user_toolchains: Default::default(),
@@ -3331,6 +3345,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: None,
@@ -3349,6 +3364,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: None,
@@ -3461,6 +3477,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: Some(999),
             user_toolchains: Default::default(),
@@ -3503,6 +3520,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: Some(1),
             user_toolchains: Default::default(),
@@ -3519,6 +3537,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: None,
@@ -3566,6 +3585,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: Some(3),
             user_toolchains: Default::default(),
@@ -3605,6 +3625,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: Some("session-id-1".to_owned()),
@@ -3623,6 +3644,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: Some("session-id-1".to_owned()),
@@ -3641,6 +3663,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: Some("session-id-2".to_owned()),
@@ -3659,6 +3682,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: None,
@@ -3688,6 +3712,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: Some("session-id-2".to_owned()),
@@ -3708,6 +3733,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some("session-id-3".to_owned()),
             window_id: Some(60),
             user_toolchains: Default::default(),
@@ -3752,6 +3778,55 @@ mod tests {
         assert_eq!(locations[0].2, Some(60));
     }
 
+    #[gpui::test]
+    async fn test_agent_focus_mode_persistence() {
+        let db = WorkspaceDb::open_test_db("agent_focus_mode_persistence").await;
+        let mut first = default_workspace(&["/first"], &SerializedPaneGroup::default());
+        first.id = WorkspaceId(10);
+        first.agent_focus_mode = true;
+        first.docks.left.visible = false;
+        first.docks.left.active_panel = Some("AgentPanel".into());
+        let mut second = default_workspace(&["/second"], &SerializedPaneGroup::default());
+        second.id = WorkspaceId(11);
+        db.save_workspace(first.clone()).await;
+        db.save_workspace(second.clone()).await;
+
+        let restored = db
+            .workspace_for_roots(&["/first"])
+            .expect("first workspace");
+        assert!(restored.agent_focus_mode);
+        assert!(!restored.docks.left.visible);
+        assert_eq!(
+            restored.docks.left.active_panel.as_deref(),
+            Some("AgentPanel")
+        );
+        assert!(
+            db.workspace_for_id(first.id)
+                .expect("first workspace by id")
+                .agent_focus_mode
+        );
+        assert!(
+            !db.workspace_for_roots(&["/second"])
+                .expect("second workspace")
+                .agent_focus_mode
+        );
+
+        first.agent_focus_mode = false;
+        second.agent_focus_mode = true;
+        db.save_workspace(first.clone()).await;
+        db.save_workspace(second.clone()).await;
+        assert!(
+            !db.workspace_for_id(first.id)
+                .expect("first workspace by id")
+                .agent_focus_mode
+        );
+        assert!(
+            db.workspace_for_id(second.id)
+                .expect("second workspace by id")
+                .agent_focus_mode
+        );
+    }
+
     fn default_workspace<P: AsRef<Path>>(
         paths: &[P],
         center_group: &SerializedPaneGroup,
@@ -3768,6 +3843,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: None,
             user_toolchains: Default::default(),
@@ -3810,6 +3886,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some("one-session".to_owned()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -3912,6 +3989,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: session_id.map(|s| s.to_owned()),
             window_id: Some(id),
             user_toolchains: Default::default(),
@@ -3937,6 +4015,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: Some(id),
             user_toolchains: Default::default(),
@@ -4194,6 +4273,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some("one-session".to_owned()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -4560,6 +4640,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: None,
             user_toolchains: Default::default(),
@@ -4637,6 +4718,7 @@ mod tests {
                 display: Default::default(),
                 docks: Default::default(),
                 centered_layout: false,
+                agent_focus_mode: false,
                 session_id: Some("test-session".to_owned()),
                 bookmarks: Default::default(),
                 breakpoints: Default::default(),
@@ -4976,6 +5058,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some(session_id.clone()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -5074,6 +5157,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some(session_id.to_owned()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -5093,6 +5177,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some(session_id.to_owned()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -5174,6 +5259,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some(session_id.clone()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),

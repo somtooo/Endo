@@ -2265,6 +2265,9 @@ impl Workspace {
                 _ => requesting_window,
             };
 
+            let agent_focus_mode = serialized_workspace
+                .as_ref()
+                .is_some_and(|workspace| workspace.agent_focus_mode);
             let (window, workspace): (WindowHandle<MultiWorkspace>, Entity<Workspace>) =
                 if let Some(window) = window_to_replace {
                     let centered_layout = serialized_workspace
@@ -2283,6 +2286,7 @@ impl Workspace {
                             );
 
                             workspace.centered_layout = centered_layout;
+                            workspace.agent_focus_mode = agent_focus_mode;
 
                             // Call init callback to add items before window renders
                             if let Some(init) = init {
@@ -2346,6 +2350,7 @@ impl Workspace {
                                     cx,
                                 );
                                 workspace.centered_layout = centered_layout;
+                                workspace.agent_focus_mode = agent_focus_mode;
 
                                 // Call init callback to add items before window renders
                                 if let Some(init) = init {
@@ -2522,10 +2527,11 @@ impl Workspace {
     fn toggle_agent_focus_mode(
         &mut self,
         _: &ToggleAgentFocusMode,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.agent_focus_mode = !self.agent_focus_mode;
+        self.serialize_workspace(window, cx);
         for dock in self.all_docks() {
             let panel_id = dock
                 .read(cx)
@@ -8028,6 +8034,7 @@ impl Workspace {
                     display: Default::default(),
                     docks,
                     centered_layout: self.centered_layout,
+                    agent_focus_mode: self.agent_focus_mode,
                     session_id: self.session_id.clone(),
                     bookmarks,
                     breakpoints,
@@ -11549,6 +11556,7 @@ pub fn open_workspace_by_id(
             .with_context(|| format!("Workspace {workspace_id:?} not found"))?;
 
         let centered_layout = serialized_workspace.centered_layout;
+        let agent_focus_mode = serialized_workspace.agent_focus_mode;
 
         let (window, workspace) = if let Some(window) = requesting_window {
             let workspace = window.update(cx, |multi_workspace, window, cx| {
@@ -11561,6 +11569,7 @@ pub fn open_workspace_by_id(
                         cx,
                     );
                     workspace.centered_layout = centered_layout;
+                    workspace.agent_focus_mode = agent_focus_mode;
                     workspace
                 });
                 multi_workspace.add(workspace.clone(), &*window, cx);
@@ -11601,6 +11610,7 @@ pub fn open_workspace_by_id(
                             cx,
                         );
                         workspace.centered_layout = centered_layout;
+                        workspace.agent_focus_mode = agent_focus_mode;
                         workspace
                     });
                     cx.new(|cx| MultiWorkspace::new(workspace, window, cx))
@@ -12035,6 +12045,7 @@ async fn open_remote_project_inner(
 
             if let Some(ref serialized) = serialized_workspace {
                 workspace.centered_layout = serialized.centered_layout;
+                workspace.agent_focus_mode = serialized.agent_focus_mode;
             }
 
             workspace
@@ -17565,6 +17576,50 @@ mod tests {
             });
             assert!(cx.debug_bounds("agent-focus-column").is_some());
         }
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_toggle_is_saved_with_workspace(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(path!("/focus-project"), json!({})).await;
+        let project = Project::test(fs, [path!("/focus-project").as_ref()], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let database = cx.update(|_, cx| WorkspaceDb::global(cx));
+        let workspace_id = database.next_id().await.expect("workspace id");
+        workspace.update(cx, |workspace, _| workspace.set_database_id(workspace_id));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.flush_serialization(window, cx)
+            })
+            .await;
+        let stored = database
+            .workspace_for_id(workspace_id)
+            .expect("saved workspace");
+        assert!(stored.agent_focus_mode);
+        assert!(!stored.docks.left.visible && !stored.docks.right.visible);
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+        });
+        workspace
+            .update_in(cx, |workspace, window, cx| {
+                workspace.flush_serialization(window, cx)
+            })
+            .await;
+        assert!(
+            !database
+                .workspace_for_id(workspace_id)
+                .expect("saved workspace")
+                .agent_focus_mode
+        );
     }
 
     #[gpui::test]
