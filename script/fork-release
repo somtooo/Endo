@@ -294,7 +294,7 @@ if [ "$PUSH" = false ]; then
     echo "Release branch built: $RELEASE_BRANCH (not pushed)"
     echo "To publish it:"
     echo "  git push -u origin $RELEASE_BRANCH"
-    echo "  gh workflow run fork-release.yml --repo somtooo/zed --ref develop -f branch=$RELEASE_BRANCH"
+    echo "  gh workflow run fork-release.yml --repo somtooo/Endo --ref develop -f branch=$RELEASE_BRANCH"
     exit 0
 fi
 
@@ -303,4 +303,4 @@ git push -u origin "$RELEASE_BRANCH"
 
 echo "Release branch ready: $RELEASE_BRANCH"
 echo "Pushing it started fork-checks on the branch. When it is green:"
-echo "  gh workflow run fork-release.yml --repo somtooo/zed --ref develop -f branch=$RELEASE_BRANCH"
+echo "  gh workflow run fork-release.yml --repo somtooo/Endo --ref develop -f branch=$RELEASE_BRANCH"
