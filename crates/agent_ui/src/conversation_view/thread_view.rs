@@ -5830,9 +5830,7 @@ impl ThreadView {
                                     .children(self.render_token_usage(cx))
                                     .children(self.profile_selector.clone())
                                     .map(|this| match self.config_options_view.clone() {
-                                        Some(config_view) => this
-                                            .child(config_view)
-                                            .children(self.model_selector.clone()),
+                                        Some(config_view) => this.child(config_view),
                                         None => this
                                             .children(self.mode_selector.clone())
                                             .children(self.model_selector.clone()),
