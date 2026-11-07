@@ -1972,6 +1972,12 @@ impl Workspace {
         let left_dock = Dock::new(DockPosition::Left, modal_layer.clone(), window, cx);
         let bottom_dock = Dock::new(DockPosition::Bottom, modal_layer.clone(), window, cx);
         let right_dock = Dock::new(DockPosition::Right, modal_layer.clone(), window, cx);
+        for dock in [&left_dock, &right_dock] {
+            cx.observe_in(dock, window, |workspace, _, window, cx| {
+                workspace.reconcile_expanded_agent_focus(window, cx);
+            })
+            .detach();
+        }
         let left_dock_buttons = cx.new(|cx| PanelButtons::new(left_dock.clone(), cx));
         let bottom_dock_buttons = cx.new(|cx| PanelButtons::new(bottom_dock.clone(), cx));
         let right_dock_buttons = cx.new(|cx| PanelButtons::new(right_dock.clone(), cx));
@@ -2524,6 +2530,21 @@ impl Workspace {
             })
     }
 
+    fn center_contains_focused(&self, window: &Window, cx: &App) -> bool {
+        self.panes
+            .iter()
+            .any(|pane| pane.focus_handle(cx).contains_focused(window, cx))
+    }
+
+    fn reconcile_expanded_agent_focus(&self, window: &mut Window, cx: &mut App) {
+        if self.expanded_agent_position(cx).is_some()
+            && self.center_contains_focused(window, cx)
+            && !self.has_active_modal(window, cx)
+        {
+            self.focus_visible_center_or_agent(window, cx);
+        }
+    }
+
     fn toggle_agent_focus_mode(
         &mut self,
         _: &ToggleAgentFocusMode,
@@ -2531,6 +2552,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.agent_focus_mode = !self.agent_focus_mode;
+        self.reconcile_expanded_agent_focus(window, cx);
         self.serialize_workspace(window, cx);
         for dock in self.all_docks() {
             let panel_id = dock
@@ -2866,6 +2888,9 @@ impl Workspace {
 
         let opposite_dock = self.dock_at_position(opposite_position).read(cx);
         let panel = opposite_dock.visible_panel()?;
+        if panel.is_agent_panel(cx) && self.agent_focus_expands_empty_center(cx) {
+            return None;
+        }
         let mut size_state = opposite_dock
             .stored_panel_size_state(panel.as_ref())
             .unwrap_or_default();
@@ -4746,8 +4771,7 @@ impl Workspace {
         }
 
         if focus_center {
-            self.active_pane
-                .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx))
+            self.focus_visible_center_or_agent(window, cx);
         }
 
         cx.notify();
@@ -4865,13 +4889,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let mut did_focus_panel = false;
-        self.focus_or_unfocus_panel::<T>(window, cx, &mut |panel, window, cx| {
+        let panel = self.focus_or_unfocus_panel::<T>(window, cx, &mut |panel, window, cx| {
             did_focus_panel = !panel.panel_focus_handle(cx).contains_focused(window, cx);
             did_focus_panel
         });
 
         if !did_focus_panel && WorkspaceSettings::get_global(cx).close_panel_on_toggle {
             self.close_panel::<T>(window, cx);
+            if self.agent_focus_mode && panel.is_some() {
+                self.focus_visible_center_or_agent(window, cx);
+            }
         }
 
         telemetry::event!(
@@ -4881,6 +4908,17 @@ impl Workspace {
         );
 
         did_focus_panel
+    }
+
+    fn focus_visible_center_or_agent(&self, window: &mut Window, cx: &mut App) {
+        let agent_focus = self.expanded_agent_position(cx).and_then(|position| {
+            self.dock_at_position(position)
+                .read(cx)
+                .visible_panel()
+                .map(|panel| panel.activation_focus_handle(cx))
+        });
+        let focus = agent_focus.unwrap_or_else(|| self.active_pane.focus_handle(cx));
+        focus.focus(window, cx);
     }
 
     pub fn focus_center_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4944,9 +4982,8 @@ impl Workspace {
                     panel
                 });
 
-                if focus_center && self.expanded_agent_position(cx).is_none() {
-                    self.active_pane
-                        .update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx))
+                if focus_center {
+                    self.focus_visible_center_or_agent(window, cx);
                 }
 
                 result_panel = panel;
@@ -5020,7 +5057,7 @@ impl Workspace {
                     None
                 }
             })
-            .unwrap_or_else(|| self.active_pane.read(cx).focus_handle(cx))
+            .unwrap_or_else(|| self.focus_handle(cx))
     }
 
     fn dismiss_zoomed_items_to_reveal(
@@ -6411,13 +6448,7 @@ impl Workspace {
             }
             pane::Event::RemovedItem { item } => {
                 if self.agent_focus_mode {
-                    if pane.focus_handle(cx).contains_focused(window, cx)
-                        && let Some(position) = self.expanded_agent_position(cx)
-                        && let Some(panel) =
-                            self.dock_at_position(position).read(cx).visible_panel()
-                    {
-                        panel.activation_focus_handle(cx).focus(window, cx);
-                    }
+                    self.reconcile_expanded_agent_focus(window, cx);
                     cx.notify();
                 }
                 if item
@@ -6442,6 +6473,7 @@ impl Workspace {
             pane::Event::Focus => {
                 window.invalidate_character_coordinates();
                 self.handle_pane_focused(pane.clone(), window, cx);
+                self.reconcile_expanded_agent_focus(window, cx);
             }
             pane::Event::ZoomIn => {
                 if *pane == self.active_pane {
@@ -6461,6 +6493,7 @@ impl Workspace {
                     self.zoomed = None;
                     cx.emit(Event::ZoomChanged);
                 }
+                self.reconcile_expanded_agent_focus(window, cx);
                 cx.notify();
             }
             pane::Event::ItemPinned | pane::Event::ItemUnpinned => {}
@@ -7920,17 +7953,26 @@ impl Workspace {
         cx: &mut Context<Workspace>,
     ) {
         let removing_active_pane = self.active_pane() == pane;
+        let center_focused = self.center_contains_focused(window, cx);
         self.panes.retain(|p| p != pane);
         if let Some(focus_on) = focus_on {
             if removing_active_pane {
                 self.set_active_pane(focus_on, window, cx);
             }
-            focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            if self.expanded_agent_position(cx).is_some() {
+                if center_focused && !self.has_active_modal(window, cx) {
+                    self.focus_visible_center_or_agent(window, cx);
+                }
+            } else {
+                focus_on.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            }
         } else if removing_active_pane {
             let fallback_pane = self.panes.last().unwrap().clone();
             self.set_active_pane(&fallback_pane, window, cx);
-            if !self.has_active_modal(window, cx) {
-                fallback_pane.update(cx, |pane, cx| window.focus(&pane.focus_handle(cx), cx));
+            if !self.has_active_modal(window, cx)
+                && (center_focused || self.expanded_agent_position(cx).is_none())
+            {
+                self.focus_visible_center_or_agent(window, cx);
             }
         }
         if self.last_active_center_pane == Some(pane.downgrade()) {
@@ -8889,6 +8931,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.expanded_agent_position(cx).is_some() {
+            return;
+        }
         if self.zoomed.is_some() {
             self.active_pane.update(cx, |pane, cx| {
                 pane.set_zoomed(false, cx);
@@ -9053,13 +9098,19 @@ impl Workspace {
                     dock
                 }
             });
-        let agent = self.render_dock(position, self.dock_at_position(position), window, cx);
+        let agent_dock = self.dock_at_position(position);
+        let agent_minimum_width = agent_dock
+            .read(cx)
+            .visible_panel()
+            .and_then(|panel| panel.min_size(window, cx));
+        let agent = self.render_dock(position, agent_dock, window, cx);
         let agent_column = div()
             .debug_selector(|| "agent-focus-column".into())
             .flex()
             .flex_col()
             .flex_1()
             .h_full()
+            .when_some(agent_minimum_width, |column, width| column.min_w(width))
             .overflow_hidden()
             .child(
                 div()
@@ -9346,6 +9397,17 @@ impl Workspace {
         }
     }
 
+    fn reserved_dock_width(&self, dock: &Dock, window: &Window, cx: &App) -> Pixels {
+        if let Some(panel) = dock.visible_panel()
+            && panel.is_agent_panel(cx)
+            && self.agent_focus_expands_empty_center(cx)
+        {
+            return panel.min_size(window, cx).unwrap_or(RESIZE_HANDLE_SIZE);
+        }
+        dock.stored_active_panel_size(window, cx)
+            .unwrap_or(Pixels::ZERO)
+    }
+
     fn resize_left_dock(&mut self, new_size: Pixels, window: &mut Window, cx: &mut App) {
         if self.expanded_agent_position(cx) == Some(DockPosition::Left) {
             return;
@@ -9354,11 +9416,9 @@ impl Workspace {
         let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
 
         self.right_dock.read_with(cx, |right_dock, cx| {
-            let right_dock_size = right_dock
-                .stored_active_panel_size(window, cx)
-                .unwrap_or(Pixels::ZERO);
+            let right_dock_size = self.reserved_dock_width(right_dock, window, cx);
             if right_dock_size + size > workspace_width {
-                size = workspace_width - right_dock_size
+                size = (workspace_width - right_dock_size).max(Pixels::ZERO)
             }
         });
 
@@ -9375,11 +9435,9 @@ impl Workspace {
         let workspace_width = self.bounds.size.width;
         let mut size = new_size.min(workspace_width - RESIZE_HANDLE_SIZE);
         self.left_dock.read_with(cx, |left_dock, cx| {
-            let left_dock_size = left_dock
-                .stored_active_panel_size(window, cx)
-                .unwrap_or(Pixels::ZERO);
+            let left_dock_size = self.reserved_dock_width(left_dock, window, cx);
             if left_dock_size + size > workspace_width {
-                size = workspace_width - left_dock_size
+                size = (workspace_width - left_dock_size).max(Pixels::ZERO)
             }
         });
         let flex_grow = self.dock_flex_for_size(DockPosition::Right, size, window, cx);
@@ -17418,84 +17476,262 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_agent_focus_mode_opposite_resize_respects_agent_minimum(cx: &mut TestAppContext) {
+        init_test(cx);
+        for (agent_position, flexible) in [
+            (DockPosition::Left, false),
+            (DockPosition::Left, true),
+            (DockPosition::Right, false),
+            (DockPosition::Right, true),
+        ] {
+            let fs = FakeFs::new(cx.executor());
+            let project = Project::test(fs, [], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+            cx.simulate_resize(size(px(1200.), px(800.)));
+            let opposite_position = match agent_position {
+                DockPosition::Left => DockPosition::Right,
+                _ => DockPosition::Left,
+            };
+            let agent = workspace.update_in(cx, |workspace, window, cx| {
+                let agent = cx.new(|cx| {
+                    let mut panel = TestPanel::new(agent_position, 100, cx);
+                    panel.agent = true;
+                    panel.minimum_size = Some(px(300.));
+                    panel
+                });
+                let opposite = cx.new(|cx| {
+                    let mut panel = TestPanel::new(opposite_position, 100, cx);
+                    panel.flexible = flexible;
+                    panel
+                });
+                workspace.add_panel(agent.clone(), window, cx);
+                workspace.add_panel(opposite, window, cx);
+                workspace.toggle_dock(agent_position, window, cx);
+                workspace.toggle_dock(opposite_position, window, cx);
+                workspace
+                    .dock_at_position(agent_position)
+                    .update(cx, |dock, cx| {
+                        dock.set_panel_size_state(
+                            &agent,
+                            PanelSizeState {
+                                size: Some(px(600.)),
+                                flex: None,
+                            },
+                            cx,
+                        );
+                    });
+                workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+                agent
+            });
+            cx.run_until_parked();
+            let selector = if opposite_position == DockPosition::Left {
+                "left-dock"
+            } else {
+                "right-dock"
+            };
+            let initial = cx.debug_bounds(selector).expect("opposite dock");
+            let (start_x, direction) = if opposite_position == DockPosition::Left {
+                (initial.right() - px(1.), 1.)
+            } else {
+                (initial.left() + px(1.), -1.)
+            };
+            let start = point(start_x, initial.center().y);
+            let target = point(
+                start_x + (px(800.) - initial.size.width) * direction,
+                start.y,
+            );
+            cx.simulate_event(gpui::MouseDownEvent {
+                position: start,
+                button: MouseButton::Left,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            cx.run_until_parked();
+            for position in [point(start.x + px(10.) * direction, start.y), target] {
+                cx.simulate_event(gpui::MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                });
+                cx.run_until_parked();
+            }
+            cx.simulate_event(gpui::MouseUpEvent {
+                position: target,
+                button: MouseButton::Left,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            });
+            cx.run_until_parked();
+            let opposite = cx.debug_bounds(selector).expect("opposite dock");
+            assert!(
+                (opposite.size.width - px(800.)).abs() < px(2.),
+                "{agent_position:?}, flexible={flexible}: {opposite:?}"
+            );
+            let start = point(
+                if opposite_position == DockPosition::Left {
+                    opposite.right() - px(1.)
+                } else {
+                    opposite.left() + px(1.)
+                },
+                opposite.center().y,
+            );
+            let target = point(start.x + px(300.) * direction, start.y);
+            cx.simulate_event(gpui::MouseDownEvent {
+                position: start,
+                button: MouseButton::Left,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+                first_mouse: false,
+            });
+            cx.run_until_parked();
+            for position in [point(start.x + px(10.) * direction, start.y), target] {
+                cx.simulate_event(gpui::MouseMoveEvent {
+                    position,
+                    pressed_button: Some(MouseButton::Left),
+                    modifiers: Modifiers::default(),
+                });
+                cx.run_until_parked();
+            }
+            cx.simulate_event(gpui::MouseUpEvent {
+                position: target,
+                button: MouseButton::Left,
+                modifiers: Modifiers::default(),
+                click_count: 1,
+            });
+            cx.run_until_parked();
+            let opposite = cx.debug_bounds(selector).expect("opposite dock");
+            let agent_bounds = cx.debug_bounds("agent-focus-column").expect("agent column");
+            assert!(
+                (opposite.size.width - px(900.)).abs() < px(2.),
+                "{agent_position:?}, flexible={flexible}: {opposite:?}"
+            );
+            assert!(
+                (agent_bounds.size.width - px(300.)).abs() < px(2.),
+                "{agent_position:?}, flexible={flexible}: {agent_bounds:?}"
+            );
+            cx.simulate_resize(size(px(700.), px(800.)));
+            cx.run_until_parked();
+            let agent_bounds = cx.debug_bounds("agent-focus-column").expect("agent column");
+            assert!(
+                agent_bounds.size.width >= px(299.),
+                "after window resize: {agent_position:?}, flexible={flexible}: {agent_bounds:?}"
+            );
+            cx.simulate_resize(size(px(1200.), px(800.)));
+            cx.run_until_parked();
+            workspace.update_in(cx, |workspace, window, cx| {
+                assert_eq!(
+                    workspace
+                        .dock_at_position(agent_position)
+                        .read(cx)
+                        .stored_panel_size_state(&agent),
+                    Some(PanelSizeState {
+                        size: Some(px(600.)),
+                        flex: None
+                    })
+                );
+                workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+                match opposite_position {
+                    DockPosition::Left => workspace.resize_left_dock(px(800.), window, cx),
+                    DockPosition::Right => workspace.resize_right_dock(px(800.), window, cx),
+                    DockPosition::Bottom => unreachable!(),
+                }
+                if !flexible {
+                    let opposite = workspace.dock_at_position(opposite_position).read(cx);
+                    assert!(
+                        opposite
+                            .stored_active_panel_size(window, cx)
+                            .expect("opposite width")
+                            <= workspace.bounds.size.width - px(600.)
+                    );
+                }
+            });
+        }
+    }
+
+    #[gpui::test]
     async fn test_agent_focus_mode_bottom_layouts_and_opposite_resize(cx: &mut TestAppContext) {
         init_test(cx);
-        for agent_position in [DockPosition::Left, DockPosition::Right] {
-            for bottom_layout in [
-                BottomDockLayout::Contained,
-                BottomDockLayout::Full,
-                BottomDockLayout::LeftAligned,
-                BottomDockLayout::RightAligned,
-            ] {
-                cx.update_global(|store: &mut SettingsStore, cx| {
-                    store.update_user_settings(cx, |settings| {
-                        settings.workspace.bottom_dock_layout = Some(bottom_layout)
-                    });
+        for (agent_position, bottom_layout, bottom_covers_opposite) in [
+            (DockPosition::Left, BottomDockLayout::Contained, false),
+            (DockPosition::Left, BottomDockLayout::Full, true),
+            (DockPosition::Left, BottomDockLayout::LeftAligned, false),
+            (DockPosition::Left, BottomDockLayout::RightAligned, true),
+            (DockPosition::Right, BottomDockLayout::Contained, false),
+            (DockPosition::Right, BottomDockLayout::Full, true),
+            (DockPosition::Right, BottomDockLayout::LeftAligned, true),
+            (DockPosition::Right, BottomDockLayout::RightAligned, false),
+        ] {
+            cx.update_global(|store: &mut SettingsStore, cx| {
+                store.update_user_settings(cx, |settings| {
+                    settings.workspace.bottom_dock_layout = Some(bottom_layout)
                 });
-                let fs = FakeFs::new(cx.executor());
-                let project = Project::test(fs, [], cx).await;
-                let (workspace, cx) =
-                    cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
-                cx.simulate_resize(size(px(1200.), px(800.)));
-                let opposite_position = if agent_position == DockPosition::Left {
-                    DockPosition::Right
-                } else {
-                    DockPosition::Left
-                };
-                workspace.update_in(cx, |workspace, window, cx| {
-                    let agent = cx.new(|cx| {
-                        let mut panel = TestPanel::new_flexible(agent_position, 100, cx);
-                        panel.agent = true;
-                        panel
-                    });
-                    let opposite = cx.new(|cx| TestPanel::new_flexible(opposite_position, 100, cx));
-                    let bottom = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
-                    workspace.add_panel(agent, window, cx);
-                    workspace.add_panel(opposite, window, cx);
-                    workspace.add_panel(bottom, window, cx);
-                    workspace.toggle_dock(agent_position, window, cx);
-                    workspace.toggle_dock(opposite_position, window, cx);
-                    workspace.toggle_dock(DockPosition::Bottom, window, cx);
-                    workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            });
+            let fs = FakeFs::new(cx.executor());
+            let project = Project::test(fs, [], cx).await;
+            let (workspace, cx) =
+                cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+            cx.simulate_resize(size(px(1200.), px(800.)));
+            let opposite_position = if agent_position == DockPosition::Left {
+                DockPosition::Right
+            } else {
+                DockPosition::Left
+            };
+            workspace.update_in(cx, |workspace, window, cx| {
+                let agent = cx.new(|cx| {
+                    let mut panel = TestPanel::new_flexible(agent_position, 100, cx);
+                    panel.agent = true;
+                    panel
                 });
-                cx.run_until_parked();
-                let opposite_selector = if opposite_position == DockPosition::Left {
-                    "left-dock"
-                } else {
-                    "right-dock"
-                };
-                let agent = cx.debug_bounds("agent-focus-column").expect("agent column");
-                let opposite = cx.debug_bounds(opposite_selector).expect("opposite dock");
-                let bottom = cx.debug_bounds("bottom-dock").expect("bottom dock");
-                assert!(
-                    agent.size.width > px(0.)
-                        && opposite.size.width > px(0.)
-                        && bottom.size.height > px(0.)
-                );
-                let spans_opposite = bottom_layout == BottomDockLayout::Full
-                    || (bottom_layout == BottomDockLayout::LeftAligned
-                        && opposite_position == DockPosition::Left)
-                    || (bottom_layout == BottomDockLayout::RightAligned
-                        && opposite_position == DockPosition::Right);
-                if spans_opposite {
-                    assert!((opposite.bottom() - bottom.top()).abs() < px(2.));
-                } else {
-                    assert!((opposite.bottom() - bottom.bottom()).abs() < px(2.));
-                }
-                workspace.update_in(cx, |workspace, window, cx| {
-                    if opposite_position == DockPosition::Left {
-                        workspace.resize_left_dock(px(250.), window, cx);
-                    } else {
-                        workspace.resize_right_dock(px(250.), window, cx);
-                    }
-                });
-                cx.run_until_parked();
-                let resized = cx.debug_bounds(opposite_selector).expect("opposite dock");
-                assert!(
-                    (resized.size.width - px(250.)).abs() < px(2.),
-                    "{agent_position:?} {bottom_layout:?}: {resized:?}"
-                );
+                let opposite = cx.new(|cx| TestPanel::new_flexible(opposite_position, 100, cx));
+                let bottom = cx.new(|cx| TestPanel::new(DockPosition::Bottom, 100, cx));
+                workspace.add_panel(agent, window, cx);
+                workspace.add_panel(opposite, window, cx);
+                workspace.add_panel(bottom, window, cx);
+                workspace.toggle_dock(agent_position, window, cx);
+                workspace.toggle_dock(opposite_position, window, cx);
+                workspace.toggle_dock(DockPosition::Bottom, window, cx);
+                workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            });
+            cx.run_until_parked();
+            let opposite_selector = if opposite_position == DockPosition::Left {
+                "left-dock"
+            } else {
+                "right-dock"
+            };
+            let agent = cx.debug_bounds("agent-focus-column").expect("agent column");
+            let opposite = cx.debug_bounds(opposite_selector).expect("opposite dock");
+            let bottom = cx.debug_bounds("bottom-dock").expect("bottom dock");
+            assert!(
+                agent.size.width > px(0.)
+                    && opposite.size.width > px(0.)
+                    && bottom.size.height > px(0.)
+            );
+            if bottom_covers_opposite {
+                assert!((agent.bottom() - bottom.top()).abs() < px(2.));
+                assert!((opposite.bottom() - bottom.top()).abs() < px(2.));
+                assert!((bottom.left() - agent.left().min(opposite.left())).abs() < px(2.));
+                assert!((bottom.right() - agent.right().max(opposite.right())).abs() < px(2.));
+            } else {
+                assert!((agent.bottom() - bottom.bottom()).abs() < px(2.));
+                assert!((opposite.bottom() - bottom.bottom()).abs() < px(2.));
+                assert!((bottom.left() - agent.left()).abs() < px(2.));
+                assert!((bottom.right() - agent.right()).abs() < px(2.));
             }
+            workspace.update_in(cx, |workspace, window, cx| {
+                if opposite_position == DockPosition::Left {
+                    workspace.resize_left_dock(px(250.), window, cx);
+                } else {
+                    workspace.resize_right_dock(px(250.), window, cx);
+                }
+            });
+            cx.run_until_parked();
+            let resized = cx.debug_bounds(opposite_selector).expect("opposite dock");
+            assert!(
+                (resized.size.width - px(250.)).abs() < px(2.),
+                "{agent_position:?} {bottom_layout:?}: {resized:?}"
+            );
         }
     }
 
@@ -17620,6 +17856,476 @@ mod tests {
                 .expect("saved workspace")
                 .agent_focus_mode
         );
+    }
+
+    #[gpui::test]
+    async fn test_moving_startup_open_panel_without_focus_mode(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let panel = workspace.update_in(cx, |workspace, window, cx| {
+            let panel = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Left, 100, cx);
+                panel.starts_open = true;
+                panel
+            });
+            workspace.add_panel(panel.clone(), window, cx);
+            workspace
+                .left_dock
+                .update(cx, |dock, cx| dock.set_open(false, window, cx));
+            panel
+        });
+        panel.update_in(cx, |panel, window, cx| {
+            panel.set_position(DockPosition::Right, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert!(!workspace.agent_focus_mode());
+            assert_eq!(
+                workspace
+                    .right_dock
+                    .read(cx)
+                    .visible_panel()
+                    .map(|panel| panel.panel_id()),
+                Some(panel.entity_id())
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_focusing_visible_content(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let (agent, bottom) = workspace.update_in(cx, |workspace, window, cx| {
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.agent = true;
+                panel
+            });
+            let bottom = cx.new(|cx| SecondTestPanel {
+                focus_handle: cx.focus_handle(),
+                zoomed: false,
+            });
+            workspace.add_panel(agent.clone(), window, cx);
+            workspace.add_panel(bottom.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            (agent, bottom)
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+            assert!(bottom.focus_handle(cx).contains_focused(window, cx));
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            assert!(
+                bottom.focus_handle(cx).contains_focused(window, cx),
+                "enabling focus mode must not steal focus from another panel"
+            );
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+            workspace.active_pane.focus_handle(cx).focus(window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(
+                agent.focus_handle(cx).contains_focused(window, cx),
+                "enabling focus mode from an empty editor should focus the agent"
+            );
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+            assert!(bottom.focus_handle(cx).contains_focused(window, cx));
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+            assert!(
+                agent.focus_handle(cx).contains_focused(window, cx),
+                "closing the focused bottom dock should focus the agent"
+            );
+            workspace.toggle_panel_focus::<SecondTestPanel>(window, cx);
+            assert!(bottom.focus_handle(cx).contains_focused(window, cx));
+            workspace.toggle_panel_focus::<SecondTestPanel>(window, cx);
+            assert!(
+                agent.focus_handle(cx).contains_focused(window, cx),
+                "toggling focus away from another panel should focus the agent"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_after_closing_last_split_item(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let agent = workspace.update_in(cx, |workspace, window, cx| {
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.agent = true;
+                panel
+            });
+            workspace.add_panel(agent.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            agent
+        });
+        let item = add_an_item_to_active_pane(cx, &workspace, 1);
+        cx.run_until_parked();
+        let item_pane = workspace.update_in(cx, |workspace, window, cx| {
+            let item_pane = workspace.active_pane.clone();
+            workspace.split_pane(item_pane.clone(), SplitDirection::Right, window, cx);
+            workspace.set_active_pane(&item_pane, window, cx);
+            item_pane.focus_handle(cx).focus(window, cx);
+            item_pane
+        });
+        cx.run_until_parked();
+        item_pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(item.entity_id(), true, true, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.agent_focus_mode());
+            assert_eq!(
+                workspace.expanded_agent_position(cx),
+                Some(DockPosition::Right)
+            );
+            assert!(
+                agent.focus_handle(cx).contains_focused(window, cx),
+                "closing the last split item should focus the expanded agent"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_after_background_pane_loses_last_item(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let (agent, bottom) = workspace.update_in(cx, |workspace, window, cx| {
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.agent = true;
+                panel
+            });
+            let bottom = cx.new(|cx| SecondTestPanel {
+                focus_handle: cx.focus_handle(),
+                zoomed: false,
+            });
+            workspace.add_panel(agent.clone(), window, cx);
+            workspace.add_panel(bottom.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            (agent, bottom)
+        });
+        let item = add_an_item_to_active_pane(cx, &workspace, 1);
+        cx.run_until_parked();
+        let (item_pane, empty_pane) = workspace.update_in(cx, |workspace, window, cx| {
+            let item_pane = workspace.active_pane.clone();
+            let empty_pane =
+                workspace.split_pane(item_pane.clone(), SplitDirection::Right, window, cx);
+            (item_pane, empty_pane)
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |_, window, cx| {
+            empty_pane.focus_handle(cx).focus(window, cx);
+            assert!(empty_pane.focus_handle(cx).contains_focused(window, cx));
+        });
+        item_pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(item.entity_id(), false, false, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.expanded_agent_position(cx),
+                Some(DockPosition::Right)
+            );
+            assert!(
+                agent.focus_handle(cx).contains_focused(window, cx),
+                "the expanded agent should receive focus when an empty split becomes hidden"
+            );
+        });
+
+        let item = add_an_item_to_active_pane(cx, &workspace, 2);
+        cx.run_until_parked();
+        let item_pane = workspace.update_in(cx, |workspace, window, cx| {
+            let item_pane = workspace.active_pane.clone();
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+            assert!(bottom.focus_handle(cx).contains_focused(window, cx));
+            item_pane
+        });
+        item_pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(item.entity_id(), false, false, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.expanded_agent_position(cx),
+                Some(DockPosition::Right)
+            );
+            assert!(
+                bottom.focus_handle(cx).contains_focused(window, cx),
+                "expanding the agent must not steal focus from another panel"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_background_split_removal_preserves_panel_focus(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let bottom = workspace.update_in(cx, |workspace, window, cx| {
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.agent = true;
+                panel
+            });
+            let bottom = cx.new(|cx| SecondTestPanel {
+                focus_handle: cx.focus_handle(),
+                zoomed: false,
+            });
+            workspace.add_panel(agent, window, cx);
+            workspace.add_panel(bottom.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            bottom
+        });
+        let item = add_an_item_to_active_pane(cx, &workspace, 1);
+        cx.run_until_parked();
+        let item_pane = workspace.update_in(cx, |workspace, window, cx| {
+            let item_pane = workspace.active_pane.clone();
+            workspace.split_pane(item_pane.clone(), SplitDirection::Right, window, cx);
+            workspace.toggle_dock(DockPosition::Bottom, window, cx);
+            item_pane
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |_, window, cx| {
+            assert!(bottom.focus_handle(cx).contains_focused(window, cx))
+        });
+        item_pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(item.entity_id(), false, true, window, cx)
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.expanded_agent_position(cx),
+                Some(DockPosition::Right)
+            );
+            assert!(
+                bottom.focus_handle(cx).contains_focused(window, cx),
+                "removing a background pane must not steal focus from another panel"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_reopening_agent_from_empty_center(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let agent = workspace.update_in(cx, |workspace, window, cx| {
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.agent = true;
+                panel
+            });
+            workspace.add_panel(agent.clone(), window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            workspace.active_pane.focus_handle(cx).focus(window, cx);
+            agent
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(workspace.center_contains_focused(window, cx));
+            workspace.open_panel::<TestPanel>(window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.expanded_agent_position(cx),
+                Some(DockPosition::Right)
+            );
+            assert!(agent.focus_handle(cx).contains_focused(window, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_modal_restores_visible_focus(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (multi_workspace, cx) =
+            cx.add_window_view(|window, cx| MultiWorkspace::test_new(project, window, cx));
+        let workspace =
+            multi_workspace.read_with(cx, |multi_workspace, _| multi_workspace.workspace().clone());
+        let agent = workspace.update_in(cx, |workspace, window, cx| {
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.agent = true;
+                panel
+            });
+            workspace.add_panel(agent.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.active_pane.focus_handle(cx).focus(window, cx);
+            workspace.toggle_modal(window, cx, TestModal::new);
+            agent
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let modal = workspace.active_modal::<TestModal>(cx).expect("modal");
+            modal.focus_handle(cx).focus(window, cx);
+            assert!(modal.focus_handle(cx).contains_focused(window, cx));
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            assert!(modal.focus_handle(cx).contains_focused(window, cx));
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace
+                .modal_layer
+                .update(cx, |modal, cx| modal.hide_modal(window, cx));
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.expanded_agent_position(cx),
+                Some(DockPosition::Right)
+            );
+            assert!(
+                agent.focus_handle(cx).contains_focused(window, cx),
+                "dismissing the modal should restore focus to the visible agent"
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_workspace_fallback_focus(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let agent = workspace.update_in(cx, |workspace, window, cx| {
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.agent = true;
+                panel
+            });
+            workspace.add_panel(agent.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            agent
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            let fallback = workspace.fallback_focus_handle(window, cx);
+            assert_eq!(fallback, agent.focus_handle(cx));
+            assert_eq!(workspace.focus_handle(cx), agent.focus_handle(cx));
+            assert!(
+                workspace
+                    .focusable_parts(cx)
+                    .iter()
+                    .all(|part| part.container != workspace.region_focus_handles.editor)
+            );
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            assert!(
+                workspace
+                    .focusable_parts(cx)
+                    .iter()
+                    .any(|part| part.container == workspace.region_focus_handles.editor)
+            );
+            assert_eq!(
+                workspace.fallback_focus_handle(window, cx),
+                workspace.active_pane.focus_handle(cx)
+            );
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_editor_zoom_on_empty_center(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let agent = workspace.update_in(cx, |workspace, window, cx| {
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.agent = true;
+                panel
+            });
+            workspace.add_panel(agent.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            agent
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(agent.focus_handle(cx).contains_focused(window, cx));
+            workspace.toggle_editor_zoom(&ToggleEditorZoom, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.expanded_agent_position(cx),
+                Some(DockPosition::Right)
+            );
+            assert!(agent.focus_handle(cx).contains_focused(window, cx));
+        });
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_after_empty_zoomed_pane_unzooms(cx: &mut TestAppContext) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let agent = workspace.update_in(cx, |workspace, window, cx| {
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 100, cx);
+                panel.agent = true;
+                panel
+            });
+            workspace.add_panel(agent.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Right, window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            agent
+        });
+        let item = add_an_item_to_active_pane(cx, &workspace, 1);
+        cx.run_until_parked();
+        let pane = workspace.read_with(cx, |workspace, _| workspace.active_pane.clone());
+        pane.update_in(cx, |_, window, cx| {
+            cx.focus_self(window);
+            cx.emit(pane::Event::ZoomIn);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, _| assert!(workspace.zoomed.is_some()));
+        pane.update_in(cx, |pane, window, cx| {
+            pane.remove_item(item.entity_id(), false, false, window, cx);
+        });
+        cx.run_until_parked();
+        workspace.read_with(cx, |workspace, cx| {
+            assert_eq!(workspace.expanded_agent_position(cx), None)
+        });
+        pane.update(cx, |_, cx| cx.emit(pane::Event::ZoomOut));
+        cx.run_until_parked();
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.expanded_agent_position(cx),
+                Some(DockPosition::Right)
+            );
+            assert!(agent.focus_handle(cx).contains_focused(window, cx));
+        });
     }
 
     #[gpui::test]

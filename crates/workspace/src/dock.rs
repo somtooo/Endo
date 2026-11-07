@@ -663,6 +663,7 @@ impl Dock {
                 move |this, window, cx| {
                     let new_position = panel.read(cx).position(window, cx);
                     if new_position == this.position {
+                        this.visible_panels_moving.remove(&panel.entity_id());
                         return;
                     }
 
@@ -711,7 +712,7 @@ impl Dock {
                         let index = new_dock.insert_panel(
                             panel.clone(),
                             workspace.clone(),
-                            false,
+                            !focus_mode,
                             window,
                             cx,
                         );
@@ -940,6 +941,7 @@ impl Dock {
             .iter()
             .position(|entry| entry.panel.panel_id() == Entity::entity_id(panel))
         {
+            self.visible_panels_moving.remove(&panel.entity_id());
             if let Some(active_panel_index) = self.active_panel_index.as_mut() {
                 match panel_ix.cmp(active_panel_index) {
                     std::cmp::Ordering::Less => {
@@ -947,7 +949,9 @@ impl Dock {
                     }
                     std::cmp::Ordering::Equal => {
                         self.active_panel_index = None;
-                        self.restoration.discard_pending();
+                        if self.is_open {
+                            self.restoration.discard_pending();
+                        }
                         self.set_open_internal(false, window, cx);
                     }
                     std::cmp::Ordering::Greater => {}
@@ -1495,6 +1499,11 @@ impl Render for PanelButtons {
                             ];
 
                             let panel_hide = panel.hide_button_setting(cx);
+                            let can_change_width = workspace_for_menu
+                                .read_with(cx, |workspace, cx| {
+                                    workspace.expanded_agent_position(cx) != Some(dock_position)
+                                })
+                                .unwrap_or(false);
                             ContextMenu::build(window, cx, |mut menu, _, cx| {
                                 let mut has_position_entries = false;
                                 for position in POSITIONS {
@@ -1515,7 +1524,7 @@ impl Render for PanelButtons {
                                         has_position_entries = true;
                                     }
                                 }
-                                if supports_flexible {
+                                if supports_flexible && can_change_width {
                                     if has_position_entries {
                                         menu = menu.separator();
                                     }
@@ -1664,6 +1673,7 @@ pub mod test {
         pub focus_handle: FocusHandle,
         pub activation_focus_handle: Option<FocusHandle>,
         pub default_size: Pixels,
+        pub minimum_size: Option<Pixels>,
         pub flexible: bool,
         pub agent: bool,
         pub follows_agent_layout: bool,
@@ -1685,6 +1695,7 @@ pub mod test {
                 focus_handle: cx.focus_handle(),
                 activation_focus_handle: None,
                 default_size: px(300.),
+                minimum_size: None,
                 flexible: false,
                 agent: false,
                 follows_agent_layout: false,
@@ -1781,6 +1792,10 @@ pub mod test {
 
         fn default_size(&self, _window: &Window, _: &App) -> Pixels {
             self.default_size
+        }
+
+        fn min_size(&self, _window: &Window, _: &App) -> Option<Pixels> {
+            self.minimum_size
         }
 
         fn initial_size_state(&self, _window: &Window, _: &App) -> PanelSizeState {
