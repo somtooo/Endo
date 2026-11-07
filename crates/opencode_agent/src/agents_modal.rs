@@ -11,6 +11,7 @@ use agent_ui::AgentPanel;
 use anyhow::{Result, anyhow};
 use editor::Editor;
 use fs::Fs;
+use futures::channel::oneshot;
 use gpui::{
     App, Context, DismissEvent, Div, Entity, EventEmitter, FocusHandle, Focusable, SharedString,
     Stateful, Task, WeakEntity, Window, actions, prelude::*,
@@ -116,7 +117,9 @@ pub struct AgentsModal {
     mode: Mode,
     focus_handle: FocusHandle,
     /// Writes run one after another, each on the file as the last left it.
-    last_write: Option<Task<()>>,
+    /// Resolves when the latest write reaches the file. Writes run detached,
+    /// so closing the modal doesn't cancel one.
+    last_write: Option<oneshot::Receiver<()>>,
     _load: Task<()>,
 }
 
@@ -373,9 +376,11 @@ impl AgentsModal {
         let fs = self.fs.clone();
         let source = self.source.clone();
         let agents_before = self.agents.clone();
-        self.last_write = Some(cx.spawn_in(window, async move |this, cx| {
+        let (written_tx, written_rx) = oneshot::channel();
+        self.last_write = Some(written_rx);
+        cx.spawn_in(window, async move |this, cx| {
             if let Some(previous) = previous {
-                previous.await;
+                previous.await.ok();
             }
             let written = async {
                 let text = read_config(fs.as_ref(), &path).await?;
@@ -389,6 +394,7 @@ impl AgentsModal {
                 anyhow::Ok(updated)
             }
             .await;
+            written_tx.send(()).ok();
             let text = match written {
                 Ok(text) => text,
                 Err(error) => {
@@ -401,12 +407,16 @@ impl AgentsModal {
                     return;
                 }
             };
-            this.update(cx, |this, cx| {
-                this.config_text = text;
-                this.error = None;
-                cx.notify();
-            })
-            .log_err();
+            let modal_open = this
+                .update(cx, |this, cx| {
+                    this.config_text = text;
+                    this.error = None;
+                    cx.notify();
+                })
+                .is_ok();
+            if !modal_open {
+                return;
+            }
             // The service reloads a moment after the file changes.
             let mut agents = None;
             for _ in 0..20 {
@@ -428,8 +438,9 @@ impl AgentsModal {
                 }
                 this.refresh_mode(window, cx);
             })
-            .log_err();
-        }));
+            .ok();
+        })
+        .detach();
     }
 
     fn set_permission(
