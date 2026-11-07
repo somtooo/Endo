@@ -9,8 +9,8 @@
 
 use crate::types::{
     AssistantContent, AssistantMessage, CompactionMessage, Event, IdleMessage, Message,
-    MessageBody, MessageTime, ModelRef, ReasoningTime, SessionRevert, TextMessage, TokenUsage,
-    ToolCall, ToolState, UserMessage,
+    MessageBody, MessageTime, ModelRef, ReasoningTime, SessionRevert, ShellMessage, TextMessage,
+    TokenUsage, ToolCall, ToolState, UserMessage,
 };
 use collections::{HashMap, HashSet};
 use serde::de::DeserializeOwned;
@@ -157,7 +157,10 @@ impl SessionTranscript {
         };
 
         let mut diff = SnapshotDiff::default();
-        for message in messages {
+        for mut message in messages {
+            if let Some(earlier) = previous.get(&message.id) {
+                keep_streamed_text(&mut message, earlier);
+            }
             if previous.get(&message.id) != Some(&message) {
                 diff.changed.push(message.id.clone());
             }
@@ -208,8 +211,17 @@ impl SessionTranscript {
             // Every reason ends the turn here, "shutdown" included: the
             // server also uses it for a dismissed question. A real shutdown
             // drops the event stream, and the resync on reconnect restores a
-            // turn the restarted server continues.
-            "session.execution.interrupted" => Ok(self.finish_execution(event, "interrupted")),
+            // turn the restarted server continues. Like the server, no idle
+            // message is stored for "shutdown".
+            "session.execution.interrupted" => {
+                if field::<String>(data, "reason").as_deref() == Some("shutdown") {
+                    let mut changes = self.clear_current_retry();
+                    changes.extend(self.set_activity(Activity::Idle));
+                    Ok(changes)
+                } else {
+                    Ok(self.finish_execution(event, "interrupted"))
+                }
+            }
             "session.inbox.enqueued" => {
                 if let (Some(inbox_id), Some(item)) =
                     (field::<String>(data, "inboxID"), data.get("item"))
@@ -243,6 +255,40 @@ impl SessionTranscript {
                 Some(model) => Ok(self.insert_derived(event, MessageBody::ModelSwitched { model })),
                 None => Ok(Vec::new()),
             },
+            "session.shell.started" => {
+                let shell = data.get("shell");
+                match (
+                    shell.and_then(|shell| field::<String>(shell, "id")),
+                    shell.and_then(|shell| field::<String>(shell, "command")),
+                ) {
+                    (Some(shell_id), Some(command)) => Ok(self.insert_derived(
+                        event,
+                        MessageBody::Shell(ShellMessage {
+                            shell_id,
+                            command,
+                            status: shell.and_then(|shell| field(shell, "status")),
+                            exit: None,
+                            output: None,
+                        }),
+                    )),
+                    _ => Ok(Vec::new()),
+                }
+            }
+            "session.shell.ended" => Ok(self.end_shell(data)),
+            // Not shown yet, but kept so the copy lists what the server
+            // stores, in the same order.
+            "session.skill.activated" => Ok(self.insert_derived(
+                event,
+                MessageBody::Other {
+                    kind: "skill".to_string(),
+                },
+            )),
+            "session.moved" => Ok(self.insert_derived(
+                event,
+                MessageBody::Other {
+                    kind: "location-switched".to_string(),
+                },
+            )),
             "session.renamed" => Ok(field::<String>(data, "title")
                 .map(Change::Title)
                 .into_iter()
@@ -411,6 +457,25 @@ impl SessionTranscript {
             _ => return None,
         };
         Some(result)
+    }
+
+    fn end_shell(&mut self, data: &Value) -> Vec<Change> {
+        let shell = data.get("shell");
+        let Some(shell_id) = shell.and_then(|shell| field::<String>(shell, "id")) else {
+            return Vec::new();
+        };
+        let Some(message) = self.messages.iter_mut().rev().find(|message| {
+            matches!(&message.body, MessageBody::Shell(started) if started.shell_id == shell_id)
+        }) else {
+            return Vec::new();
+        };
+        let MessageBody::Shell(started) = &mut message.body else {
+            return Vec::new();
+        };
+        started.status = shell.and_then(|shell| field(shell, "status"));
+        started.exit = shell.and_then(|shell| field(shell, "exit"));
+        started.output = data.get("output").cloned();
+        vec![Change::Message(message.id.clone())]
     }
 
     fn set_revert(&mut self, revert: Option<String>) -> Vec<Change> {
@@ -787,6 +852,38 @@ fn field<T: DeserializeOwned>(data: &Value, key: &str) -> Option<T> {
         .and_then(|value| T::deserialize(value).ok())
 }
 
+/// The server stores a block's text only when the block ends, so a snapshot
+/// taken mid-block has it empty. The text already streamed is kept.
+fn keep_streamed_text(message: &mut Message, earlier: &Message) {
+    let (Some(assistant), Some(earlier)) = (message.as_assistant_mut(), earlier.as_assistant())
+    else {
+        return;
+    };
+    if assistant.time.completed.is_some() {
+        return;
+    }
+    for kind in [BlockKind::Text, BlockKind::Reasoning] {
+        let streamed: Vec<&String> = earlier
+            .content
+            .iter()
+            .filter(|item| is_block(item, kind))
+            .filter_map(|item| match item {
+                AssistantContent::Text { text } | AssistantContent::Reasoning { text, .. } => {
+                    Some(text)
+                }
+                AssistantContent::Tool(_) => None,
+            })
+            .collect();
+        for (ordinal, text) in streamed.into_iter().enumerate() {
+            if let Some(stored) = block_mut(assistant, kind, ordinal)
+                && stored.is_empty()
+            {
+                stored.clone_from(text);
+            }
+        }
+    }
+}
+
 fn empty_block(kind: BlockKind, created: Option<i64>) -> AssistantContent {
     match kind {
         BlockKind::Text => AssistantContent::Text {
@@ -1110,6 +1207,84 @@ mod tests {
                 expected: 2,
                 received: 3
             })
+        );
+    }
+
+    fn assistant_text(transcript: &SessionTranscript) -> String {
+        transcript
+            .messages()
+            .iter()
+            .filter_map(Message::as_assistant)
+            .flat_map(|assistant| &assistant.content)
+            .filter_map(|item| match item {
+                AssistantContent::Text { text } => Some(text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_snapshot_mid_block_keeps_the_text_streamed_so_far() {
+        let events = turn();
+        // Up to the second text delta, before the block ends.
+        let streamed = &events[..14];
+        let mut transcript = SessionTranscript::new(SESSION);
+        apply_all(&mut transcript, streamed);
+        assert_eq!(assistant_text(&transcript), "Good day");
+
+        transcript.replace_snapshot(snapshot(server_snapshot(streamed), true));
+        assert_eq!(assistant_text(&transcript), "Good day");
+    }
+
+    #[test]
+    fn a_shutdown_interrupt_adds_no_idle_message() {
+        let mut log = EventLog::new();
+        log.durable("session.execution.started", json!({}));
+        log.durable(
+            "session.execution.interrupted",
+            json!({"reason": "shutdown"}),
+        );
+        log.durable("session.execution.started", json!({}));
+        log.durable("session.execution.interrupted", json!({"reason": "user"}));
+        let mut transcript = SessionTranscript::new(SESSION);
+        apply_all(&mut transcript, &log.events[..2]);
+        assert!(transcript.messages().is_empty());
+        assert_eq!(transcript.activity(), Activity::Idle);
+
+        apply_all(&mut transcript, &log.events[2..]);
+        assert_eq!(transcript.messages().len(), 1);
+    }
+
+    #[test]
+    fn shell_events_add_a_shell_message_and_finish_it() {
+        let mut log = EventLog::new();
+        log.durable(
+            "session.shell.started",
+            json!({"shell": {"id": "sh_1", "command": "ls", "status": "running"}}),
+        );
+        log.durable(
+            "session.shell.ended",
+            json!({
+                "shell": {"id": "sh_1", "command": "ls", "status": "exited"},
+                "output": {"output": "a.rs", "cursor": 4, "size": 4, "truncated": false},
+            }),
+        );
+        let mut transcript = SessionTranscript::new(SESSION);
+        apply_all(&mut transcript, &log.events[..1]);
+        let shell = |transcript: &SessionTranscript| match &transcript.messages()[0].body {
+            MessageBody::Shell(shell) => shell.clone(),
+            other => panic!("expected a shell message, got {other:?}"),
+        };
+        assert_eq!(shell(&transcript).status.as_deref(), Some("running"));
+
+        apply_all(&mut transcript, &log.events[1..]);
+        assert_eq!(transcript.messages().len(), 1);
+        assert_eq!(shell(&transcript).status.as_deref(), Some("exited"));
+        assert_eq!(
+            shell(&transcript).output,
+            Some(json!({
+                "output": "a.rs", "cursor": 4, "size": 4, "truncated": false,
+            }))
         );
     }
 

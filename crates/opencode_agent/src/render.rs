@@ -135,8 +135,6 @@ pub(crate) fn shell_notification(message: &Message) -> Option<(String, ShellOutc
     ))
 }
 
-/// The background shell a shell tool call started, if it's still marked
-/// as running on the call itself.
 /// The shell a shell tool call runs, and whether it's still running: a
 /// foreground call reports its shell while running, a background call in its
 /// result until the completion notice arrives.
@@ -268,23 +266,44 @@ pub(crate) fn render_message(message: &Message, context: &RenderContext) -> Resu
             vec![RenderOp::Compaction(update)]
         }
         MessageBody::Shell(shell) => {
-            let output = shell
-                .output
-                .as_ref()
-                .map(error_text)
-                .unwrap_or_default();
-            vec![RenderOp::Tool(
-                acp::ToolCallUpdate::new(message.id.as_str())
-                    .name("shell")
-                    .title(shell.command.clone())
-                    .kind(acp::ToolKind::Execute)
-                    .status(match shell.status.as_deref() {
-                        Some("running") => acp::ToolCallStatus::InProgress,
-                        Some("failed") => acp::ToolCallStatus::Failed,
-                        _ => acp::ToolCallStatus::Completed,
-                    })
-                    .content(vec![tool_text(&output)]),
-            )]
+            // Shown like the agent's shell calls: Zed's command card shows
+            // output only from a terminal.
+            let terminal_id = acp::TerminalId::new(format!("{}/terminal", message.id));
+            let mut patch = DisplayTerminalPatch::default();
+            patch.command = MaybeUndefined::Value(shell.command.clone());
+            // The stored output is a page of the command's output.
+            if let Some(output) = &shell.output {
+                let text = match output.get("output") {
+                    Some(Value::String(text)) => text.clone(),
+                    _ => error_text(output),
+                };
+                patch.output = MaybeUndefined::Value(DisplayTerminalOutput {
+                    data: terminal_bytes(&text),
+                    meta: None,
+                });
+                patch.exit_status =
+                    MaybeUndefined::Value(acp::TerminalExitStatus::new().exit_code(shell.exit));
+            }
+            vec![
+                RenderOp::Terminal(terminal_id.clone(), patch),
+                RenderOp::Tool(
+                    acp::ToolCallUpdate::new(message.id.as_str())
+                        .name("shell")
+                        .title(shell.command.clone())
+                        .kind(acp::ToolKind::Execute)
+                        .status(match shell.status.as_deref() {
+                            Some("running") => acp::ToolCallStatus::InProgress,
+                            Some("exited") if shell.exit.is_none_or(|exit| exit == 0) => {
+                                acp::ToolCallStatus::Completed
+                            }
+                            // A non-zero exit, a timeout, or a killed command.
+                            _ => acp::ToolCallStatus::Failed,
+                        })
+                        .content(vec![acp::ToolCallContent::Terminal(acp::Terminal::new(
+                            terminal_id.0.to_string(),
+                        ))]),
+                ),
+            ]
         }
         MessageBody::Idle(_)
         | MessageBody::System(_)

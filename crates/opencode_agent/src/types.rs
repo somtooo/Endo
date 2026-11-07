@@ -7,8 +7,9 @@ use std::path::PathBuf;
 
 /// A new message ID in OpenCode's ascending format (`schema/src/identifier.ts`):
 /// `msg_`, 12 hex characters of `timestamp * 0x1000 + counter`, then 14 random
-/// base62 characters. The server orders messages by ID, so a client-chosen ID
-/// must sort the same way the server's own IDs do.
+/// base62 characters. The server orders messages by when it stored them, not
+/// by ID, but other clients may sort by ID, so a client-chosen ID should sort
+/// the same way the server's own IDs do.
 pub fn new_message_id() -> String {
     static LAST: std::sync::Mutex<(u64, u64)> = std::sync::Mutex::new((0, 0));
     let timestamp = std::time::SystemTime::now()
@@ -435,6 +436,7 @@ pub struct ShellMessage {
     pub shell_id: String,
     pub command: String,
     pub status: Option<String>,
+    pub exit: Option<i64>,
     pub output: Option<Value>,
 }
 
