@@ -530,11 +530,16 @@ fn main() {
             std::env::consts::ARCH
         );
         let proxy_url = ProxySettings::get_global(cx).proxy_url();
-        let http = {
+        let (http, opencode_http) = {
             let _guard = Tokio::handle(cx).enter();
 
-            ReqwestClient::proxy_and_user_agent(proxy_url, &user_agent)
-                .expect("could not start HTTP client")
+            (
+                ReqwestClient::proxy_and_user_agent(proxy_url, &user_agent)
+                    .expect("could not start HTTP client"),
+                // The OpenCode service runs on this machine, and its requests
+                // carry the service's password.
+                ReqwestClient::local_only(&user_agent).expect("could not start HTTP client"),
+            )
         };
         cx.set_http_client(Arc::new(http));
 
@@ -742,7 +747,7 @@ fn main() {
             false,
             cx,
         );
-        opencode_agent::init(cx.http_client(), cx);
+        opencode_agent::init(cx.http_client(), Arc::new(opencode_http), cx);
         zed::watch_user_agents_md(app_state.fs.clone(), cx);
 
         repl::init(app_state.fs.clone(), cx);

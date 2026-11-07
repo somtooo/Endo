@@ -75,7 +75,13 @@ pub fn service_client(cx: &mut App) -> Task<anyhow::Result<OpenCodeClient>> {
 
 /// Registers OpenCode D: always offered in the agent picker for local
 /// projects, backed by the shared OpenCode service instead of ACP.
-pub fn init(http: Arc<dyn http_client::HttpClient>, cx: &mut App) {
+/// `download_http` downloads OpenCode when it isn't installed. `http` talks
+/// to the OpenCode service on this machine, so it must not use a proxy.
+pub fn init(
+    download_http: Arc<dyn http_client::HttpClient>,
+    http: Arc<dyn http_client::HttpClient>,
+    cx: &mut App,
+) {
     cx.set_global(ServiceHttpClient(http.clone()));
     // Thread history syncs whenever OpenCode is installed, even if OpenCode D
     // is never opened.
@@ -172,18 +178,20 @@ pub fn init(http: Arc<dyn http_client::HttpClient>, cx: &mut App) {
             if find_system_binary().is_none()
                 && read_registration(&registration_path()).ok().flatten().is_none()
             {
-                return gpui::Task::ready(Ok(Rc::new(install::InstallConnection::new(http.clone()))
+                return gpui::Task::ready(Ok(Rc::new(install::InstallConnection::new(
+                    download_http.clone(),
+                ))
                     as Rc<dyn acp_thread::AgentConnection>));
             }
             let hub = Hub::get(http.clone(), cx);
-            let http = http.clone();
+            let download_http = download_http.clone();
             cx.spawn(async move |_| match hub.await {
                 Ok(hub) => {
                     Ok(Rc::new(OpenCodeConnection::new(hub)) as Rc<dyn acp_thread::AgentConnection>)
                 }
                 // A stale registration with no binary to restart the service.
                 Err(error) if error.downcast_ref::<NotInstalled>().is_some() => {
-                    Ok(Rc::new(install::InstallConnection::new(http))
+                    Ok(Rc::new(install::InstallConnection::new(download_http))
                         as Rc<dyn acp_thread::AgentConnection>)
                 }
                 Err(error) => Err(error),

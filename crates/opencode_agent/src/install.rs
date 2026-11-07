@@ -6,7 +6,7 @@
 //! Unlike the script, this never edits shell profiles: Zed finds the binary
 //! in `~/.opencode/bin` itself.
 
-use crate::connection::{AGENT_ID, Hub};
+use crate::connection::AGENT_ID;
 use acp_thread::{AcpThread, AgentConnection, AuthRequired};
 use agent_client_protocol::v2::schema as acp;
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -273,7 +273,7 @@ impl AgentConnection for InstallConnection {
             let binary = cx.background_spawn(install(http.clone())).await?;
             log::info!("installed OpenCode at {}", binary.display());
             cx.update(|cx| cx.set_global(crate::Installed(true)));
-            cx.update(|cx| Hub::get(http, cx)).await?;
+            cx.update(crate::service_client).await?;
             Ok(())
         })
     }

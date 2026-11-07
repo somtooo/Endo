@@ -63,6 +63,19 @@ impl ReqwestClient {
         Ok(client.into())
     }
 
+    /// A client that ignores proxy settings and proxy environment variables,
+    /// for services on this machine that a proxy can't reach.
+    pub fn local_only(user_agent: &str) -> anyhow::Result<Self> {
+        let mut map = HeaderMap::new();
+        map.insert(http::header::USER_AGENT, HeaderValue::from_str(user_agent)?);
+        let client = Self::builder(None)
+            .no_proxy()
+            .default_headers(map)
+            .use_preconfigured_tls(http_client_tls::tls_config())
+            .build()?;
+        Ok(client.into())
+    }
+
     pub fn proxy_and_user_agent(proxy: Option<Url>, user_agent: &str) -> anyhow::Result<Self> {
         Self::proxy_user_agent_and_read_timeout(proxy, user_agent, None)
     }
