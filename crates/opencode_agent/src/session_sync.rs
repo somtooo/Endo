@@ -107,13 +107,22 @@ impl SessionTranscript {
 
     /// The messages a client shows: everything before the revert point.
     pub fn visible_messages(&self) -> &[Message] {
+        // Messages are in the server's order, which IDs only usually follow,
+        // since a client picks the IDs of the prompts it sends.
         let end = match &self.revert {
-            Some(message_id) => self
-                .messages
-                .partition_point(|message| message.id < *message_id),
+            Some(message_id) => match self.index.get(message_id) {
+                Some(position) => *position,
+                None => self
+                    .messages
+                    .partition_point(|message| message.id < *message_id),
+            },
             None => self.messages.len(),
         };
         &self.messages[..end]
+    }
+
+    pub fn contains(&self, message_id: &str) -> bool {
+        self.index.contains_key(message_id)
     }
 
     pub fn revert(&self) -> Option<&str> {
@@ -1102,6 +1111,25 @@ mod tests {
                 received: 3
             })
         );
+    }
+
+    #[test]
+    fn revert_point_follows_server_order_not_id_order() {
+        let mut transcript = SessionTranscript::new(SESSION);
+        apply_all(&mut transcript, &turn());
+        let mut messages = transcript.messages().to_vec();
+        // A prompt whose client-picked ID sorts before the one ahead of it.
+        let early_id = "msg_000000000aaa000000000001".to_string();
+        messages[1].id = early_id.clone();
+        let mut reverted = SessionTranscript::new(SESSION);
+        reverted.replace_snapshot(Snapshot {
+            messages,
+            running: false,
+            revert: Some(SessionRevert {
+                message_id: early_id,
+            }),
+        });
+        assert_eq!(reverted.visible_messages().len(), 1);
     }
 
     #[test]

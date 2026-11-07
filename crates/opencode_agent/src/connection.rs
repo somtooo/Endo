@@ -105,8 +105,18 @@ struct SessionEntry {
     /// Set while the hub itself rewinds the thread, so the truncate hook
     /// doesn't ask the server to revert again.
     server_rewind: Rc<Cell<bool>>,
-    /// Pending permission request ID to the tool call it was attached to.
-    permissions: HashMap<String, String>,
+    /// Pending permission request ID to the tool call it was attached to,
+    /// and the prompt showing it.
+    permissions: HashMap<String, (String, u64)>,
+    /// Numbers each permission prompt, so a prompt withdrawn by a rebuild
+    /// can't answer for the one that replaces it.
+    next_permission_prompt: u64,
+    /// Messages Zed sent that the server hasn't delivered yet. The server
+    /// starts the turn before it delivers the prompt, so until then the
+    /// thread shows a message the transcript doesn't have.
+    awaiting_delivery: HashSet<String>,
+    /// Counts resyncs, so only the latest one's snapshot is applied.
+    resync_generation: u64,
     options: Rc<SessionOptions>,
     /// The folder the session works in now. It starts as the one it was
     /// opened in and follows the session when it moves.
@@ -260,6 +270,52 @@ impl Hub {
         self.activity.borrow().get(session_id).copied()
     }
 
+    /// Records activity learned other than from an event, telling listeners
+    /// if it changed.
+    fn set_activity(&self, session_id: &str, activity: Activity, cx: &mut App) {
+        let previous = self
+            .activity
+            .borrow_mut()
+            .insert(session_id.to_string(), activity);
+        if previous != Some(activity) {
+            for listener in self.activity_listeners.borrow().iter() {
+                listener(session_id, activity, cx);
+            }
+        }
+    }
+
+    /// Missed events aren't replayed, so after a reconnect sessions that
+    /// started or finished meanwhile are found by asking which ones run.
+    fn recheck_activity(self: &Rc<Self>, cx: &mut App) {
+        let hub = Rc::downgrade(self);
+        let client = self.client.clone();
+        cx.spawn(async move |cx| {
+            let running = client.active_sessions().await?;
+            cx.update(|cx| {
+                let Some(hub) = hub.upgrade() else {
+                    return;
+                };
+                let finished: Vec<String> = hub
+                    .activity
+                    .borrow()
+                    .iter()
+                    .filter(|(session_id, activity)| {
+                        **activity == Activity::Running && !running.contains_key(*session_id)
+                    })
+                    .map(|(session_id, _)| session_id.clone())
+                    .collect();
+                for session_id in finished {
+                    hub.set_activity(&session_id, Activity::Idle, cx);
+                }
+                for session_id in running.keys() {
+                    hub.set_activity(session_id, Activity::Running, cx);
+                }
+            });
+            anyhow::Ok(())
+        })
+        .detach_and_log_err(cx);
+    }
+
     /// Calls `listener` whenever the server reports a session starting or
     /// finishing work, for every session on the server.
     pub fn observe_activity(&self, listener: impl Fn(&str, Activity, &mut App) + 'static) {
@@ -330,6 +386,7 @@ impl Hub {
                     PumpMessage::Connected => {
                         hub.mcp.reconnected(cx);
                         Hub::recheck_steers(&hub, cx);
+                        hub.recheck_activity(cx);
                         let session_ids: Vec<String> =
                             hub.sessions.borrow().keys().cloned().collect();
                         for session_id in session_ids {
@@ -656,46 +713,37 @@ impl Hub {
     /// that are already shown are re-rendered in place; visible messages not
     /// shown yet are appended. If the thread shows a message the server no
     /// longer has (or in another order), the thread is rewound to the last
-    /// user message before it and rebuilt from there.
-    fn sync_thread(self: &Rc<Self>, session_id: &str, changed: Vec<String>, cx: &mut App) {
+    /// user message before it and rebuilt from there. Returns whether a
+    /// rewind started, which replays the buffered events when it's done.
+    fn sync_thread(self: &Rc<Self>, session_id: &str, changed: Vec<String>, cx: &mut App) -> bool {
         let plan = {
             let sessions = self.sessions.borrow();
             let Some(entry) = sessions.get(session_id) else {
-                return;
+                return false;
             };
-            let visible: Vec<&str> = entry
-                .transcript
-                .visible_messages()
-                .iter()
-                .map(|message| message.id.as_str())
-                .collect();
-            let mismatch = entry
-                .rendered
-                .iter()
-                .enumerate()
-                .position(|(ix, id)| visible.get(ix) != Some(&id.as_str()));
-            match mismatch {
-                None => SyncPlan::Append,
-                Some(ix) => {
-                    let rewind_to = entry.rendered[..=ix]
-                        .iter()
-                        .rposition(|id| entry.user_messages.contains(id));
-                    match rewind_to {
-                        Some(rewind_to) => SyncPlan::Rewind(rewind_to),
-                        None => {
-                            log::warn!(
-                                "OpenCode session {session_id} changed before its first prompt; \
-                                 the thread may show stale entries"
-                            );
-                            SyncPlan::Append
-                        }
-                    }
-                }
+            let plan = sync_plan(
+                &entry.rendered,
+                &entry.user_messages,
+                &entry.awaiting_delivery,
+                &entry.transcript,
+            );
+            if plan == SyncPlan::Stale {
+                log::warn!(
+                    "OpenCode session {session_id} changed before its first prompt; \
+                     the thread may show stale entries"
+                );
             }
+            plan
         };
         match plan {
-            SyncPlan::Append => self.render_pending(session_id, &changed, cx),
-            SyncPlan::Rewind(index) => Hub::rewind_and_rebuild(self, session_id.to_string(), index, cx),
+            SyncPlan::Append | SyncPlan::Stale => {
+                self.render_pending(session_id, &changed, cx);
+                false
+            }
+            SyncPlan::Rewind(index) => {
+                Hub::rewind_and_rebuild(self, session_id.to_string(), index, cx);
+                true
+            }
         }
     }
 
@@ -707,6 +755,10 @@ impl Hub {
             let Some(entry) = sessions.get_mut(session_id) else {
                 return;
             };
+            let transcript = &entry.transcript;
+            entry
+                .awaiting_delivery
+                .retain(|id| !transcript.contains(id));
             let visible = entry.transcript.visible_messages();
             let finished_shells: HashMap<String, render::ShellOutcome> = visible
                 .iter()
@@ -752,8 +804,11 @@ impl Hub {
                 }
             }
             to_render.extend(new_messages);
-            let pending_permissions: HashSet<String> =
-                entry.permissions.values().cloned().collect();
+            let pending_permissions: HashSet<String> = entry
+                .permissions
+                .values()
+                .map(|(tool_id, _)| tool_id.clone())
+                .collect();
             let running_sessions: HashSet<String> = self
                 .activity
                 .borrow()
@@ -1238,7 +1293,7 @@ impl Hub {
     }
 
     fn rewind_and_rebuild(hub: &Rc<Hub>, session_id: String, index: usize, cx: &mut App) {
-        let (thread, target, flag) = {
+        let (thread, target, flag, withdrew_permissions) = {
             let mut sessions = hub.sessions.borrow_mut();
             let Some(entry) = sessions.get_mut(&session_id) else {
                 return;
@@ -1250,7 +1305,17 @@ impl Hub {
             entry.forget_rendered_from(index);
             entry.rewinding = true;
             entry.buffered.get_or_insert_with(Vec::new);
-            (thread, target, entry.server_rewind.clone())
+            // Rewinding cancels the prompts it removes. Forgetting them first
+            // keeps that from rejecting them on the server; they're asked
+            // again below.
+            let withdrew_permissions = !entry.permissions.is_empty();
+            entry.permissions.clear();
+            (
+                thread,
+                target,
+                entry.server_rewind.clone(),
+                withdrew_permissions,
+            )
         };
         let hub = hub.clone();
         cx.spawn(async move |cx| {
@@ -1267,6 +1332,17 @@ impl Hub {
                 hub.render_pending(&session_id, &[], cx);
                 hub.replay_buffered(&session_id, cx);
             });
+            if withdrew_permissions {
+                let permissions = hub.client.pending_permissions(&session_id).await;
+                match permissions {
+                    Ok(permissions) => cx.update(|cx| {
+                        for permission in permissions {
+                            hub.permission_asked(&session_id, &permission, cx);
+                        }
+                    }),
+                    Err(error) => log::warn!("Can't list OpenCode permissions: {error:#}"),
+                }
+            }
         })
         .detach();
     }
@@ -1286,13 +1362,15 @@ impl Hub {
     /// Replaces the session's copy with a fresh snapshot from the server.
     /// Events that arrive meanwhile are buffered and replayed on top.
     fn resync(hub: &Rc<Hub>, session_id: String, cx: &mut App) -> Task<Result<()>> {
-        {
+        let generation = {
             let mut sessions = hub.sessions.borrow_mut();
             let Some(entry) = sessions.get_mut(&session_id) else {
                 return Task::ready(Ok(()));
             };
             entry.buffered.get_or_insert_with(Vec::new);
-        }
+            entry.resync_generation += 1;
+            entry.resync_generation
+        };
         let hub = hub.clone();
         let client = hub.client.clone();
         cx.spawn(async move |cx| {
@@ -1309,12 +1387,21 @@ impl Hub {
             }
             .await;
             let prompts = cx.update(|cx| {
+                // A later resync started meanwhile, and its snapshot is newer.
+                let is_latest = hub
+                    .sessions
+                    .borrow()
+                    .get(&session_id)
+                    .is_some_and(|entry| entry.resync_generation == generation);
+                if !is_latest {
+                    return Ok((Vec::new(), Vec::new()));
+                }
                 let (running, info, messages, permissions, forms) = match result {
                     Ok(result) => result,
                     Err(error) => {
-                        if let Some(entry) = hub.sessions.borrow_mut().get_mut(&session_id) {
-                            entry.buffered = None;
-                        }
+                        // The copy is as it was, so the events still apply.
+                        // A gap in them starts another resync.
+                        hub.replay_buffered(&session_id, cx);
                         return Err(error);
                     }
                 };
@@ -1330,9 +1417,10 @@ impl Hub {
                     });
                     diff.changed
                 };
-                hub.activity.borrow_mut().insert(
-                    session_id.clone(),
+                hub.set_activity(
+                    &session_id,
                     if running { Activity::Running } else { Activity::Idle },
+                    cx,
                 );
                 hub.refresh_subagent_cards(&session_id, cx);
                 hub.with_thread(&session_id, cx, |thread, cx| {
@@ -1351,21 +1439,8 @@ impl Hub {
                         thread.update_session_info(acp::SessionInfoUpdate::new().title(title), cx);
                     }
                 });
-                // Rendering may rewind asynchronously; keep buffering until
-                // it finishes, then replay.
-                let needs_rewind = {
-                    let sessions = hub.sessions.borrow();
-                    sessions.get(&session_id).is_some_and(|entry| {
-                        let visible = entry.transcript.visible_messages();
-                        entry
-                            .rendered
-                            .iter()
-                            .enumerate()
-                            .any(|(ix, id)| visible.get(ix).map(|m| &m.id) != Some(id))
-                    })
-                };
-                hub.sync_thread(&session_id, changed, cx);
-                if !needs_rewind {
+                // A rewind replays the buffered events once it finishes.
+                if !hub.sync_thread(&session_id, changed, cx) {
                     hub.replay_buffered(&session_id, cx);
                 }
                 anyhow::Ok((permissions, forms))
@@ -1508,7 +1583,7 @@ impl Hub {
         let Some(request_id) = data.get("id").and_then(Value::as_str).map(str::to_string) else {
             return;
         };
-        let (thread, tool_id) = {
+        let (thread, tool_id, prompt) = {
             let mut sessions = self.sessions.borrow_mut();
             let Some(entry) = sessions.get_mut(session_id) else {
                 return;
@@ -1525,8 +1600,12 @@ impl Hub {
                 .and_then(Value::as_str)
                 .map(str::to_string)
                 .unwrap_or_else(|| request_id.clone());
-            entry.permissions.insert(request_id.clone(), tool_id.clone());
-            (thread, tool_id)
+            let prompt = entry.next_permission_prompt;
+            entry.next_permission_prompt += 1;
+            entry
+                .permissions
+                .insert(request_id.clone(), (tool_id.clone(), prompt));
+            (thread, tool_id, prompt)
         };
         let action = data.get("action").and_then(Value::as_str).unwrap_or("tool");
         let resources: Vec<&str> = data
@@ -1571,13 +1650,16 @@ impl Hub {
                 RequestPermissionOutcome::Cancelled
                 | RequestPermissionOutcome::InterruptedByFollowUp => "reject".to_string(),
             };
-            // Answered by another client already: the server settled it.
+            // Answered by another client already: the server settled it. Or
+            // withdrawn by a rebuild, which shows the request again.
             let still_pending = cx.update(|_| {
                 hub.sessions
                     .borrow_mut()
                     .get_mut(&session_id)
-                    .and_then(|entry| entry.permissions.remove(&request_id))
-                    .is_some()
+                    .is_some_and(|entry| {
+                        let current = entry.permissions.get(&request_id).map(|(_, shown)| *shown);
+                        current == Some(prompt) && entry.permissions.remove(&request_id).is_some()
+                    })
             });
             if still_pending {
                 hub.client
@@ -1599,7 +1681,7 @@ impl Hub {
             let Some(entry) = sessions.get_mut(session_id) else {
                 return;
             };
-            let Some(tool_id) = entry.permissions.remove(request_id) else {
+            let Some((tool_id, _)) = entry.permissions.remove(request_id) else {
                 return;
             };
             (entry.thread.upgrade(), tool_id)
@@ -1650,6 +1732,9 @@ impl Hub {
                 buffered: Some(Vec::new()),
                 server_rewind: Rc::default(),
                 permissions: HashMap::default(),
+                next_permission_prompt: 0,
+                awaiting_delivery: HashSet::default(),
+                resync_generation: 0,
                 folder: options.directory.clone(),
                 options,
                 queue: VecDeque::new(),
@@ -1748,13 +1833,52 @@ impl SessionEntry {
     fn forget_rendered_from(&mut self, index: usize) {
         let removed: HashSet<String> = self.rendered.drain(index..).collect();
         self.user_messages.retain(|id| !removed.contains(id));
+        self.awaiting_delivery.retain(|id| !removed.contains(id));
         self.queue.retain(|(id, _)| !removed.contains(id));
     }
 }
 
+#[derive(Debug, PartialEq)]
 enum SyncPlan {
     Append,
     Rewind(usize),
+    /// Shows a message the server no longer has, with no user message
+    /// before it to rewind to, so new messages are appended anyway.
+    Stale,
+}
+
+/// How to bring the rendered thread in line with the transcript. Messages
+/// at the end that Zed sent and the server hasn't delivered yet still match.
+fn sync_plan(
+    rendered: &[String],
+    user_messages: &HashSet<String>,
+    awaiting_delivery: &HashSet<String>,
+    transcript: &SessionTranscript,
+) -> SyncPlan {
+    let visible: Vec<&str> = transcript
+        .visible_messages()
+        .iter()
+        .map(|message| message.id.as_str())
+        .collect();
+    let awaiting = rendered
+        .iter()
+        .rev()
+        .take_while(|id| awaiting_delivery.contains(*id) && !transcript.contains(id))
+        .count();
+    let mismatch = rendered[..rendered.len() - awaiting]
+        .iter()
+        .enumerate()
+        .position(|(ix, id)| visible.get(ix) != Some(&id.as_str()));
+    let Some(ix) = mismatch else {
+        return SyncPlan::Append;
+    };
+    match rendered[..=ix]
+        .iter()
+        .rposition(|id| user_messages.contains(id))
+    {
+        Some(rewind_to) => SyncPlan::Rewind(rewind_to),
+        None => SyncPlan::Stale,
+    }
 }
 
 fn state_update(activity: Activity) -> acp::StateUpdate {
@@ -2862,6 +2986,7 @@ impl ReceiptSessionSubmissions for Submissions {
                     if let Some(entry) = self.hub.sessions.borrow_mut().get_mut(&session_id) {
                         entry.rendered.push(message_id.clone());
                         entry.user_messages.insert(message_id.clone());
+                        entry.awaiting_delivery.insert(message_id.clone());
                     }
                     Some((client_id, content))
                 }
@@ -3270,6 +3395,71 @@ mod tests {
             cursor,
             size: cursor,
         }
+    }
+
+    fn transcript_with(ids: &[&str]) -> SessionTranscript {
+        let messages: Vec<Message> = ids
+            .iter()
+            .map(|id| {
+                Message::from_value(serde_json::json!({
+                    "id": id,
+                    "type": "user",
+                    "text": "hello",
+                }))
+                .expect("message")
+            })
+            .collect();
+        let mut transcript = SessionTranscript::new("ses_test");
+        transcript.replace_snapshot(Snapshot {
+            messages,
+            running: false,
+            revert: None,
+        });
+        transcript
+    }
+
+    fn ids(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    fn set(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|id| id.to_string()).collect()
+    }
+
+    #[test]
+    fn a_sent_prompt_the_server_has_not_delivered_is_kept() {
+        let transcript = transcript_with(&["msg_a"]);
+        let plan = sync_plan(
+            &ids(&["msg_a", "msg_sent"]),
+            &set(&["msg_a", "msg_sent"]),
+            &set(&["msg_sent"]),
+            &transcript,
+        );
+        assert_eq!(plan, SyncPlan::Append);
+    }
+
+    #[test]
+    fn a_rendered_message_the_server_dropped_rewinds_to_its_prompt() {
+        let transcript = transcript_with(&["msg_a"]);
+        let plan = sync_plan(
+            &ids(&["msg_a", "msg_gone"]),
+            &set(&["msg_a", "msg_gone"]),
+            &HashSet::default(),
+            &transcript,
+        );
+        assert_eq!(plan, SyncPlan::Rewind(1));
+    }
+
+    #[test]
+    fn a_mismatch_with_no_prompt_before_it_is_stale() {
+        let transcript = transcript_with(&["msg_b"]);
+        let plan = sync_plan(
+            &ids(&["msg_a"]),
+            &HashSet::default(),
+            &HashSet::default(),
+            &transcript,
+        );
+        assert_eq!(plan, SyncPlan::Stale);
     }
 
     #[test]
