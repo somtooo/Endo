@@ -233,14 +233,17 @@ impl McpSync {
 
     async fn run(self: Rc<Self>, directory: String, cx: &mut AsyncApp) {
         loop {
-            let configured = self
-                .client
-                .configured_mcp_names(&directory)
-                .await
-                .unwrap_or_else(|error| {
+            // Without the config, every server would look unconfigured: the
+            // user's own would be overwritten. The next sync, such as the one
+            // after a reconnect, tries again.
+            let configured = match self.client.configured_mcp_names(&directory).await {
+                Ok(configured) => configured,
+                Err(error) => {
                     log::warn!("Can't read OpenCode's MCP config for {directory}: {error:#}");
-                    HashSet::default()
-                });
+                    self.finish_sync(&directory);
+                    return;
+                }
+            };
             let (adds, removes) = {
                 let mut directories = self.directories.borrow_mut();
                 let Some(entry) = directories.get_mut(&directory) else {
@@ -316,22 +319,31 @@ impl McpSync {
                 self.write_owned(&directory, cx).await;
             }
 
-            let waiters = {
-                let mut directories = self.directories.borrow_mut();
-                let Some(entry) = directories.get_mut(&directory) else {
-                    return;
-                };
-                if entry.dirty {
-                    entry.dirty = false;
-                    continue;
-                }
-                entry.syncing = false;
-                std::mem::take(&mut entry.waiters)
-            };
-            for waiter in waiters {
-                waiter.send(()).ok();
+            let dirty = self
+                .directories
+                .borrow_mut()
+                .get_mut(&directory)
+                .is_some_and(|entry| std::mem::take(&mut entry.dirty));
+            if dirty {
+                continue;
             }
+            self.finish_sync(&directory);
             return;
+        }
+    }
+
+    fn finish_sync(&self, directory: &str) {
+        let waiters = {
+            let mut directories = self.directories.borrow_mut();
+            let Some(entry) = directories.get_mut(directory) else {
+                return;
+            };
+            entry.syncing = false;
+            entry.dirty = false;
+            std::mem::take(&mut entry.waiters)
+        };
+        for waiter in waiters {
+            waiter.send(()).ok();
         }
     }
 
