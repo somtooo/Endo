@@ -77,6 +77,15 @@ fn matches_entry(plugin: &PluginInfo, target: &str) -> bool {
     }
 }
 
+/// The ID in a `-<id>` entry that turns off the plugin listed before it.
+/// Rules for groups or for built-in plugins stand on their own.
+fn paired_disable(entry: &Value) -> Option<&str> {
+    entry
+        .as_str()?
+        .strip_prefix('-')
+        .filter(|id| !id.ends_with(".*") && *id != "*" && !id.starts_with("opencode."))
+}
+
 fn is_rule(entry: &str) -> bool {
     entry == "*" || entry.ends_with(".*") || entry.starts_with('-')
 }
@@ -95,11 +104,7 @@ fn plugin_rows(config: &Value, plugins: &[PluginInfo]) -> Vec<PluginRow> {
         let Some(target) = entry_target(entry).filter(|target| !is_rule(target)) else {
             continue;
         };
-        let disabled_id = entries
-            .get(index + 1)
-            .and_then(Value::as_str)
-            .and_then(|next| next.strip_prefix('-'))
-            .filter(|next| !next.ends_with(".*") && !next.starts_with("opencode."));
+        let disabled_id = entries.get(index + 1).and_then(paired_disable);
         if disabled_id.is_some() {
             paired_disables[index + 1] = true;
         }
@@ -234,11 +239,7 @@ fn remove_plugin(text: &str, target: &str) -> Result<String> {
         .position(|entry| entry_target(entry) == Some(target))
     {
         entries.remove(position);
-        if entries
-            .get(position)
-            .and_then(Value::as_str)
-            .is_some_and(|next| next.starts_with('-') && !next.ends_with(".*"))
-        {
+        if entries.get(position).and_then(paired_disable).is_some() {
             entries.remove(position);
         }
     }
@@ -653,6 +654,16 @@ mod tests {
                 .unwrap()
                 .get("plugins")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn removing_a_plugin_keeps_a_built_in_rule_after_it() {
+        let text = r#"{"plugins": ["acme", "-opencode.provider.openai-context-caps"]}"#;
+        let updated = remove_plugin(text, "acme").unwrap();
+        assert_eq!(
+            opencode_config::parse(&updated).unwrap()["plugins"],
+            json!(["-opencode.provider.openai-context-caps"])
         );
     }
 
