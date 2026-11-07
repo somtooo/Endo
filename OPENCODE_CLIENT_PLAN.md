@@ -235,7 +235,7 @@ Decision: shared.
 
 **Starting it** when none is running: `opencode serve --service`. That is what the official clients do (`client/src/effect/service.ts:49-127`).
 
-**Version mismatch:** OpenCode's own client *replaces* a running service whose version differs (`client/src/effect/service.ts:45-47`, `service-probe.ts:22-24`). The CLI, by default, refuses instead (`cli/src/services/server-connection.ts:80-88`). **Zed must never replace a running service.** Two clients with different OpenCode versions would keep killing each other's server, and with it every running session. Zed reuses whatever is running if its API version is supported, and starts one only when none is running.
+**Version mismatch:** OpenCode's own client *replaces* a running service whose version differs (`client/src/effect/service.ts:45-47`, `service-probe.ts:22-24`). The CLI, by default, refuses instead (`cli/src/services/server-connection.ts:80-88`). **Zed must never replace a running service.** Two clients with different OpenCode versions would keep killing each other's server, and with it every running session. Zed reuses whatever is running and starts one only when none is running. It doesn't check the version yet: any service that answers `/api/info` is used.
 
 ### 5.2 Getting the binary (system OpenCode, not Zed's ACP download)
 
@@ -245,7 +245,7 @@ Order, when OpenCode D connects:
 
 1. **A service is already running** (found through `service.json`, healthy on `/api/info`): connect. No binary needed. This is the normal case. On this machine the service runs from `~/.opencode/bin/opencode`.
 2. **No service, system binary found:** run `opencode serve --service`, then connect. Zed looks for the binary:
-   - on `PATH`, using the project's shell environment, as Zed does for other tools
+   - on Zed's own `PATH` (not the project's shell environment)
    - then in `~/.opencode/bin/opencode`, where OpenCode's installer puts it (`install:69`, `INSTALL_DIR=$HOME/.opencode/bin`)
 3. **No system binary:** install OpenCode to `~/.opencode/bin`, the official location, so the TUI and Zed share it. Then go to step 2. How it installs, and whether it asks first, is decision 1 in section 14.
 
@@ -603,8 +603,8 @@ OpenCode makes all three more likely. It sends each reasoning part as its own me
 
 1. **Sync correctness (hardest).** Reconciling the message snapshot with live events, and rebuilding through `rewind`, is the riskiest code. The spike must prove it.
 2. **Rewinding before the first user message.** The workaround can't remove entries that come before the first user message. Rare. Fallback: the small `acp_thread` change in section 11.
-3. **Version mismatch with the running service.** OpenCode D uses the system binary, so normally Zed and the TUI share one version. If the running service's API is newer or older than our crate supports, Zed shows a clear error and never replaces the service (section 5.1).
-4. **API churn.** Experimental routes may change. Use few, ignore unknown events, check the server version, and test our types against `protocol/openapi.json`.
+3. **Version mismatch with the running service.** OpenCode D uses the system binary, so normally Zed and the TUI share one version. Zed never replaces the service (section 5.1). Not done yet: a version check that shows a clear error when the running service's API is newer or older than the crate supports.
+4. **API churn.** Experimental routes may change. Use few, ignore unknown events, and test our types against `protocol/openapi.json`.
 5. **Unsaved buffers.** OpenCode reads and writes the disk, so it can't see unsaved Zed edits. Same as ACP today.
 
 (Event volume is not a risk. The TUI and web app read the same unfiltered stream. It only means Zed must parse off the main thread, as section 10 says.)
@@ -713,7 +713,7 @@ cargo run -p opencode_agent --example follow_session -- --session <id> --seconds
 
 **What it contains**
 
-- `service.rs`: reads `service.json` (`$XDG_STATE_HOME` or `~/.local/state`, the same rule as OpenCode), finds the system `opencode` (`PATH`, then `~/.opencode/bin`). Starting the service isn't wired up yet.
+- `service.rs`: reads `service.json` (`$XDG_STATE_HOME` or `~/.local/state`, the same rule as OpenCode), finds the system `opencode` (`PATH`, then `~/.opencode/bin`), and starts the service with `opencode serve --service` when none is running.
 - `client.rs`: HTTP Basic auth; info, sessions, running sessions, messages with paging, create, prompt, interrupt; the event stream with a server-sent-events parser.
 - `types.rs`: the session, message and event types we use. Unknown message kinds and event types decode instead of failing. Message IDs are generated in OpenCode's format, checked against a real server ID.
 - `session_sync.rs`: `SessionTranscript`, a Rust copy of OpenCode's reducer (`core/src/session/message-updater.ts`) plus live deltas.
