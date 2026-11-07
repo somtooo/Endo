@@ -24,6 +24,7 @@
       "ctrl-alt-enter": ["picker::ConfirmInput", { "secondary": true }],
       "ctrl-shift-w": "workspace::CloseWindow",
       "shift-escape": "workspace::ToggleZoom",
+      "ctrl-alt-shift-m": "workspace::ToggleAgentFocusMode",
       "open": "workspace::Open",
       "ctrl-o": "workspace::OpenFiles",
       "ctrl-k ctrl-o": "workspace::Open",

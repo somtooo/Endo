@@ -5,6 +5,7 @@ use crate::{DraggedDock, Event, ModalLayer, Pane, WorkspaceSettings};
 use crate::{Workspace, status_bar::StatusItemView};
 use anyhow::Context as _;
 use client::proto;
+use collections::HashSet;
 use db::kvp::KeyValueStore;
 
 use gpui::{
@@ -286,6 +287,7 @@ pub struct Dock {
     workspace: WeakEntity<Workspace>,
     is_open: bool,
     active_panel_index: Option<usize>,
+    visible_panels_moving: HashSet<EntityId>,
     focus_handle: FocusHandle,
     restoration: DockRestoreState,
     zoom_layer_open: bool,
@@ -451,6 +453,7 @@ impl Dock {
                 workspace: workspace.downgrade(),
                 panel_entries: Default::default(),
                 active_panel_index: None,
+                visible_panels_moving: HashSet::default(),
                 is_open: false,
                 focus_handle: focus_handle.clone(),
                 _subscriptions: [focus_subscription, zoom_subscription],
@@ -513,7 +516,13 @@ impl Dock {
     }
 
     fn resizable(&self, cx: &App) -> bool {
-        !(self.zoom_layer_open || self.modal_layer.read(cx).has_active_modal())
+        let agent_expanded =
+            self.visible_panel()
+                .is_some_and(|panel| panel.is_agent_panel(cx))
+                && self.workspace.upgrade().is_some_and(|workspace| {
+                    workspace.read(cx).agent_focus_expands_empty_center(cx)
+                });
+        !(agent_expanded || self.zoom_layer_open || self.modal_layer.read(cx).has_active_modal())
     }
 
     pub fn panel<T: Panel>(&self) -> Option<Entity<T>> {
@@ -576,6 +585,9 @@ impl Dock {
     pub fn set_open(&mut self, open: bool, window: &mut Window, cx: &mut Context<Self>) {
         if open != self.is_open {
             self.restoration.discard_pending();
+            if !open {
+                self.visible_panels_moving.clear();
+            }
         }
         self.set_open_internal(open, window, cx);
     }
@@ -631,6 +643,17 @@ impl Dock {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
+        self.insert_panel(panel, workspace, true, window, cx)
+    }
+
+    fn insert_panel<T: Panel>(
+        &mut self,
+        panel: Entity<T>,
+        workspace: WeakEntity<Workspace>,
+        apply_startup_policy: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
         let subscriptions = [
             cx.observe(&panel, |_, _, cx| cx.notify()),
             cx.observe_global_in::<SettingsStore>(window, {
@@ -643,25 +666,27 @@ impl Dock {
                         return;
                     }
 
-                    let Ok(new_dock) = workspace.update(cx, |workspace, cx| {
+                    let Ok((new_dock, focus_mode)) = workspace.update(cx, |workspace, cx| {
                         if panel.is_zoomed(window, cx) {
                             workspace.zoomed_position = Some(new_position);
                         }
-                        match new_position {
+                        let dock = match new_position {
                             DockPosition::Left => &workspace.left_dock,
                             DockPosition::Bottom => &workspace.bottom_dock,
                             DockPosition::Right => &workspace.right_dock,
                         }
-                        .clone()
+                        .clone();
+                        (dock, workspace.agent_focus_mode())
                     }) else {
                         return;
                     };
 
                     let panel_id = Entity::entity_id(&panel);
-                    let was_visible = this.is_open()
-                        && this
-                            .visible_panel()
-                            .is_some_and(|active_panel| active_panel.panel_id() == panel_id);
+                    let was_visible = this.visible_panels_moving.remove(&panel_id)
+                        || (this.is_open()
+                            && this
+                                .visible_panel()
+                                .is_some_and(|active_panel| active_panel.panel_id() == panel_id));
                     let size_state = this
                         .panel_entries
                         .iter()
@@ -683,13 +708,27 @@ impl Dock {
                     }
 
                     new_dock.update(cx, |new_dock, cx| {
-                        let index =
-                            new_dock.add_panel(panel.clone(), workspace.clone(), window, cx);
+                        let index = new_dock.insert_panel(
+                            panel.clone(),
+                            workspace.clone(),
+                            false,
+                            window,
+                            cx,
+                        );
                         if let Some(added_panel) = new_dock.panel_for_id(panel_id).cloned() {
                             new_dock.set_panel_size_state(added_panel.as_ref(), size_state, cx);
                         }
                         if was_visible {
-                            new_dock.activate_panel(index, window, cx);
+                            if focus_mode
+                                && let Some(displaced) = new_dock.visible_panel()
+                                && displaced.position(window, cx) != new_position
+                            {
+                                new_dock.visible_panels_moving.insert(displaced.panel_id());
+                            }
+                            if Some(index) != new_dock.active_panel_index {
+                                new_dock.restoration.discard_pending();
+                            }
+                            new_dock.activate_panel_internal(index, window, cx);
                             new_dock.set_open(true, window, cx);
                         }
                     });
@@ -814,7 +853,7 @@ impl Dock {
 
         self.replay_pending_serialized_state(window, cx);
 
-        if panel.read(cx).starts_open(window, cx) {
+        if apply_startup_policy && panel.read(cx).starts_open(window, cx) {
             self.activate_panel_internal(index, window, cx);
             self.set_open_internal(true, window, cx);
         }
@@ -908,7 +947,8 @@ impl Dock {
                     }
                     std::cmp::Ordering::Equal => {
                         self.active_panel_index = None;
-                        self.set_open(false, window, cx);
+                        self.restoration.discard_pending();
+                        self.set_open_internal(false, window, cx);
                     }
                     std::cmp::Ordering::Greater => {}
                 }
@@ -934,6 +974,7 @@ impl Dock {
     }
 
     pub fn activate_panel(&mut self, panel_ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.visible_panels_moving.clear();
         if Some(panel_ix) != self.active_panel_index {
             self.restoration.discard_pending();
         }
@@ -1624,6 +1665,7 @@ pub mod test {
         pub activation_focus_handle: Option<FocusHandle>,
         pub default_size: Pixels,
         pub flexible: bool,
+        pub agent: bool,
         pub activation_priority: u32,
     }
     actions!(test_only, [ToggleTestPanel]);
@@ -1642,6 +1684,7 @@ pub mod test {
                 activation_focus_handle: None,
                 default_size: px(300.),
                 flexible: false,
+                agent: false,
                 activation_priority,
             }
         }
@@ -1681,6 +1724,10 @@ pub mod test {
     }
 
     impl Panel for TestPanel {
+        fn is_agent_panel(&self) -> bool {
+            self.agent
+        }
+
         fn activation_focus_handle(&self, cx: &App) -> FocusHandle {
             self.activation_focus_handle
                 .clone()

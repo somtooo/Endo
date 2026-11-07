@@ -29,6 +29,10 @@ The sections below cover what you can do from here.
 > Note that some Agent Panel features may not be available for every External Agent. Restoring threads from history, token usage display, and similar features depend on the agent integration.
 > Their availability varies depending on the agent.
 
+### Focus Mode {#focus-mode}
+
+Use the Focus Mode button in the Agent Panel or {#kb workspace::ToggleAgentFocusMode} to let the agent use the editor's space when the editor is empty. Opening an editor item makes room for it; closing the last item expands the visible agent again. Focus Mode remains enabled until you turn it off. Hiding the agent does not reopen it, and other panels remain available.
+
 ### Creating New Threads {#new-thread}
 
 By default, the Agent Panel uses Zed's first-party agent.

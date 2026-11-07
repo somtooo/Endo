@@ -6253,6 +6253,25 @@ impl AgentPanel {
             ToolbarMode::EmptyThread
         };
 
+        let focus_mode = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.agent_focus_mode())
+            .unwrap_or(false);
+        let focus_mode_label = if focus_mode {
+            "Disable Focus Mode"
+        } else {
+            "Enable Focus Mode"
+        };
+        let focus_mode_button = IconButton::new("toggle-focus-mode", IconName::MaximizeAlt)
+            .icon_size(IconSize::Small)
+            .toggle_state(focus_mode)
+            .tooltip(move |_, cx| {
+                Tooltip::for_action(focus_mode_label, &workspace::ToggleAgentFocusMode, cx)
+            })
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(workspace::ToggleAgentFocusMode), cx)
+            });
+
         let is_full_screen = self.is_zoomed(window, cx);
         let (icon_name, tooltip_text) = if is_full_screen {
             (IconName::Minimize, "Disable Full Screen")
@@ -6336,6 +6355,7 @@ impl AgentPanel {
                         .gap_1()
                         .children(sandbox_status)
                         .when(can_create_entries, |this| this.child(new_thread_menu))
+                        .child(focus_mode_button)
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )
