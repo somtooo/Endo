@@ -6264,6 +6264,7 @@ impl AgentPanel {
         };
         let focus_mode_button = IconButton::new("toggle-focus-mode", IconName::MaximizeAlt)
             .icon_size(IconSize::Small)
+            .aria_label(focus_mode_label)
             .toggle_state(focus_mode)
             .tooltip(move |_, cx| {
                 Tooltip::for_action(focus_mode_label, &workspace::ToggleAgentFocusMode, cx)

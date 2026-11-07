@@ -1666,6 +1666,8 @@ pub mod test {
         pub default_size: Pixels,
         pub flexible: bool,
         pub agent: bool,
+        pub follows_agent_layout: bool,
+        pub starts_open: bool,
         pub activation_priority: u32,
     }
     actions!(test_only, [ToggleTestPanel]);
@@ -1685,6 +1687,8 @@ pub mod test {
                 default_size: px(300.),
                 flexible: false,
                 agent: false,
+                follows_agent_layout: false,
+                starts_open: false,
                 activation_priority,
             }
         }
@@ -1742,8 +1746,28 @@ pub mod test {
             "TestPanel"
         }
 
-        fn position(&self, _window: &Window, _: &App) -> super::DockPosition {
-            self.position
+        fn position(&self, _window: &Window, cx: &App) -> super::DockPosition {
+            if !self.follows_agent_layout {
+                return self.position;
+            }
+            if self.agent {
+                agent_settings::AgentSettings::get_global(cx).dock.into()
+            } else {
+                match cx
+                    .global::<SettingsStore>()
+                    .merged_settings()
+                    .project_panel
+                    .as_ref()
+                    .and_then(|panel| panel.dock)
+                {
+                    Some(settings::DockSide::Left) => DockPosition::Left,
+                    _ => DockPosition::Right,
+                }
+            }
+        }
+
+        fn starts_open(&self, _: &Window, _: &App) -> bool {
+            self.starts_open
         }
 
         fn position_is_valid(&self, _: super::DockPosition) -> bool {

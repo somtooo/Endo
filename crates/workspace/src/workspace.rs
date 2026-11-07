@@ -17489,6 +17489,85 @@ mod tests {
     }
 
     #[gpui::test]
+    async fn test_agent_focus_mode_follows_layout_settings(cx: &mut TestAppContext) {
+        use agent_settings::WindowLayout;
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        cx.update(|_, cx| AgentSettings::set_layout(WindowLayout::agent(), fs.clone(), cx))
+            .await
+            .expect("layout update")
+            .expect("settings write");
+        cx.run_until_parked();
+        let (agent, project_panel) = workspace.update_in(cx, |workspace, window, cx| {
+            let project_panel = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Right, 1, cx);
+                panel.follows_agent_layout = true;
+                panel.starts_open = true;
+                panel
+            });
+            workspace.add_panel(project_panel.clone(), window, cx);
+            for priority in 2..5 {
+                let panel = cx.new(|cx| {
+                    let mut panel = TestPanel::new(DockPosition::Right, priority, cx);
+                    panel.follows_agent_layout = true;
+                    panel
+                });
+                workspace.add_panel(panel, window, cx);
+            }
+            let agent = cx.new(|cx| {
+                let mut panel = TestPanel::new(DockPosition::Left, 0, cx);
+                panel.agent = true;
+                panel.follows_agent_layout = true;
+                panel
+            });
+            workspace.add_panel(agent.clone(), window, cx);
+            workspace.toggle_dock(DockPosition::Left, window, cx);
+            workspace.toggle_agent_focus_mode(&ToggleAgentFocusMode, window, cx);
+            (agent, project_panel)
+        });
+        cx.run_until_parked();
+        for (layout, position) in [
+            (WindowLayout::editor(), DockPosition::Right),
+            (WindowLayout::agent(), DockPosition::Left),
+        ] {
+            cx.update(|_, cx| AgentSettings::set_layout(layout, fs.clone(), cx))
+                .await
+                .expect("layout update")
+                .expect("settings write");
+            cx.run_until_parked();
+            workspace.read_with(cx, |workspace, cx| {
+                assert!(workspace.agent_focus_mode());
+                assert_eq!(workspace.expanded_agent_position(cx), Some(position));
+                assert_eq!(
+                    workspace
+                        .dock_at_position(position)
+                        .read(cx)
+                        .visible_panel()
+                        .map(|panel| panel.panel_id()),
+                    Some(agent.entity_id())
+                );
+                let opposite = if position == DockPosition::Left {
+                    DockPosition::Right
+                } else {
+                    DockPosition::Left
+                };
+                assert_eq!(
+                    workspace
+                        .dock_at_position(opposite)
+                        .read(cx)
+                        .visible_panel()
+                        .map(|panel| panel.panel_id()),
+                    Some(project_panel.entity_id())
+                );
+            });
+            assert!(cx.debug_bounds("agent-focus-column").is_some());
+        }
+    }
+
+    #[gpui::test]
     async fn test_agent_focus_mode_tracks_editor_occupancy(cx: &mut TestAppContext) {
         init_test(cx);
         let fs = FakeFs::new(cx.executor());

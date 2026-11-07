@@ -29,3 +29,10 @@ Focus Mode is an explicit, per-workspace preference for this session. It remains
 - Both agent sides, real Classic/Agentic switches, same-dock replacement and opposite dock, fixed/flexible saved sizes, resizing handles, bottom-dock variants, sidebar, fullscreen and region focus.
 - Background item add/remove, delayed opens and modal dialogs should remain normal upstream behavior; no bespoke asynchronous request plumbing.
 - Compare diff against `origin/develop` for moved upstream blocks and avoid broad reformatting. GPUI tests should assert rendered geometry as well as state; verify actual UI in isolated Zed.
+
+## Validation and remaining risks
+
+- The occupancy, normal-width, bottom-layout/opposite-resize, and settings-driven layout-swap tests run deterministically; the settings-driven move reproduces the real `starts_open` ordering. The V2 implementation does not change `open_paths` or add asynchronous request wrappers.
+- Isolated UI passes have covered both layout presets, file opening, closing the final item, multiple splits, hiding the agent while closing the last item, re-showing it, opposite-dock drag, the bottom terminal, and the empty-editor agent focus action. These are not a substitute for all platform, accessibility, restoration, or live-agent coverage.
+- The preference is per workspace session, like V1; restart persistence has not been implemented. In particular, re-opening a workspace starts with Focus Mode off.
+- `./script/clippy -p workspace -p agent_ui` was blocked by an existing `clippy::approx_constant` error in `crates/gpui/src/geometry.rs`, before it could validate these crates.
