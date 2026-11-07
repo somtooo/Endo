@@ -163,7 +163,8 @@ pub async fn install(http: Arc<dyn HttpClient>) -> Result<PathBuf> {
     let mut binary = None;
     while let Some(entry) = entries.next().await {
         let mut entry = entry?;
-        if entry.path()?.as_os_str() == wanted.as_os_str() {
+        // Compared as paths, since the archive uses `/` and Windows `\`.
+        if std::path::Path::new(entry.path()?.as_os_str()) == wanted {
             let mut bytes = Vec::new();
             entry.read_to_end(&mut bytes).await?;
             binary = Some(bytes);
