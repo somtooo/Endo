@@ -601,7 +601,8 @@ impl ThreadMetadataStore {
         self.threads.get(thread_id)
     }
 
-    /// Returns all threads.
+    /// Marks a session a backend reports as running while no panel has it
+    /// loaded.
     pub fn set_externally_running(
         &mut self,
         session_id: acp::SessionId,
@@ -622,6 +623,7 @@ impl ThreadMetadataStore {
         self.externally_running.contains(session_id)
     }
 
+    /// Returns all threads.
     pub fn entries(&self) -> impl Iterator<Item = &ThreadMetadata> + '_ {
         self.threads.values()
     }
