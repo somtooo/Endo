@@ -20,10 +20,7 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 
 ## Needs checking
 
-| # | Item | Details | Source | Status |
-|---|---|---|---|---|
-| 39 | OpenCode D row in settings without OpenCode | The OpenCode D row on AI > External Agents now appears only when OpenCode is installed, or after installing it from an OpenCode D thread. Without OpenCode, the settings page looks the same as upstream Zed. | You | Needs check |
-| 37 | No sidebar spinner for a session already running when Zed starts | Reported by the user: a session running in the TUI showed no spinner in Zed's sidebar until its row was clicked. The agent couldn't reproduce it with a private service. A session started before Zed launched and one started after both showed an animated spinner. Needs more detail about the case that failed. | You | Needs info |
+Nothing waiting.
 
 ## Later
 
@@ -35,6 +32,8 @@ Everything still to do on OpenCode D, in one place. Update the status as work mo
 
 | # | Item | Details | Source | Status |
 |---|---|---|---|---|
+| 39 | OpenCode D row in settings without OpenCode | The OpenCode D row on AI > External Agents now appears only when OpenCode is installed, or after installing it from an OpenCode D thread. Without OpenCode, the settings page looks the same as upstream Zed. Confirmed by the user. | You | Done |
+| 37 | No sidebar spinner for a session already running when Zed starts | Reported by the user: a session running in the TUI showed no spinner in Zed's sidebar until its row was clicked. The agent couldn't reproduce it with a private service. A session started before Zed launched and one started after both showed an animated spinner. Confirmed working by the user. | You | Done |
 | 1 | Agent edits missing from diff review | Finished edits now reach the action log, with the old text worked out by reversing OpenCode's patch. Keep, reject, new files, deletes, CRLF, and editing an old message all checked in the UI. Edits made through shell commands don't show, because OpenCode doesn't report them as file edits. | Tester | Done |
 | 2 | Footer stuck after a failed compact | `/compact` on an empty thread fails, and "Waiting… /compact" stays in the footer even after later messages work. | You | Done |
 | 3 | Stray `<system-reminder>` line | Plan-mode threads show a lone tag. Its body is missing from the stored thread too. | You | Done |
