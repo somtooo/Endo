@@ -85,6 +85,11 @@ const CATALOG_EVENTS: &[&str] = &[
     "credential.updated",
 ];
 
+/// The server sends a heartbeat every 15 seconds, so a stream silent this
+/// long is dead even if the connection looks open. OpenCode's own client uses
+/// the same limit.
+const EVENT_STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(45);
+
 enum PumpMessage {
     Connected,
     Event(Event),
@@ -345,10 +350,19 @@ impl Hub {
                         if tx.unbounded_send(PumpMessage::Connected).is_err() {
                             return;
                         }
-                        while let Some(event) = events.next().await {
-                            let event = match event {
-                                Ok(event) => event,
-                                Err(error) => {
+                        loop {
+                            let next = futures::select_biased! {
+                                next = events.next().fuse() => next,
+                                _ = executor.timer(EVENT_STREAM_IDLE_TIMEOUT).fuse() => {
+                                    log::warn!("OpenCode event stream went quiet; reconnecting");
+                                    break;
+                                }
+                            };
+                            let event = match next {
+                                None => break,
+                                Some(Ok(Some(event))) => event,
+                                Some(Ok(None)) => continue,
+                                Some(Err(error)) => {
                                     log::warn!("OpenCode event stream error: {error:#}");
                                     break;
                                 }
@@ -531,8 +545,6 @@ impl Hub {
             .unwrap_or_default()
     }
 
-    /// Refetches the commands and skills of `directory` for the threads open
-    /// in it.
     fn settle_steer(&self, message_id: &str, delivered: bool) {
         self.cancelled_steers.borrow_mut().remove(message_id);
         if let Some((_, settled)) = self.steers.borrow_mut().remove(message_id) {
@@ -573,6 +585,8 @@ impl Hub {
         }
     }
 
+    /// Refetches the commands and skills of `directory` for the threads open
+    /// in it.
     fn refresh_catalog(self: &Rc<Self>, directory: String, cx: &mut App) {
         let has_sessions = self
             .sessions
@@ -1445,9 +1459,10 @@ impl Hub {
                 }
                 anyhow::Ok((permissions, forms))
             })?;
+            let (permissions, forms) = prompts;
+            cx.update(|cx| hub.settle_missed_replies(&session_id, &permissions, &forms, cx));
             // Each prompt adds a thread entry, and the agent panel expects at
             // most one new entry per update.
-            let (permissions, forms) = prompts;
             for permission in permissions {
                 cx.update(|cx| hub.permission_asked(&session_id, &permission, cx));
             }
@@ -1522,6 +1537,63 @@ impl Hub {
     }
 
     /// Another client answered or cancelled a form: close it here too.
+    /// Closes prompts the server no longer has, which another client answered
+    /// while the event stream was down. A permission counts as allowed if its
+    /// tool went on to run.
+    fn settle_missed_replies(
+        &self,
+        session_id: &str,
+        permissions: &[Value],
+        forms: &[Value],
+        cx: &mut App,
+    ) {
+        let pending = |items: &[Value]| -> HashSet<String> {
+            items
+                .iter()
+                .filter_map(|item| item.get("id").and_then(Value::as_str))
+                .map(str::to_string)
+                .collect()
+        };
+        let (pending_permissions, pending_forms) = (pending(permissions), pending(forms));
+        let (missed_permissions, missed_forms) = {
+            let sessions = self.sessions.borrow();
+            let Some(entry) = sessions.get(session_id) else {
+                return;
+            };
+            let missed_permissions: Vec<(String, &'static str)> = entry
+                .permissions
+                .iter()
+                .filter(|(request_id, _)| !pending_permissions.contains(*request_id))
+                .map(|(request_id, (tool_id, _))| {
+                    let ran = tool_state(&entry.transcript, tool_id).is_some_and(|state| {
+                        matches!(
+                            state,
+                            ToolState::Running { .. } | ToolState::Completed { .. }
+                        )
+                    });
+                    (request_id.clone(), if ran { "once" } else { "reject" })
+                })
+                .collect();
+            let missed_forms: Vec<String> = entry
+                .forms
+                .keys()
+                .filter(|form_id| !pending_forms.contains(*form_id))
+                .cloned()
+                .collect();
+            (missed_permissions, missed_forms)
+        };
+        for (request_id, reply) in missed_permissions {
+            self.permission_replied(
+                session_id,
+                &serde_json::json!({ "requestID": request_id, "reply": reply }),
+                cx,
+            );
+        }
+        for form_id in missed_forms {
+            self.form_settled(session_id, &serde_json::json!({ "id": form_id }), cx);
+        }
+    }
+
     fn form_settled(&self, session_id: &str, data: &Value, cx: &mut App) {
         let Some(form_id) = data.get("id").and_then(Value::as_str) else {
             return;
@@ -1836,6 +1908,19 @@ impl SessionEntry {
         self.awaiting_delivery.retain(|id| !removed.contains(id));
         self.queue.retain(|(id, _)| !removed.contains(id));
     }
+}
+
+fn tool_state<'a>(transcript: &'a SessionTranscript, tool_id: &str) -> Option<&'a ToolState> {
+    transcript.messages().iter().rev().find_map(|message| {
+        message
+            .as_assistant()?
+            .content
+            .iter()
+            .find_map(|item| match item {
+                AssistantContent::Tool(tool) if tool.id == tool_id => Some(&tool.state),
+                _ => None,
+            })
+    })
 }
 
 #[derive(Debug, PartialEq)]
@@ -3012,7 +3097,7 @@ impl ReceiptSessionSubmissions for Submissions {
                 Some((name, _)) if name == "compact" => client.compact(&session_id).await?,
                 Some((name, arguments)) => {
                     client
-                        .command(&session_id, &name, &arguments, &skills)
+                        .command(&session_id, &name, &arguments, &files, &skills)
                         .await?
                 }
                 None => {

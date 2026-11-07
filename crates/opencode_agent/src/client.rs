@@ -40,6 +40,13 @@ fn connect_path(integration_id: &str, rest: &str) -> String {
     format!("/api/integration/{integration_id}/connect/{rest}")
 }
 
+/// MCP server names come from the user's settings and can contain any
+/// character.
+fn mcp_path(name: &str) -> String {
+    let name = percent_encoding::utf8_percent_encode(name, percent_encoding::NON_ALPHANUMERIC);
+    format!("/api/experimental/mcp/{name}")
+}
+
 fn method_body(method_id: &str, answer: Option<&Value>) -> Value {
     let mut body = serde_json::json!({ "methodID": method_id });
     if let Some(answer) = answer {
@@ -490,7 +497,7 @@ impl OpenCodeClient {
 
     /// Adds or replaces an MCP server for every session in `directory`.
     pub async fn add_mcp(&self, directory: &str, name: &str, config: &Value) -> Result<()> {
-        let path = format!("/api/experimental/mcp/{name}");
+        let path = mcp_path(name);
         let request = self
             .request(
                 Method::PUT,
@@ -507,7 +514,7 @@ impl OpenCodeClient {
     /// Removes an MCP server from every session in `directory`. A server the
     /// service doesn't have (it restarted since) counts as removed.
     pub async fn remove_mcp(&self, directory: &str, name: &str) -> Result<()> {
-        let path = format!("/api/experimental/mcp/{name}");
+        let path = mcp_path(name);
         let request = self
             .request(
                 Method::DELETE,
@@ -623,12 +630,14 @@ impl OpenCodeClient {
         session_id: &str,
         name: &str,
         arguments: &str,
+        files: &[Value],
         skills: &[String],
     ) -> Result<()> {
         let path = format!("/api/session/{session_id}/command");
         let body = serde_json::json!({
             "name": name,
             "text": arguments,
+            "files": files,
             "skills": skill_attachments(skills),
         });
         let _: Value = self.post_json(self.url(&path, &[])?, &body).await?;
@@ -749,8 +758,10 @@ impl OpenCodeClient {
 
     /// Subscribes to every event on the server. The server drops a subscriber
     /// that falls behind, and never replays missed events, so callers must
-    /// resync their state after the stream ends.
-    pub async fn events(&self) -> Result<BoxStream<'static, Result<Event>>> {
+    /// resync their state after the stream ends. Each line the server sends
+    /// yields an item, `None` for lines that carry no event, such as the
+    /// heartbeat, so a caller can tell a quiet stream from a dead one.
+    pub async fn events(&self) -> Result<BoxStream<'static, Result<Option<Event>>>> {
         let request = self
             .request(Method::GET, self.url("/api/event", &[])?)
             .header("Accept", "text/event-stream")
@@ -761,17 +772,18 @@ impl OpenCodeClient {
             return Err(anyhow!("OpenCode event stream failed with status {status}"));
         }
         let lines = BufReader::new(response.into_body()).lines();
-        let events = lines
-            .scan(SseParser::default(), |parser, line| {
-                let output = match line {
-                    Ok(line) => parser.push_line(&line).map(|data| {
+        let events = lines.scan(SseParser::default(), |parser, line| {
+            let output = match line {
+                Ok(line) => parser
+                    .push_line(&line)
+                    .map(|data| {
                         serde_json::from_str::<Event>(&data).context("decoding OpenCode event")
-                    }),
-                    Err(error) => Some(Err(anyhow::Error::from(error))),
-                };
-                futures::future::ready(Some(output))
-            })
-            .filter_map(futures::future::ready);
+                    })
+                    .transpose(),
+                Err(error) => Err(anyhow::Error::from(error)),
+            };
+            futures::future::ready(Some(output))
+        });
         Ok(events.boxed())
     }
 
@@ -887,6 +899,14 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mcp_names_are_escaped_in_the_path() {
+        assert_eq!(
+            mcp_path("my server/v2?x"),
+            "/api/experimental/mcp/my%20server%2Fv2%3Fx"
+        );
+    }
 
     #[test]
     fn sse_parser_dispatches_on_blank_line_and_skips_heartbeats() {

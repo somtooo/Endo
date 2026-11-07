@@ -95,7 +95,9 @@ async fn run(options: Options) -> Result<()> {
                 println!("event stream ended; reconnecting");
                 break;
             };
-            let event = event?;
+            let Some(event) = event? else {
+                continue;
+            };
             stats.events += 1;
             match transcript.apply(&event) {
                 Applied::Ignored => {}
