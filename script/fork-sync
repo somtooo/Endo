@@ -191,4 +191,4 @@ git push --force-with-lease origin develop
 
 echo "Synced: main $(git rev-parse --short main), develop $(git rev-parse --short develop)"
 echo "Pushed develop has no CI run -- dispatch fork-checks on develop if you skipped verification:"
-echo "  gh workflow run fork-checks.yml --repo somtooo/zed --ref develop"
+echo "  gh workflow run fork-checks.yml --repo somtooo/Endo --ref develop"
