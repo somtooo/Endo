@@ -317,10 +317,10 @@ mod tests {
         smol::block_on(async {
             let client = FakeHttpClient::create(|request| async move {
                 let body = match request.uri().path() {
-                    "/repos/somtooo/zed/releases" => {
-                        r#"[{"tag_name":"fork-v1.25.3.2","draft":false,"prerelease":false,"assets":[{"name":"Endo-aarch64.dmg","browser_download_url":"https://github.com/somtooo/zed/releases/download/fork-v1.25.3.2/Endo-aarch64.dmg"}]}]"#
+                    "/repos/somtooo/Endo/releases" => {
+                        r#"[{"tag_name":"fork-v1.25.3.2","draft":false,"prerelease":false,"assets":[{"name":"Endo-aarch64.dmg","browser_download_url":"https://github.com/somtooo/Endo/releases/download/fork-v1.25.3.2/Endo-aarch64.dmg"}]}]"#
                     }
-                    "/repos/somtooo/zed/commits/fork-v1.25.3.2" => r#"{"sha":"cafe"}"#,
+                    "/repos/somtooo/Endo/commits/fork-v1.25.3.2" => r#"{"sha":"cafe"}"#,
                     _ => anyhow::bail!("unexpected request: {}", request.uri()),
                 };
                 Ok(Response::builder().status(200).body(body.into())?)

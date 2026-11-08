@@ -15,9 +15,9 @@
 #
 # Model: a release branch is an upstream stable tag with the fork's own
 # commits replayed onto it:
-#   release/fork-vX.Y.Z = <upstream tag> + <the fork's commits from develop>
+#   release/fork-vX.Y.Z = <upstream tag> + <the fork's commits from main>
 # The `build-branch` job builds that branch when none is given: it replays
-# develop's commits onto the tag with script/fork-resolve, which resolves the
+# main's commits onto the tag with script/fork-resolve, which resolves the
 # conflicts with opencode and repairs the build (upstream renames APIs, so
 # the fork's code can stop compiling against an older tag). The result is
 # pushed, which starts fork-checks on it -- this workflow requires that run
@@ -89,6 +89,9 @@ jobs:
     if: ${{ inputs.branch == '' }}
     runs-on: namespace-profile-zed-linux
     timeout-minutes: 300
+    permissions:
+      contents: write
+      id-token: write
     outputs:
       branch: ${{ steps.branch.outputs.name }}
     env:
@@ -105,6 +108,13 @@ jobs:
         with:
           fetch-depth: 0
           token: ${{ secrets.FORK_SYNC_PAT }}
+
+      - name: Capture main for this release
+        id: source
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          echo "sha=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Install the Devbox CLI
         run: |
@@ -177,11 +187,15 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # The image needs cmake for the WebRTC build and ripgrep for the
-          # conflict resolver's repository searches.
-          if ! command -v cmake >/dev/null 2>&1 || ! command -v rg >/dev/null 2>&1; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq cmake ripgrep
+          if ! command -v cmake >/dev/null 2>&1 \
+            || ! command -v jq >/dev/null 2>&1 \
+            || ! command -v rg >/dev/null 2>&1 \
+            || ! command -v xvfb-run >/dev/null 2>&1 \
+            || ! dpkg-query -W cmake jq ripgrep xvfb libgl1-mesa-dri mesa-vulkan-drivers >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq cmake jq ripgrep xvfb libgl1-mesa-dri mesa-vulkan-drivers
           fi
+          sudo sed -i '/^# sudo hint/,/^fi$/d' /etc/bash.bashrc
 
           rm -rf "$WORK_DIR"
           git clone "$REPO_URL" "$WORK_DIR"
@@ -193,7 +207,8 @@ jobs:
           # tag it needs.
           git fetch upstream
           git fetch origin
-          git checkout -B develop "origin/develop"
+          git fetch origin "${{ steps.source.outputs.sha }}"
+          git checkout -B main "${{ steps.source.outputs.sha }}"
           # The release script comes from the ref this workflow runs on, so it
           # is available even when the branch it builds is not checked out.
           git show "origin/$REF_NAME:script/fork-release" > /tmp/fork-release
@@ -206,14 +221,15 @@ jobs:
           git log --oneline -6
           DEVOX
 
-          if devbox exec "${{ env.DEVBOX_NAME }}" -- bash -c "$(cat /tmp/build-release-branch.sh)"; then
+          if devbox exec "${{ env.DEVBOX_NAME }}" -- true; then
+            devbox exec "${{ env.DEVBOX_NAME }}" -- bash -c "$(cat /tmp/build-release-branch.sh)"
             echo "built in the Devbox"
             devbox download "${{ env.DEVBOX_NAME }}" "/workspaces/release-${{ github.run_id }}/release.bundle" /tmp/release.bundle
           else
             echo "::warning::the Devbox would not take the job -- building on the runner instead"
             npm install -g --prefix "$HOME/.local" opencode-ai
             export PATH="$HOME/.local/bin:$PATH"
-            # The scripts have to survive the checkout of develop below, so
+            # The scripts have to survive the checkout of main below, so
             # keep copies outside the working tree.
             cp script/fork-release /tmp/fork-release
             cp script/fork-resolve /tmp/fork-resolve
@@ -224,11 +240,13 @@ jobs:
             fi
             git fetch upstream
             git fetch origin
-            git checkout -B develop "origin/develop"
+            git fetch origin "${{ steps.source.outputs.sha }}"
+            git checkout -B main "${{ steps.source.outputs.sha }}"
             # The build check after the replay needs the same toolchain the
             # checks use. The resolver also uses ripgrep to inspect conflicts.
             ./script/linux
-            sudo apt-get install -y ripgrep
+            sudo apt-get install -y cmake jq ripgrep xvfb libgl1-mesa-dri mesa-vulkan-drivers
+            sudo sed -i '/^# sudo hint/,/^fi$/d' /etc/bash.bashrc
             ./script/download-wasi-sdk
             bash /tmp/fork-release --no-push --model "${{ env.OPENCODE_MODEL_FALLBACK }}"
             git bundle create /tmp/release.bundle "$(git rev-parse --abbrev-ref HEAD)"
@@ -262,6 +280,7 @@ jobs:
           fi
           git push origin "refs/remotes/built/$BRANCH:refs/heads/$PUSH_BRANCH"
           echo "name=$PUSH_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse "refs/remotes/built/$BRANCH")" >> "$GITHUB_OUTPUT"
           echo "Pushed $PUSH_BRANCH"
 
       - name: Wait for fork-checks on the release branch
@@ -270,6 +289,7 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="${{ steps.branch.outputs.name }}"
+          export HEAD="${{ steps.branch.outputs.sha }}"
           # Pushing the branch runs fork-checks on it (the branch carries the
           # workflow files), so wait for that run to finish.
           STATUS=""
@@ -277,7 +297,7 @@ jobs:
           for attempt in $(seq 1 120); do
             sleep 30
             RESULT=$(gh run list --workflow fork-checks.yml --repo "${{ github.repository }}" --branch "$BRANCH" --limit 1 \
-              --json databaseId,status,conclusion --jq '.[0]? | select(. != null) | "\(.databaseId) \(.status) \(.conclusion)"' || true)
+              --json databaseId,status,conclusion,headSha --jq '.[] | select(.headSha == env.HEAD) | "\(.databaseId) \(.status) \(.conclusion)"' | head -1 || true)
             [ -n "$RESULT" ] || continue
             RUN_ID=$(echo "$RESULT" | cut -d' ' -f1)
             STATUS=$(echo "$RESULT" | cut -d' ' -f2)
@@ -290,7 +310,7 @@ jobs:
             exit 1
           fi
           if [ "$CONCLUSION" != "success" ]; then
-            echo "::error::fork-checks on $BRANCH concluded '$CONCLUSION' -- the branch was not built correctly; fix it on develop and re-run, or fix the branch by hand and re-dispatch with branch=$BRANCH"
+            echo "::error::fork-checks on $BRANCH concluded '$CONCLUSION' -- the branch was not built correctly; fix it on main and re-run, or fix the branch by hand and re-dispatch with branch=$BRANCH"
             exit 1
           fi
 
@@ -369,11 +389,12 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="${{ inputs.branch || needs.build-branch.outputs.branch }}"
-          UPSTREAM_TAG="${BRANCH#release/fork-}"
-          case "$UPSTREAM_TAG" in
-            v[0-9]*.[0-9]*.[0-9]*) ;;
-            *) echo "::error::cannot derive upstream tag from branch '$BRANCH'"; exit 1 ;;
-          esac
+          if [[ "$BRANCH" =~ ^release/fork-(v[0-9]+\.[0-9]+\.[0-9]+)(\.[0-9]+)?$ ]]; then
+            UPSTREAM_TAG="${BASH_REMATCH[1]}"
+          else
+            echo "::error::cannot derive upstream tag from branch '$BRANCH'"
+            exit 1
+          fi
           if ! git remote get-url upstream >/dev/null 2>&1; then
             git remote add upstream https://github.com/zed-industries/zed.git
           fi
