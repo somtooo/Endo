@@ -137,6 +137,8 @@ Other entities can then register a callback to handle these events by doing `cx.
 
 # Commit messages
 
+- Keep each feature to one commit on `main` and in pull requests targeting `main`. Squash follow-up fixes into the feature commit before pushing.
+- Merge single-feature pull requests with squash or rebase, not merge commits, so the feature remains one commit on `main`.
 - Review recent project commit history before writing a commit message and follow its conventions.
 - Use `area: Imperative description`, naming the relevant crate or project area (for example, `agent_ui: Fix thread title restoration`). Do not use conventional commit types such as `feat:` or `fix:` as the prefix.
 
