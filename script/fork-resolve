@@ -257,7 +257,7 @@ if [ "$REPLAY_ONLY" = false ]; then
             echo "Re-run with --no-ai and resolve manually." >&2
             exit 1
         fi
-        if ! git diff --check; then
+        if ! git diff --check || ! git diff --cached --check; then
             git rebase --abort
             echo "error: whitespace/marker issues after opencode -- replay aborted." >&2
             exit 1

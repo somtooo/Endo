@@ -22,6 +22,8 @@ class ForkResolveTests(unittest.TestCase):
         self.run_git("init", "-q", "-b", "main")
         self.run_git("config", "user.name", "Test")
         self.run_git("config", "user.email", "test@example.com")
+        self.run_git("config", "commit.gpgsign", "false")
+        self.run_git("config", "core.hooksPath", str(self.root / "no-hooks"))
         (self.repo / "file.txt").write_text("base\n")
         self.run_git("add", "file.txt")
         self.run_git("commit", "-qm", "base")
@@ -43,6 +45,7 @@ case "$MOCK_DECISION" in
   uncertain) mkdir -p target; printf 'needs-human\\n' > target/fork-resolve-decision.txt ;;
   missing) printf 'feature adapted to upstream\\n' > file.txt; git add file.txt ;;
   partial) mkdir -p target; printf 'resolved\\n' > target/fork-resolve-decision.txt ;;
+  markers) printf '<<<<<<< ours\\nfeature\\n=======\\nupstream\\n>>>>>>> theirs\\n' > file.txt; git add file.txt; mkdir -p target; printf 'resolved\\n' > target/fork-resolve-decision.txt ;;
   invalid) mkdir -p target; printf 'maybe\\n' > target/fork-resolve-decision.txt ;;
   failure) exit 1 ;;
 esac
@@ -68,7 +71,7 @@ esac
         self.run_git("merge-base", "--is-ancestor", "upstream", "HEAD")
 
     def test_uncertainty_or_missing_decision_aborts(self):
-        for decision in ("uncertain", "missing", "invalid", "failure", "partial"):
+        for decision in ("uncertain", "missing", "invalid", "failure", "partial", "markers"):
             with self.subTest(decision=decision):
                 result = self.run_resolver(decision)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
