@@ -1,0 +1,134 @@
+#!/usr/bin/env python3
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+import unittest
+
+
+RESOLVER = Path(__file__).resolve().with_name("fork-resolve")
+RELEASE = Path(__file__).resolve().with_name("fork-release")
+SYNC = Path(__file__).resolve().with_name("fork-sync")
+
+
+class ForkResolveTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="fork-resolve-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.run_git("init", "-q", "-b", "main")
+        self.run_git("config", "user.name", "Test")
+        self.run_git("config", "user.email", "test@example.com")
+        (self.repo / "file.txt").write_text("base\n")
+        self.run_git("add", "file.txt")
+        self.run_git("commit", "-qm", "base")
+        self.run_git("branch", "upstream")
+        (self.repo / "file.txt").write_text("feature\n")
+        self.run_git("commit", "-qam", "feature")
+        self.original = self.run_git("rev-parse", "HEAD").stdout.strip()
+        self.run_git("checkout", "-q", "upstream")
+        (self.repo / "file.txt").write_text("upstream\n")
+        self.run_git("commit", "-qam", "upstream")
+        self.run_git("checkout", "-q", "main")
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        mock = self.bin / "opencode"
+        mock.write_text('''#!/usr/bin/env bash
+set -eu
+case "$MOCK_DECISION" in
+  resolved) printf 'feature adapted to upstream\\n' > file.txt; git add file.txt; mkdir -p target; printf 'resolved\\n' > target/fork-resolve-decision.txt ;;
+  uncertain) mkdir -p target; printf 'needs-human\\n' > target/fork-resolve-decision.txt ;;
+  missing) printf 'feature adapted to upstream\\n' > file.txt; git add file.txt ;;
+  partial) mkdir -p target; printf 'resolved\\n' > target/fork-resolve-decision.txt ;;
+  invalid) mkdir -p target; printf 'maybe\\n' > target/fork-resolve-decision.txt ;;
+  failure) exit 1 ;;
+esac
+''')
+        mock.chmod(0o755)
+
+    def run_git(self, *args):
+        return subprocess.run(["git", *args], cwd=self.repo, text=True, capture_output=True, check=True)
+
+    def run_resolver(self, decision):
+        env = os.environ.copy()
+        env["PATH"] = str(self.bin) + os.pathsep + env["PATH"]
+        env["MOCK_DECISION"] = decision
+        return subprocess.run(
+            ["bash", str(RESOLVER), "--onto", "upstream", "--no-fix-build"],
+            cwd=self.repo, env=env, text=True, capture_output=True,
+        )
+
+    def test_explicit_resolution_continues(self):
+        result = self.run_resolver("resolved")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((self.repo / "file.txt").read_text(), "feature adapted to upstream\n")
+        self.run_git("merge-base", "--is-ancestor", "upstream", "HEAD")
+
+    def test_uncertainty_or_missing_decision_aborts(self):
+        for decision in ("uncertain", "missing", "invalid", "failure", "partial"):
+            with self.subTest(decision=decision):
+                result = self.run_resolver(decision)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.run_git("rev-parse", "HEAD").stdout.strip(), self.original)
+                self.assertEqual((self.repo / "file.txt").read_text(), "feature\n")
+                self.assertFalse((self.repo / ".git" / "rebase-merge").exists())
+
+    def prepare_release(self, tag_target):
+        self.run_git("tag", "v1.2.3", tag_target)
+        self.run_git("remote", "add", "upstream", str(self.repo))
+        self.run_git("config", "remote.upstream.fetch", "+refs/heads/upstream:refs/remotes/upstream/main")
+        self.run_git("fetch", "-q", "upstream")
+        scripts = self.repo / "script"
+        scripts.mkdir()
+        shutil.copy(RESOLVER, scripts / "fork-resolve")
+        shutil.copy(RELEASE, scripts / "fork-release")
+        return subprocess.run(
+            ["bash", str(scripts / "fork-release"), "--upstream-tag", "v1.2.3", "--no-ai", "--no-push"],
+            cwd=self.repo, text=True, capture_output=True,
+        )
+
+    def test_release_conflict_aborts_without_push(self):
+        result = self.prepare_release("upstream")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.run_git("rev-parse", "HEAD").stdout.strip(), self.original)
+        self.assertEqual(self.run_git("branch", "--show-current").stdout.strip(), "main")
+        self.assertNotIn("release/fork-v1.2.3", self.run_git("branch", "--list").stdout)
+
+    def test_release_uses_main_features_on_stable_tag(self):
+        result = self.prepare_release("main~1")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.run_git("branch", "--show-current").stdout.strip(), "release/fork-v1.2.3")
+        self.run_git("merge-base", "--is-ancestor", "v1.2.3", "HEAD")
+        self.assertEqual((self.repo / "file.txt").read_text(), "feature\n")
+
+    def test_local_sync_replays_main_onto_upstream(self):
+        self.run_git("checkout", "-q", "upstream")
+        (self.repo / "file.txt").write_text("base\n")
+        (self.repo / "upstream.txt").write_text("upstream change\n")
+        self.run_git("add", "file.txt", "upstream.txt")
+        self.run_git("commit", "-qm", "nonconflicting upstream change")
+        upstream = self.run_git("rev-parse", "HEAD").stdout.strip()
+        self.run_git("checkout", "-q", "main")
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(remote)], check=True)
+        self.run_git("remote", "add", "origin", str(remote))
+        self.run_git("remote", "add", "upstream", str(remote))
+        self.run_git("config", "remote.upstream.fetch", "+refs/heads/upstream:refs/remotes/upstream/main")
+        scripts = self.repo / "script"
+        scripts.mkdir()
+        shutil.copy(SYNC, scripts / "fork-sync")
+        result = subprocess.run(
+            ["bash", str(scripts / "fork-sync"), "--no-ai", "--skip-verify", "--no-push"],
+            cwd=self.repo, text=True, capture_output=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.run_git("merge-base", "--is-ancestor", upstream, "HEAD")
+        self.assertEqual((self.repo / "file.txt").read_text(), "feature\n")
+        self.assertEqual((self.repo / "upstream.txt").read_text(), "upstream change\n")
+
+
+if __name__ == "__main__":
+    unittest.main()
