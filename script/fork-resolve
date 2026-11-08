@@ -163,7 +163,7 @@ FEATURES=$(fork_features)
 
 if [ "$REPLAY_ONLY" = false ]; then
     if ! rebase_in_progress; then
-        if git rebase --onto "$ONTO" "$UPSTREAM_POINT"; then
+        if git -c rerere.enabled=false rebase --onto "$ONTO" "$UPSTREAM_POINT"; then
             echo "Replay clean."
         else
             if [ "$AI" = false ]; then
@@ -187,13 +187,22 @@ if [ "$REPLAY_ONLY" = false ]; then
                 exit 1
             fi
             echo "No conflicted files left (rerere resolved it, or the commit is empty) -- continuing ..."
-            if ! git rebase --continue; then
+            if ! git -c rerere.enabled=false rebase --continue; then
                 if ! rebase_in_progress; then
                     echo "Replay finished."
                     break
                 fi
-                git rebase --skip
-                echo "Skipped the empty commit."
+                if [ -n "$(git diff --name-only --diff-filter=U)" ]; then
+                    continue
+                fi
+                if git diff --cached --quiet; then
+                    git -c rerere.enabled=false rebase --skip
+                    echo "Skipped the empty commit."
+                else
+                    git rebase --abort
+                    echo "error: replay could not continue with staged changes -- replay aborted." >&2
+                    exit 1
+                fi
             fi
             continue
         fi
@@ -211,7 +220,10 @@ if [ "$REPLAY_ONLY" = false ]; then
         if [ "$BRANCH" = "HEAD" ] && [ -f "$(git rev-parse --git-path rebase-merge/head-name)" ]; then
             BRANCH=$(basename "$(cat "$(git rev-parse --git-path rebase-merge/head-name)")")
         fi
-        BRANCH=${BRANCH:-develop}
+        BRANCH=${BRANCH:-main}
+        DECISION_FILE="$REPO_ROOT/target/fork-resolve-decision.txt"
+        mkdir -p "$(dirname "$DECISION_FILE")"
+        rm -f "$DECISION_FILE"
         if ! opencode run -m "$MODEL" --variant "$VARIANT" "You are resolving a git rebase conflict in this repo. Context: branch $BRANCH (all custom fork commits, kept linear) is having its commits replayed onto '$ONTO'. Replaying commit $STOP_SHA ($STOP_SUBJECT) just conflicted; these files now contain git conflict markers: $CONFLICTS.
 
     Our fork features you must PRESERVE (never delete to 'resolve' a conflict):
@@ -221,15 +233,22 @@ if [ "$REPLAY_ONLY" = false ]; then
 
     How to resolve this stop:
     1. Inspect every conflict hunk (grep -n '^<<<<<<< \|^=======$\|^>>>>>>> ' in each file). Use 'git show :2:<file>' (BASE, upstream) and 'git show :3:<file>' (THEIRS, our commit) to understand what each side intended. For shared APIs, inspect their call sites and tests on both sides before choosing a shape.
-    2. Merge SEMANTICALLY: keep the feature's intent, adapted to the new base's APIs. When upstream refactored code our feature touches, adapt our feature to the new shape -- do not revert the refactor and do not drop our feature. Preserve upstream behavior relied on by other call sites; do not blindly choose one side or keep only the version that compiles. Do NOT pull newer upstream code into an older base; adapt minimally. If a hunk is genuinely ambiguous, prefer keeping upstream behavior and note the choice in your final summary.
+    2. Merge SEMANTICALLY: keep the feature's intent, adapted to the new base's APIs. When upstream refactored code our feature touches, adapt our feature to the new shape -- do not revert the refactor and do not drop our feature. Preserve upstream behavior relied on by other call sites; do not blindly choose one side or keep only the version that compiles. Do NOT pull newer upstream code into an older base; adapt minimally. If you cannot establish with confidence how to preserve the intent and behavior of both sides, STOP. Do not guess, even if tests pass. Explain the ambiguity and the human decision needed in your final summary; do not mark the conflict resolved.
     3. Follow this repo's Rust rules (AGENTS.md): no unwrap()/expect() in new code, propagate errors with ?, handle fallible results explicitly, full-word variable names, and keep diffs minimal -- no drive-by reformatting.
     4. Remove ALL conflict markers. After editing each file, stage it with 'git add <file>'. Do NOT commit and do NOT run 'git rebase --continue' -- the script continues the rebase after verifying.
     5. When all files are staged, run 'git diff --check' (must be clean) and verify no markers remain (rg -n '^<{7} |^={7}\$|^>{7} ' on the touched files).
     6. Do NOT run cargo build, cargo check or cargo test while the rebase is paused: later fork commits may not have been replayed yet. After the complete replay, fork-resolve runs focused tests for every Cargo package containing changed Rust files and will ask you to repair any failures before the branch is handed to fork-checks. Resolve the conflict, stage it, and stop.
 
+    Only after every conflict has been resolved with confidence, staged, and checked, write exactly 'resolved' followed by a newline to $DECISION_FILE. If any part is ambiguous, do not write 'resolved'; write 'needs-human' to that file and explain the ambiguity in your final summary. The script refuses to continue without this decision.
+
     Final summary must list: each file, what each side changed, and how you reconciled it."; then
             git rebase --abort
             echo "error: opencode run failed -- replay aborted." >&2
+            exit 1
+        fi
+        if [ ! -f "$DECISION_FILE" ] || [ "$(cat "$DECISION_FILE")" != "resolved" ]; then
+            echo "error: conflict resolution requires a human decision (commit $STOP_SHA; files: $CONFLICTS) -- replay aborted." >&2
+            git rebase --abort
             exit 1
         fi
         if [ -n "$(git diff --name-only --diff-filter=U || true)" ]; then
@@ -238,12 +257,12 @@ if [ "$REPLAY_ONLY" = false ]; then
             echo "Re-run with --no-ai and resolve manually." >&2
             exit 1
         fi
-        if ! git diff --check; then
+        if ! git diff --check || ! git diff --cached --check; then
             git rebase --abort
             echo "error: whitespace/marker issues after opencode -- replay aborted." >&2
             exit 1
         fi
-        if ! git rebase --continue; then
+        if ! git -c rerere.enabled=false rebase --continue; then
             if ! rebase_in_progress; then
                 # The replay finished: `git rebase --continue` returns non-zero
                 # when it cannot open the commit message editor.
@@ -297,6 +316,8 @@ for attempt in $(seq 1 "$BUILD_ATTEMPTS"); do
     fi
     echo "the build is broken:"
     echo "$ERRORS"
+    DECISION_FILE="$REPO_ROOT/target/fork-resolve-decision.txt"
+    rm -f "$DECISION_FILE"
     if ! opencode run -m "$MODEL" --variant "$VARIANT" "The replay onto the new upstream base is done, but the fork's code no longer compiles cleanly. Upstream renamed or removed APIs that this fork still uses, and CI denies warnings.
 
 Fix every error reported by the build. The errors are:
@@ -315,12 +336,12 @@ So, instead of committing on top:
 2. Find the commit that owns the code you changed. 'git log --format='%H %s' $ONTO..HEAD -- <file>' lists the commits that touched it; 'git blame <file>' on the lines you had to change (before your edit) names the commit that introduced them. That commit is the feature the fix belongs to.
 3. Fold the fix into it:
        git commit --fixup=<owner-sha>
-       GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash $ONTO
+       GIT_SEQUENCE_EDITOR=true git -c rerere.enabled=false rebase -i --autosquash $ONTO
    The autosquash rebase folds the fixup commit into the commit that owns the code, leaving the same number of commits and the same final tree.
 4. If that rebase conflicts, resolve it by hand: the conflict is between the feature's original code and the upstream change; keep the feature's intent adapted to the new base, and make sure the tree at the end is exactly what you had before the fold. Then run 'git rebase --continue'.
 5. When you are done, the branch must have the same number of commits as before your work and a clean working tree, and clippy must be clean.
 
-Do not stop until clippy is clean and the fix is folded into the commit that owns the code. If a tool call is rejected (for example reading a path outside the project), work around it and carry on -- do not give up.
+If you cannot establish with confidence that the fix and any autosquash conflict preserve feature intent and upstream behavior, stop without guessing, write 'needs-human' to $DECISION_FILE, and explain the uncertainty. Otherwise, only after the fix is clean and folded in, write exactly 'resolved' to $DECISION_FILE. The script refuses to continue without this decision. If a tool call is rejected (for example reading a path outside the project), work around it and carry on.
 
 Final summary must list: each file, what broke, how you fixed it, and which commit you folded the fix into."; then
         echo "error: opencode could not repair the build -- aborting." >&2
@@ -331,6 +352,10 @@ Final summary must list: each file, what broke, how you fixed it, and which comm
     # a caller may have put the resolver itself there.
     if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
         echo "error: opencode left the working tree dirty -- aborting." >&2
+        exit 1
+    fi
+    if [ ! -f "$DECISION_FILE" ] || [ "$(cat "$DECISION_FILE")" != "resolved" ]; then
+        echo "error: build repair requires a human decision -- aborting." >&2
         exit 1
     fi
     # The branch is a linear sequence of feature commits, so a repair that
@@ -451,6 +476,8 @@ EOF
         if [ "$attempt" -eq "$TEST_ATTEMPTS" ]; then
             break
         fi
+        DECISION_FILE="$REPO_ROOT/target/fork-resolve-decision.txt"
+        rm -f "$DECISION_FILE"
         if ! opencode run -m "$MODEL" --variant "$VARIANT" "The full rebase onto '$ONTO' is complete, but focused tests for the changed Rust packages failed. Fix the regression before handing this branch to the full fork-checks gate.
 
 The affected packages and exact test command are:
@@ -462,12 +489,18 @@ $TEST_FAILURES
 
 Read the full test log at $TEST_LOG and inspect the changed Rust files. Classify failures first: deterministic assertion failures usually indicate a regression in the rebased code; shell-startup output failures may be an environment mismatch, so compare the setup with fork-checks before changing product behavior; reproduce timeouts before changing behavior. Reproduce the failures with the exact focused test command, fix the underlying behavior, and rerun it until all selected tests pass. Do not delete or skip tests, weaken assertions, or add retries beyond the single CI retry already configured. Do not inspect system files or paths outside the checkout, launch tests in the background, or leave temporary debug edits in the final diff; the workflow configures the test environment and the full log is inside the checkout. This is a non-interactive run: do not use commands that request confirmation or require a terminal prompt, including 'git add -p'; use checkout-local scratch files under target/, and if a tool call is rejected, replace it with a checkout-local, non-interactive command. Follow AGENTS.md and keep the fork feature intent intact.
 
-Fold every code fix into the existing commit that owns the affected code; do not add commits. Stage your changes, use git log/git blame to find the owning commit, create a fixup commit, and autosquash it with 'GIT_SEQUENCE_EDITOR=true git rebase -i --autosquash $ONTO'. Resolve any autosquash conflict by hand. Finish with the same number of commits as before the repair, a clean tracked working tree, and 'git diff --check' clean."; then
+Fold every code fix into the existing commit that owns the affected code; do not add commits. Stage your changes, use git log/git blame to find the owning commit, create a fixup commit, and autosquash it with 'GIT_SEQUENCE_EDITOR=true git -c rerere.enabled=false rebase -i --autosquash $ONTO'. Resolve any autosquash conflict by hand. Finish with the same number of commits as before the repair, a clean tracked working tree, and 'git diff --check' clean.
+
+If you cannot establish with confidence that the fix and any autosquash conflict preserve feature intent and upstream behavior, stop without guessing, write 'needs-human' to $DECISION_FILE, and explain the uncertainty. Otherwise, only after the fix is clean and folded in, write exactly 'resolved' to $DECISION_FILE. The script refuses to continue without this decision."; then
             echo "error: opencode could not repair the focused test failures" >&2
             exit 1
         fi
         if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
             echo "error: opencode left the working tree dirty after test repair" >&2
+            exit 1
+        fi
+        if [ ! -f "$DECISION_FILE" ] || [ "$(cat "$DECISION_FILE")" != "resolved" ]; then
+            echo "error: focused test repair requires a human decision -- aborting." >&2
             exit 1
         fi
         COMMITS_NOW=$(git rev-list --count "$ONTO"..HEAD)
