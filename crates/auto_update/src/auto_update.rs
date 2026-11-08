@@ -1454,7 +1454,7 @@ mod tests {
         cx.background_executor.allow_parking();
         let file_name =
             endo::releases::asset_file_name("zed", OS, ARCH).expect("supported test platform");
-        let download_path = format!("/somtooo/zed/releases/download/fork-v99.0.0/{file_name}");
+        let download_path = format!("/somtooo/Endo/releases/download/fork-v99.0.0/{file_name}");
         let listing = serde_json::json!([{
             "tag_name": "fork-v99.0.0", "draft": false, "prerelease": false,
             "assets": [{"name": file_name, "browser_download_url": format!("https://github.com{download_path}")}]
@@ -1464,8 +1464,8 @@ mod tests {
             let download_path = download_path.clone();
             async move {
                 let body = match request.uri().path() {
-                    "/repos/somtooo/zed/releases" => listing,
-                    "/repos/somtooo/zed/commits/fork-v99.0.0" => r#"{"sha":"cafe"}"#.into(),
+                    "/repos/somtooo/Endo/releases" => listing,
+                    "/repos/somtooo/Endo/commits/fork-v99.0.0" => r#"{"sha":"cafe"}"#.into(),
                     path if path == download_path => "<endo-update>".into(),
                     path => anyhow::bail!("unexpected update endpoint: {path}"),
                 };
