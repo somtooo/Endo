@@ -59,6 +59,8 @@
     .doc .hash { color: var(--dim); }
     .doc strong { color: var(--amber); font-weight: 500; }
     .doc .comment { color: var(--muted); font-style: italic; }
+    .doc em { color: var(--text); font-style: italic; }
+    .doc code { color: var(--amber); background: var(--panel-2); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-size: 0.92em; }
     .doc .quote { color: var(--muted); }
     .doc .quote .gt { color: var(--dim); }
     .doc .li .n { color: var(--dim); }
@@ -136,14 +138,14 @@
         <article class="doc" id="doc-why">
           <h1><span class="hash"># </span>Why Endo</h1>
           <div class="gap"></div>
-          <p>The UX of most new agentic development environments encourages offloading your thinking to Opus (they have to; it means more profit), and this is not a bad thing. It's truly amazing that Opus can go from a single prompt to production, and the productivity unlock is huge, but unfortunately you're not achieving any form of domain expertise without exercising the LLM in your head.</p>
+          <p class="quote"><span class="gt">&gt; </span>Endo is an experiment for the balanced: the people who believe AI is a game changer but know that to do game-changing things with it, they <strong>cannot outsource their understanding</strong>.</p>
           <div class="gap"></div>
-          <p>The IDE, in the abstract, was not just a place to write code. You could read code, inspect memory, read PDFs, write a blog post. It was your gym, where you could train the LLM in your head, and there's no reason the equipment in that gym can't be replaced with AI-powered versions.</p>
+          <p>The UX of most new agentic development environments encourages offloading your thinking to Opus (they have to; it means more profit), and that's not a bad thing: Opus can go from a single prompt to production. But you're not achieving any form of domain expertise without exercising the LLM in your head, and that's what the IDE was for. It was never just a place to write code; <strong>it was your gym</strong>, where you could read code, inspect memory, read PDFs, write a blog post. There's no reason the equipment in that gym can't be replaced with AI-powered versions: highlight the part of the <em>Raft paper</em> you don't get and ask Opus to explain it, or stop at a breakpoint and ask Opus why your struct with a <code>u64</code> and a <code>u8</code> takes 16 bytes instead of 9.</p>
           <div class="gap"></div>
-          <p>Endo is an experiment for the balanced: the people who believe this technology is a game changer but know that to do game-changing things with it, they <strong>cannot outsource their understanding</strong>. It starts with a traditional IDE and sees how far we can push it toward the extreme without sacrificing the benefits the traditional IDE gave us: a place to practice, to learn, to attain domain expertise.</p>
+          <p>So Endo starts with a traditional IDE and sees how far we can push it toward the extreme without sacrificing the benefits the traditional IDE gave us: <em>a place to practice, to learn, to attain domain expertise.</em></p>
           <div class="gap"></div>
-          <p class="li"><span class="n">- </span>If the day calls for full vibe coding, no problem, Endo's got you.</p>
-          <p class="li"><span class="n">- </span>If it calls for digging in, sweating and pushing the LLM in your head, Endo's got you too, and you won't be alone: Opus is a great workout partner.</p>
+          <p class="li"><span class="n">- </span>If the day calls for full vibe coding, no problem, <strong>Endo's got you.</strong></p>
+          <p class="li"><span class="n">- </span>If it calls for digging in, sweating and pushing the LLM in your head, <strong>Endo's got you too</strong>, and you won't be alone: Opus is a great workout partner.</p>
           <div class="gap"></div>
           <p class="comment">// see <a href="https://x.com/karpathy/status/1756380066580455557">this post by Andrej Karpathy</a></p>
           <div class="gap"></div>
