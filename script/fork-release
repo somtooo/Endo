@@ -3,10 +3,10 @@
 #
 # Model: the release branch is the upstream stable tag with the fork's own
 # commits replayed onto it:
-#   release/fork-vX.Y.Z = <upstream tag> + <the fork's commits from develop>
+#   release/fork-vX.Y.Z = <upstream tag> + <the fork's commits from main>
 #
-# The fork's commits are the ones develop has gained since it forked from
-# upstream, so a release needs no list of commits: whatever is on develop is
+# The fork's commits are the ones main has gained since it forked from
+# upstream, so a release needs no list of commits: whatever is on main is
 # what ships. The release branch is rebuilt from the tag every time, so it
 # carries the current state of the fork's features, not the state they had
 # when they were last released.
@@ -27,7 +27,7 @@
 # Nothing here publishes anything.
 #
 # Conflicts: the replay can conflict when the release base is older than
-# develop. script/fork-resolve resolves them with opencode (same model and
+# main. script/fork-resolve resolves them with opencode (same model and
 # variant defaults as script/fork-sync); use --no-ai to abort for manual
 # resolution instead. CI never auto-resolves: the workflow only releases
 # green, conflict-free branches.
@@ -51,7 +51,7 @@
 #   --variant <v>         model reasoning variant (default: xhigh)
 #   <tag>                 release tag (default: fork-<upstream-tag>[.N])
 #
-# Run from develop with a clean tree. Then dispatch the fork-release workflow
+# Run from main with a clean tree. Then dispatch the fork-release workflow
 # with the release branch, or let the workflow build the branch itself by
 # dispatching it without a branch.
 
@@ -138,8 +138,8 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
 fi
 
 BRANCH=$(git branch --show-current)
-if [ "$BRANCH" != "develop" ]; then
-    echo "error: run from develop (currently on '$BRANCH')" >&2
+if [ "$BRANCH" != "main" ]; then
+    echo "error: run from main (currently on '$BRANCH')" >&2
     exit 1
 fi
 
@@ -175,30 +175,30 @@ if ! git rev-parse --verify --quiet "refs/tags/$UPSTREAM_TAG" >/dev/null; then
     exit 1
 fi
 
-# The fork's commits are the ones develop has gained since it forked from
+# The fork's commits are the ones main has gained since it forked from
 # upstream. The fork point is the merge base rather than upstream/main's tip
-# because upstream/main moves: the tip can drift ahead of develop and widen
+# because upstream/main moves: the tip can drift ahead of main and widen
 # the range with upstream's own commits.
-FORK_POINT=$(git merge-base develop upstream/main)
+FORK_POINT=$(git merge-base main upstream/main)
 if [ -z "$FORK_POINT" ]; then
-    echo "error: develop and upstream/main have no common ancestor" >&2
+    echo "error: main and upstream/main have no common ancestor" >&2
     exit 1
 fi
 
 PICKS=()
 while IFS= read -r sha; do
     [ -n "$sha" ] && PICKS+=("$sha")
-done < <(git rev-list --reverse "$FORK_POINT"..develop)
+done < <(git rev-list --reverse "$FORK_POINT"..main)
 
 if [ "${#PICKS[@]}" -eq 0 ]; then
-    echo "error: develop has no commits of its own -- nothing to release" >&2
+    echo "error: main has no commits of its own -- nothing to release" >&2
     exit 1
 fi
 
 # A merge commit cannot be replayed with git rebase --onto, and this flow
 # has no way to ask which parent to use.
-if [ -n "$(git rev-list --merges "$FORK_POINT"..develop || true)" ]; then
-    echo "error: develop contains merge commits -- the fork's history must be linear" >&2
+if [ -n "$(git rev-list --merges "$FORK_POINT"..main || true)" ]; then
+    echo "error: main contains merge commits -- the fork's history must be linear" >&2
     exit 1
 fi
 
@@ -230,7 +230,7 @@ RELEASE_BRANCH="release/$TAG"
 echo "Upstream tag:      $UPSTREAM_TAG ($(git rev-parse --short "$UPSTREAM_TAG"))"
 echo "Release branch:    $RELEASE_BRANCH"
 echo "Release tag:       $TAG (created by the workflow, not here)"
-echo "Fork point:        $(git rev-parse --short "$FORK_POINT") (develop forked from upstream here)"
+echo "Fork point:        $(git rev-parse --short "$FORK_POINT") (main forked from upstream here)"
 echo "Picks (the fork's commits, oldest first):"
 for pick in "${PICKS[@]}"; do
     echo "  $(git rev-parse --short "$pick") $(git log -1 --format=%s "$pick")"
@@ -253,10 +253,10 @@ fi
 
 restore_on_failure() {
     git rebase --abort >/dev/null 2>&1 || true
-    git checkout develop >/dev/null 2>&1 || true
+    git checkout main >/dev/null 2>&1 || true
     if [ -n "$PRIOR_SHA" ]; then
         git checkout -B "$RELEASE_BRANCH" "$PRIOR_SHA" >/dev/null 2>&1 || true
-        git checkout develop >/dev/null 2>&1 || true
+        git checkout main >/dev/null 2>&1 || true
     else
         git branch -D "$RELEASE_BRANCH" >/dev/null 2>&1 || true
     fi
@@ -265,8 +265,8 @@ restore_on_failure() {
 # The release branch is rebuilt from the tag every time: the fork's commits
 # are replayed onto it, so the branch carries the fork's current features
 # rather than the adaptations the last release was built from. Starting from
-# develop and replaying onto the tag is what script/fork-resolve does.
-git checkout -B "$RELEASE_BRANCH" develop
+# main and replaying onto the tag is what script/fork-resolve does.
+git checkout -B "$RELEASE_BRANCH" main
 
 RESOLVE_ARGS=(--onto "$UPSTREAM_TAG" --upstream-point "$FORK_POINT" --model "$MODEL" --variant "$VARIANT")
 # Older release tags can compile while still breaking fork behavior; check the
@@ -294,13 +294,13 @@ if [ "$PUSH" = false ]; then
     echo "Release branch built: $RELEASE_BRANCH (not pushed)"
     echo "To publish it:"
     echo "  git push -u origin $RELEASE_BRANCH"
-    echo "  gh workflow run fork-release.yml --repo somtooo/Endo --ref develop -f branch=$RELEASE_BRANCH"
+    echo "  gh workflow run fork-release.yml --repo somtooo/Endo --ref main -f branch=$RELEASE_BRANCH"
     exit 0
 fi
 
-git checkout develop >/dev/null 2>&1 || true
+git checkout main >/dev/null 2>&1 || true
 git push -u origin "$RELEASE_BRANCH"
 
 echo "Release branch ready: $RELEASE_BRANCH"
 echo "Pushing it started fork-checks on the branch. When it is green:"
-echo "  gh workflow run fork-release.yml --repo somtooo/Endo --ref develop -f branch=$RELEASE_BRANCH"
+echo "  gh workflow run fork-release.yml --repo somtooo/Endo --ref main -f branch=$RELEASE_BRANCH"
