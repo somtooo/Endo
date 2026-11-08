@@ -187,11 +187,15 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # The image needs cmake for the WebRTC build and ripgrep for the
-          # conflict resolver's repository searches.
-          if ! command -v cmake >/dev/null 2>&1 || ! command -v rg >/dev/null 2>&1; then
-            sudo apt-get update -qq && sudo apt-get install -y -qq cmake ripgrep
+          if ! command -v cmake >/dev/null 2>&1 \
+            || ! command -v jq >/dev/null 2>&1 \
+            || ! command -v rg >/dev/null 2>&1 \
+            || ! command -v xvfb-run >/dev/null 2>&1 \
+            || ! dpkg-query -W cmake jq ripgrep xvfb libgl1-mesa-dri mesa-vulkan-drivers >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq cmake jq ripgrep xvfb libgl1-mesa-dri mesa-vulkan-drivers
           fi
+          sudo sed -i '/^# sudo hint/,/^fi$/d' /etc/bash.bashrc
 
           rm -rf "$WORK_DIR"
           git clone "$REPO_URL" "$WORK_DIR"
@@ -241,7 +245,8 @@ jobs:
             # The build check after the replay needs the same toolchain the
             # checks use. The resolver also uses ripgrep to inspect conflicts.
             ./script/linux
-            sudo apt-get install -y ripgrep
+            sudo apt-get install -y cmake jq ripgrep xvfb libgl1-mesa-dri mesa-vulkan-drivers
+            sudo sed -i '/^# sudo hint/,/^fi$/d' /etc/bash.bashrc
             ./script/download-wasi-sdk
             bash /tmp/fork-release --no-push --model "${{ env.OPENCODE_MODEL_FALLBACK }}"
             git bundle create /tmp/release.bundle "$(git rev-parse --abbrev-ref HEAD)"

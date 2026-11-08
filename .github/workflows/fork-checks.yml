@@ -48,6 +48,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Test fork automation
+        run: python3 script/test-fork-resolve
+
       - name: Free disk space and quiet the sudo hint
         run: |
           # Full-workspace debug builds (webrtc et al.) need disk: ditch the
