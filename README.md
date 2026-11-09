@@ -16,7 +16,7 @@
 
 ## Why Endo
 
-> Endo is an experiment for the balanced: the people who believe AI is a game changer but know that to do game-changing things with it, they **cannot outsource their understanding**.
+Endo is an experiment for the balanced: the people who believe AI is a game changer but know that to do game-changing things with it, they **cannot outsource their understanding**.
 
 The UX of most new agentic development environments encourages offloading your thinking to Opus (they have to; it means more profit), and that's not a bad thing: Opus can go from a single prompt to production. But you're not achieving any form of domain expertise without exercising the LLM in your head, and that's what the IDE was for. It was never just a place to write code; **it was your gym**, where you could read code, inspect memory, read PDFs, write a blog post. There's no reason the equipment in that gym can't be replaced with AI-powered versions: highlight the part of the *Raft paper* you don't get and ask Opus to explain it, or stop at a breakpoint and ask Opus why your struct with a `u64` and a `u8` takes 16 bytes instead of 9.
 
