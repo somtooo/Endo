@@ -67,7 +67,8 @@ use workspace::{
     CloseWindow, FocusWorkspaceSidebar, MoveProjectDown, MoveProjectUp, MultiWorkspace,
     MultiWorkspaceEvent, NextProject, NextThread, Open, OpenMode, PreviousProject, PreviousThread,
     ProjectGroupKey, RemovalIntent, SaveIntent, Sidebar as WorkspaceSidebar, SidebarSide, Toast,
-    ToggleWorkspaceSidebar, Workspace, notifications::NotificationId, sidebar_side_context_menu,
+    ToggleWorkspaceSidebar, Workspace, floating_panes, notifications::NotificationId,
+    sidebar_side_context_menu,
 };
 
 use git_ui_core::worktree_service::{RemoteBranchName, worktree_create_targets};
@@ -2251,6 +2252,10 @@ impl Sidebar {
 
         let is_group_header_after_first =
             ix > 0 && matches!(entry, ListEntry::ProjectHeader { .. });
+        // A row that runs into the rounded edge of a floating surface looks
+        // cut off, so it becomes a rounded row inside of it.
+        let is_inset_row = floating_panes::enabled(cx)
+            && matches!(entry, ListEntry::Thread(_) | ListEntry::Terminal(_));
 
         let is_active = self
             .active_entry
@@ -2298,10 +2303,18 @@ impl Sidebar {
         if is_group_header_after_first {
             v_flex()
                 .w_full()
-                .border_t_1()
+                .map(|this| {
+                    if floating_panes::enabled(cx) {
+                        this.pt_1()
+                    } else {
+                        this.border_t_1()
+                    }
+                })
                 .border_color(cx.theme().colors().border)
                 .child(rendered)
                 .into_any_element()
+        } else if is_inset_row {
+            div().w_full().px_1().child(rendered).into_any_element()
         } else {
             rendered
         }
@@ -2365,11 +2378,11 @@ impl Sidebar {
         let key_for_focus = key.clone();
 
         let color = cx.theme().colors();
-        let sidebar_base_bg = if is_sticky {
+        let sidebar_base_bg = floating_background(is_sticky, cx).unwrap_or(if is_sticky {
             color.panel_background_for_overlay()
         } else {
             color.panel_background
-        };
+        });
 
         // The fade gradient renders as a visible patch on transparent windows,
         // so truncate the label instead.
@@ -3307,7 +3320,8 @@ impl Sidebar {
             .unwrap_or(px(0.));
 
         let color = cx.theme().colors();
-        let background = color.panel_background_for_overlay();
+        let background =
+            floating_background(true, cx).unwrap_or_else(|| color.panel_background_for_overlay());
 
         let element = v_flex()
             .absolute()
@@ -6299,7 +6313,7 @@ impl Sidebar {
         let id = SharedString::from(format!("thread-entry-{}", ix));
 
         let color = cx.theme().colors();
-        let sidebar_bg = color.panel_background;
+        let sidebar_bg = floating_background(false, cx).unwrap_or(color.panel_background);
         let button_hover_bg = color.element_background;
         let button_active_bg = color.element_active;
 
@@ -6329,6 +6343,7 @@ impl Sidebar {
 
         let thread_item = ThreadItem::new(id, title.clone())
             .base_bg(sidebar_bg)
+            .rounded(floating_panes::enabled(cx))
             .icon(icon)
             .when(is_draft, |this| {
                 this.icon_color(Color::Custom(cx.theme().colors().icon_muted.opacity(0.2)))
@@ -6634,7 +6649,7 @@ impl Sidebar {
         let timestamp = format_history_entry_timestamp(terminal.metadata.created_at);
         let is_hovered = self.hovered_thread_index == Some(ix);
         let color = cx.theme().colors();
-        let sidebar_bg = color.panel_background;
+        let sidebar_bg = floating_background(false, cx).unwrap_or(color.panel_background);
         let button_hover_bg = color.element_background;
         let button_active_bg = color.element_active;
         let metadata = terminal.metadata.clone();
@@ -6658,6 +6673,7 @@ impl Sidebar {
 
         let terminal_item = ThreadItem::new(id, title)
             .base_bg(sidebar_bg)
+            .rounded(floating_panes::enabled(cx))
             .icon(IconName::Terminal)
             .when_some(icon_char, |this, icon_char| this.icon_char(icon_char))
             .is_remote(is_remote)
@@ -7436,7 +7452,7 @@ impl Sidebar {
             .when(!right_window_controls, |this| this.pr_1p5())
             .gap_1()
             .when(!no_open_projects, |this| {
-                this.border_b_1()
+                this.when(!floating_panes::enabled(cx), |this| this.border_b_1())
                     .border_color(cx.theme().colors().border)
                     .when(traffic_lights, |this| {
                         this.child(Divider::vertical().color(ui::DividerColor::Border))
@@ -7557,7 +7573,7 @@ impl Sidebar {
             .p_1()
             .gap_1()
             .when(on_right, |this| this.flex_row_reverse())
-            .border_t_1()
+            .when(!floating_panes::enabled(cx), |this| this.border_t_1())
             .border_color(cx.theme().colors().border)
             .child(self.render_sidebar_toggle_button(cx))
             .child(
@@ -7976,6 +7992,19 @@ impl Focusable for Sidebar {
     }
 }
 
+/// While panes float, the sidebar does not. It is part of what they float on
+/// and takes its color. Rows scroll underneath an overlay, so that one must
+/// not let anything show through.
+fn floating_background(is_overlay: bool, cx: &App) -> Option<gpui::Hsla> {
+    floating_panes::enabled(cx).then(|| {
+        let mut background = floating_panes::gap_color(cx);
+        if is_overlay {
+            background.a = 1.;
+        }
+        background
+    })
+}
+
 impl Render for Sidebar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let _titlebar_height = ui::utils::platform_title_bar_height(window);
@@ -7983,7 +8012,8 @@ impl Render for Sidebar {
         let sticky_header = self.render_sticky_header(window, cx);
 
         let color = cx.theme().colors();
-        let bg = color.background.blend(color.panel_background);
+        let bg = floating_background(false, cx)
+            .unwrap_or_else(|| color.background.blend(color.panel_background));
 
         let no_open_projects = !self.contents.has_open_projects;
         let no_search_results = self.contents.entries.is_empty();
@@ -8063,8 +8093,20 @@ impl Render for Sidebar {
                 }
             })
             .bg(bg)
-            .when(self.side(cx) == SidebarSide::Left, |el| el.border_r_1())
-            .when(self.side(cx) == SidebarSide::Right, |el| el.border_l_1())
+            .map(|el| {
+                let on_left = self.side(cx) == SidebarSide::Left;
+                if floating_panes::enabled(cx) {
+                    // The workspace keeps the other half of the gap free on
+                    // the side that faces it.
+                    let inset = floating_panes::GAP / 2.;
+                    el.py(inset)
+                        .when(on_left, |el| el.pl(inset))
+                        .when(!on_left, |el| el.pr(inset))
+                } else {
+                    el.when(on_left, |el| el.border_r_1())
+                        .when(!on_left, |el| el.border_l_1())
+                }
+            })
             .border_color(color.border)
             .map(|this| match &self.view {
                 SidebarView::ThreadList => this

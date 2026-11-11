@@ -72,6 +72,16 @@ Non-negative `float` values
 
 `boolean` values
 
+## Floating Panes {#floating-panes}
+
+- Description: Render the docks and the editor area as separate floating surfaces with rounded corners, a gap between them, and a soft shadow. The title bar and the status bar are hidden until `workspace::ToggleBars` shows them.
+- Setting: `floating_panes`
+- Default: `false`
+
+**Options**
+
+`boolean` values
+
 ## Bottom Dock Layout
 
 - Description: Control the layout of the bottom dock, relative to the left and right docks.

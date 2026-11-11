@@ -143,6 +143,13 @@ pub struct WorkspaceSettingsContent {
     ///
     /// Default: true
     pub zoomed_padding: Option<bool>,
+    /// Whether to render the docks and the editor area as separate floating
+    /// surfaces with rounded corners, a gap between them, and a soft shadow.
+    /// The title bar and the status bar are hidden until
+    /// `workspace::ToggleBars` shows them.
+    ///
+    /// Default: false
+    pub floating_panes: Option<bool>,
     /// Whether invoking a panel's `ToggleFocus` action while the panel is
     /// already focused closes the panel, instead of just moving focus back
     /// to the editor. This only applies to a panel's focus-toggle action, not

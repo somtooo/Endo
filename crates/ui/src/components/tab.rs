@@ -7,6 +7,9 @@ use crate::prelude::*;
 
 const START_TAB_SLOT_SIZE: Pixels = px(12.);
 const END_TAB_SLOT_SIZE: Pixels = px(14.);
+const PILL_GAP: Pixels = px(4.);
+const PILL_INSET: Pixels = px(4.);
+const PILL_RADIUS: Pixels = px(6.);
 
 /// The position of a [`Tab`] within a list of tabs.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -35,6 +38,7 @@ pub struct Tab {
     selected: bool,
     position: TabPosition,
     close_side: TabCloseSide,
+    pill: bool,
     start_slot: Option<AnyElement>,
     end_slot: Option<AnyElement>,
     children: SmallVec<[AnyElement; 2]>,
@@ -50,6 +54,7 @@ impl Tab {
             selected: false,
             position: TabPosition::First,
             close_side: TabCloseSide::End,
+            pill: false,
             start_slot: None,
             end_slot: None,
             children: SmallVec::new(),
@@ -63,6 +68,14 @@ impl Tab {
 
     pub fn close_side(mut self, close_side: TabCloseSide) -> Self {
         self.close_side = close_side;
+        self
+    }
+
+    /// Renders the tab as a rounded pill inside the tab bar instead of a tab
+    /// that is attached to the content below it. Use it together with
+    /// [`TabBar::pills`](crate::TabBar::pills).
+    pub fn pill(mut self, pill: bool) -> Self {
+        self.pill = pill;
         self
     }
 
@@ -140,6 +153,38 @@ impl RenderOnce for Tab {
                 TabCloseSide::Start => (end_slot, start_slot),
             }
         };
+
+        if self.pill {
+            return self
+                .div
+                .h(Tab::container_height(cx))
+                .flex()
+                .items_center()
+                .pl(PILL_GAP)
+                .cursor_pointer()
+                .child(
+                    h_flex()
+                        .group("")
+                        .relative()
+                        .h(Tab::container_height(cx) - PILL_INSET * 2.)
+                        .rounded(PILL_RADIUS)
+                        .map(|this| {
+                            if self.selected {
+                                this.bg(cx.theme().colors().ghost_element_selected)
+                            } else {
+                                this.hover(|style| {
+                                    style.bg(cx.theme().colors().ghost_element_hover)
+                                })
+                            }
+                        })
+                        .px(DynamicSpacing::Base06.px(cx))
+                        .gap(DynamicSpacing::Base04.rems(cx))
+                        .text_color(text_color)
+                        .child(start_slot)
+                        .children(self.children)
+                        .child(end_slot),
+                );
+        }
 
         self.div
             .h(Tab::container_height(cx))

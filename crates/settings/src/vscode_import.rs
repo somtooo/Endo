@@ -1122,6 +1122,7 @@ impl VsCodeSettings {
                 }
             }),
             zoomed_padding: None,
+            floating_panes: None,
             focus_follows_mouse: None,
         }
     }

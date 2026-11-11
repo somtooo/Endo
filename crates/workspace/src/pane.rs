@@ -1,7 +1,7 @@
 use crate::{
     CloseWindow, NewCenterTerminal, NewFile, NewTerminal, OpenInTerminal, OpenOptions,
     OpenTerminal, OpenVisible, SplitDirection, ToggleFileFinder, ToggleProjectSymbols, ToggleZoom,
-    Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut,
+    Workspace, WorkspaceItemBuilder, ZoomIn, ZoomOut, floating_panes,
     focus_follows_mouse::FocusFollowsMouse as _,
     invalid_item_view::InvalidItemView,
     item::{
@@ -2943,6 +2943,7 @@ impl Pane {
         let capability = item.capability(cx);
         let can_toggle_read_only = item.read_only_toggle_buffer(cx).is_some();
         let tab = Tab::new(ix)
+            .pill(floating_panes::enabled(cx))
             .position(if is_first_item {
                 TabPosition::First
             } else if is_last_item {
@@ -3647,7 +3648,7 @@ impl Pane {
     ) -> AnyElement {
         let tab_bar = self
             .configure_tab_bar_start(
-                TabBar::new("tab_bar"),
+                TabBar::new("tab_bar").pills(floating_panes::enabled(cx)),
                 navigate_backward,
                 navigate_forward,
                 window,
@@ -3685,7 +3686,7 @@ impl Pane {
     ) -> AnyElement {
         let pinned_tab_bar = self
             .configure_tab_bar_start(
-                TabBar::new("pinned_tab_bar"),
+                TabBar::new("pinned_tab_bar").pills(floating_panes::enabled(cx)),
                 navigate_backward,
                 navigate_forward,
                 window,
@@ -3705,11 +3706,9 @@ impl Pane {
             .flex_none()
             .child(pinned_tab_bar)
             .child(
-                TabBar::new("unpinned_tab_bar").child(self.render_unpinned_tabs_container(
-                    unpinned_tabs,
-                    tab_count,
-                    cx,
-                )),
+                TabBar::new("unpinned_tab_bar")
+                    .pills(floating_panes::enabled(cx))
+                    .child(self.render_unpinned_tabs_container(unpinned_tabs, tab_count, cx)),
             )
             .into_any_element()
     }

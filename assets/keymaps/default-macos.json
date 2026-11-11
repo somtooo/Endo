@@ -780,6 +780,7 @@
       "cmd-alt-j": "multi_workspace::ToggleWorkspaceSidebar",
       "cmd-alt-;": "multi_workspace::FocusWorkspaceSidebar",
       "alt-cmd-y": "workspace::ToggleAllDocks",
+      "alt-cmd-u": "workspace::ToggleBars",
       // For 0px parameter, uses UI font size value.
       "ctrl-alt-0": "workspace::ResetActiveDockSize",
       "ctrl-alt--": ["workspace::DecreaseActiveDockSize", { "px": 0 }],

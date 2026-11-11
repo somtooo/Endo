@@ -19,6 +19,7 @@ pub mod searchable;
 pub mod security_modal;
 pub mod shared_screen;
 pub use shared_screen::SharedScreen;
+pub mod floating_panes;
 pub mod focus_follows_mouse;
 mod status_bar;
 pub mod tasks;
@@ -417,6 +418,9 @@ actions!(
         CloseAllDocks,
         /// Toggles all docks.
         ToggleAllDocks,
+        /// Toggles the title bar and the status bar, which are hidden while
+        /// panes float.
+        ToggleBars,
         /// Closes the current window.
         CloseWindow,
         /// Closes the current project.
@@ -1671,6 +1675,7 @@ pub struct Workspace {
     pub(crate) modal_layer: Entity<ModalLayer>,
     toast_layer: Entity<ToastLayer>,
     titlebar_item: Option<AnyView>,
+    bars_revealed: bool,
     titlebar_focus_handle: FocusHandle,
     region_focus_handles: RegionFocusHandles,
     notifications: Notifications,
@@ -2177,6 +2182,7 @@ impl Workspace {
             modal_layer,
             toast_layer,
             titlebar_item: None,
+            bars_revealed: false,
             titlebar_focus_handle: cx.focus_handle(),
             region_focus_handles: RegionFocusHandles::new(cx),
             notifications: Notifications::default(),
@@ -2976,7 +2982,20 @@ impl Workspace {
     }
 
     pub fn status_bar_visible(&self, cx: &App) -> bool {
-        StatusBarSettings::get_global(cx).show
+        StatusBarSettings::get_global(cx).show && self.bars_visible(cx)
+    }
+
+    /// Floating panes fill the window, the bars around them only show on
+    /// request.
+    fn bars_visible(&self, cx: &App) -> bool {
+        self.bars_revealed || !floating_panes::enabled(cx)
+    }
+
+    fn toggle_bars(&mut self, _: &ToggleBars, _: &mut Window, cx: &mut Context<Self>) {
+        if floating_panes::enabled(cx) {
+            self.bars_revealed = !self.bars_revealed;
+            cx.notify();
+        }
     }
 
     pub fn multi_workspace(&self) -> Option<&WeakEntity<MultiWorkspace>> {
@@ -8566,6 +8585,7 @@ impl Workspace {
                 }),
             )
             .on_action(cx.listener(Self::toggle_all_docks))
+            .on_action(cx.listener(Self::toggle_bars))
             .on_action(cx.listener(
                 |workspace: &mut Workspace, _: &ClearAllNotifications, _, cx| {
                     workspace.clear_all_notifications(cx);
@@ -9024,6 +9044,13 @@ impl Workspace {
             .flex()
             .overflow_hidden()
             .flex_none()
+            .when(
+                floating_panes::enabled(cx) && dock.read(cx).visible_panel().is_some(),
+                |this| {
+                    this.relative()
+                        .child(floating_panes::backdrop(floating_panes::margin(), cx))
+                },
+            )
             .child(dock.clone())
             .children(leader_border);
 
@@ -9032,6 +9059,10 @@ impl Workspace {
         // this, toggle_panel_focus cannot focus the panel when the dock is closed.
         let dock = dock.read(cx);
         if let Some(panel) = dock.visible_panel() {
+            if floating_panes::enabled(cx) {
+                container = floating_panes::outset(container)
+                    .child(floating_panes::frame(floating_panes::margin(), cx));
+            }
             let size_state = dock.stored_panel_size_state(panel.as_ref());
             let min_size = panel.min_size(window, cx);
             if position.axis() == Axis::Horizontal {
@@ -9098,7 +9129,7 @@ impl Workspace {
         };
 
         let mut parts = Vec::new();
-        if self.titlebar_item.is_some() {
+        if self.titlebar_item.is_some() && self.bars_visible(cx) {
             // The title bar is an ARIA toolbar, so region navigation lands on
             // its first control rather than the toolbar container.
             parts.push(FocusablePart::toolbar(self.titlebar_focus_handle.clone()));
@@ -9231,13 +9262,23 @@ impl Workspace {
                 this.track_focus(&self.region_focus_handles.editor)
             })
             .size_full()
-            .child(self.center.render(
-                self.zoomed.as_ref(),
-                self.maximized_pane.as_ref(),
-                render_cx,
-                window,
-                cx,
-            ))
+            .map(|this| {
+                let center = self
+                    .center
+                    .render(
+                        self.zoomed.as_ref(),
+                        self.maximized_pane.as_ref(),
+                        render_cx,
+                        window,
+                        cx,
+                    )
+                    .into_any_element();
+                if floating_panes::enabled(cx) {
+                    floating_panes::float(this, center, floating_panes::margin(), cx)
+                } else {
+                    this.child(center)
+                }
+            })
     }
 
     pub fn for_window(window: &Window, cx: &App) -> Option<Entity<Workspace>> {
@@ -9919,13 +9960,20 @@ impl Render for Workspace {
             && self.active_item(cx).is_some();
         let pad_zoomed_pane =
             self.centered_layout && self.zoomed.is_some() && self.zoomed_position.is_none();
+        let floating_panes = floating_panes::enabled(cx);
         let render_padding = |size| {
             (size > 0.0).then(|| {
-                div()
-                    .h_full()
-                    .w(relative(size))
-                    .bg(cx.theme().colors().editor_background)
-                    .border_color(cx.theme().colors().pane_group_border)
+                div().h_full().w(relative(size)).map(|this| {
+                    // Floating panes show the workspace background next to
+                    // the centered surface.
+                    if floating_panes {
+                        this.bg(floating_panes::gap_color(cx))
+                            .border_color(gpui::transparent_black())
+                    } else {
+                        this.bg(cx.theme().colors().editor_background)
+                            .border_color(cx.theme().colors().pane_group_border)
+                    }
+                })
             })
         };
         let render_centered_paddings = |enabled: bool| {
@@ -9982,36 +10030,39 @@ impl Render for Workspace {
             // a tab group: region navigation lands on the first control (per
             // the ARIA toolbar pattern), Tab steps through them, and arrow keys
             // move between them once focus is inside.
-            .when_some(self.titlebar_item.clone(), |this, item| {
-                this.child(
-                    div()
-                        .id("titlebar-region")
-                        .track_focus(&self.titlebar_focus_handle)
-                        .tab_group()
-                        .role(gpui::Role::Toolbar)
-                        .aria_label("Title bar")
-                        .on_key_down(cx.listener(
-                            |workspace, event: &gpui::KeyDownEvent, window, cx| {
-                                if event.keystroke.modifiers.modified() {
-                                    return;
-                                }
-                                match event.keystroke.key.as_str() {
-                                    "right" => {
-                                        workspace.move_titlebar_item_focus(true, window, cx);
-                                        cx.stop_propagation();
+            .when_some(
+                self.titlebar_item.clone().filter(|_| self.bars_visible(cx)),
+                |this, item| {
+                    this.child(
+                        div()
+                            .id("titlebar-region")
+                            .track_focus(&self.titlebar_focus_handle)
+                            .tab_group()
+                            .role(gpui::Role::Toolbar)
+                            .aria_label("Title bar")
+                            .on_key_down(cx.listener(
+                                |workspace, event: &gpui::KeyDownEvent, window, cx| {
+                                    if event.keystroke.modifiers.modified() {
+                                        return;
                                     }
-                                    "left" => {
-                                        workspace.move_titlebar_item_focus(false, window, cx);
-                                        cx.stop_propagation();
+                                    match event.keystroke.key.as_str() {
+                                        "right" => {
+                                            workspace.move_titlebar_item_focus(true, window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                        "left" => {
+                                            workspace.move_titlebar_item_focus(false, window, cx);
+                                            cx.stop_propagation();
+                                        }
+                                        _ => {}
                                     }
-                                    _ => {}
-                                }
-                            },
-                        ))
-                        .w_full()
-                        .child(item),
-                )
-            })
+                                },
+                            ))
+                            .w_full()
+                            .child(item),
+                    )
+                },
+            )
             .on_modifiers_changed(move |_, _, cx| {
                 for &id in &notification_entities {
                     cx.notify(id);
@@ -10027,19 +10078,29 @@ impl Render for Workspace {
                     .child(
                         div()
                             .id("workspace")
-                            .bg(colors.background)
+                            // Floating panes paint the background themselves,
+                            // see `floating_panes::backdrop`.
+                            .when(!floating_panes, |this| this.bg(colors.background))
                             .relative()
                             .flex_1()
                             .w_full()
                             .flex()
                             .flex_col()
                             .overflow_hidden()
-                            .border_t_1()
-                            .border_b_1()
-                            .border_color(colors.border)
+                            .map(|this| {
+                                // The title bar and status bar sit on the same
+                                // backdrop as floating panes. A line between
+                                // them and the panes would box the panes in.
+                                if floating_panes {
+                                    floating_panes::outset(this)
+                                        .child(floating_panes::workspace_edge(cx))
+                                } else {
+                                    this.border_t_1().border_b_1().border_color(colors.border)
+                                }
+                            })
                             .child({
                                 let this = cx.entity();
-                                canvas(
+                                let bounds_canvas = canvas(
                                     move |bounds, window, cx| {
                                         this.update(cx, |this, cx| {
                                             let bounds_changed = this.bounds != bounds;
@@ -10074,8 +10135,15 @@ impl Render for Workspace {
                                     },
                                     |_, _, _, _| {},
                                 )
-                                .absolute()
-                                .size_full()
+                                .absolute();
+                                // Dock sizes are measured from the edges of
+                                // these bounds, so they have to exclude the
+                                // padding around floating panes.
+                                if floating_panes {
+                                    bounds_canvas.inset(floating_panes::GAP / 2.)
+                                } else {
+                                    bounds_canvas.size_full()
+                                }
                             })
                             .when(self.zoomed.is_none(), |this| {
                                 this.on_drag_move(cx.listener(
@@ -10385,6 +10453,23 @@ impl Render for Workspace {
                                         })
                                         .into_any_element(),
                                 };
+                                if floating_panes {
+                                    return Some(
+                                        floating_panes::outset(
+                                            div().occlude().absolute().inset_0(),
+                                        )
+                                        .child(floating_panes::workspace_edge(cx))
+                                        .child(
+                                            floating_panes::float(
+                                                div().size_full(),
+                                                zoomed_element,
+                                                floating_panes::margin(),
+                                                cx,
+                                            ),
+                                        ),
+                                    );
+                                }
+
                                 let overlay = div()
                                     .occlude()
                                     .absolute()
@@ -19535,6 +19620,38 @@ mod tests {
         workspace.read_with(cx, |workspace, cx| {
             let visible = workspace.status_bar_visible(cx);
             assert!(visible, "Status bar should be visible when show is true");
+        });
+    }
+
+    #[gpui::test]
+    async fn test_floating_panes_hide_bars_until_toggled(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        let project = Project::test(fs, [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project.clone(), window, cx));
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            workspace.toggle_bars(&ToggleBars, window, cx);
+            assert!(
+                workspace.status_bar_visible(cx),
+                "Toggling bars should do nothing while panes do not float"
+            );
+        });
+
+        cx.update_global(|store: &mut SettingsStore, cx| {
+            store.update_user_settings(cx, |settings| {
+                settings.workspace.floating_panes = Some(true);
+            });
+        });
+
+        workspace.update_in(cx, |workspace, window, cx| {
+            assert!(!workspace.status_bar_visible(cx));
+            workspace.toggle_bars(&ToggleBars, window, cx);
+            assert!(workspace.status_bar_visible(cx));
+            workspace.toggle_bars(&ToggleBars, window, cx);
+            assert!(!workspace.status_bar_visible(cx));
         });
     }
 

@@ -271,6 +271,13 @@
   //
   // Default: true
   "zoomed_padding": true,
+  // Whether to render the docks and the editor area as separate floating
+  // surfaces with rounded corners, a gap between them, and a soft shadow.
+  // The title bar and the status bar are hidden until `workspace::ToggleBars`
+  // shows them.
+  //
+  // Default: false
+  "floating_panes": false,
   // Window title template.
   // Available variables are ${projectName}, ${fileName}, ${filePath},
   // ${relativePath}, ${fileStem}, ${remoteName}, ${remoteHost},
