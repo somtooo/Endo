@@ -1,51 +1,38 @@
-> [!IMPORTANT]
-> Remove this line to confirm you've reviewed this PR before submitting.
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/endo-mark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/endo-mark-light.svg">
+    <img src="assets/endo-mark-light.svg" alt="Endo logo" width="96" height="96">
+  </picture>
+</p>
 
-# Zed
+<h1 align="center">Endo</h1>
 
-[![Zed](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zed-industries/zed/main/assets/badge/v0.json)](https://zed.dev)
-[![CI](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml/badge.svg)](https://github.com/zed-industries/zed/actions/workflows/run_tests.yml)
-
-Welcome to Zed, a high-performance, multiplayer code editor from the creators of [Atom](https://github.com/atom/atom) and [Tree-sitter](https://github.com/tree-sitter/tree-sitter).
+<p align="center">
+  <em>An experiment for the balanced.</em>
+</p>
 
 ---
 
-### Installation
+## Why Endo
 
-On macOS, Linux, and Windows you can [download Zed directly](https://zed.dev/download) or install Zed via your local package manager ([macOS](https://zed.dev/docs/installation#macos)/[Linux](https://zed.dev/docs/linux#installing-via-a-package-manager)/[Windows](https://zed.dev/docs/windows#package-managers)).
+Endo is an experiment for the balanced: the people who believe AI is a game changer but know that to do game-changing things with it, they **cannot outsource their understanding**.
 
-Other platforms are not yet available:
+The UX of most new agentic development environments encourages offloading your thinking to Opus (they have to; it means more profit), and that's not a bad thing: Opus can go from a single prompt to production. But you're not achieving any form of domain expertise without exercising the LLM in your head, and that's what the IDE was for. It was never just a place to write code; **it was your gym**, where you could read code, inspect memory, read PDFs, write a blog post. There's no reason the equipment in that gym can't be replaced with AI-powered versions: highlight the part of the *Raft paper* you don't get and ask Opus to explain it, or stop at a breakpoint and ask Opus why your struct with a `u64` and a `u8` takes 16 bytes instead of 9.
 
-- Web ([tracking discussion](https://github.com/zed-industries/zed/discussions/26195))
+So Endo starts with a traditional IDE and sees how far we can push it toward the extreme without sacrificing the benefits the traditional IDE gave us: *a place to practice, to learn, to attain domain expertise.*
 
-### Developing Zed
+- If the day calls for full vibe coding, no problem, **Endo's got you.**
+- If it calls for digging in, sweating and pushing the LLM in your head, **Endo's got you too**, and you won't be alone: Opus is a great workout partner.
 
-- [Building Zed for macOS](./docs/src/development/macos.md)
-- [Building Zed for Linux](./docs/src/development/linux.md)
-- [Building Zed for Windows](./docs/src/development/windows.md)
+> [!TIP]
+> See [this post by Andrej Karpathy](https://x.com/karpathy/status/1756380066580455557).
 
-### Contributing
+## The current idea
 
-See [CONTRIBUTING.md](./CONTRIBUTING.md) for ways you can contribute to Zed.
+> [!NOTE]
+> This will evolve over time as the world changes, but for now Endo comprises three core ideas.
 
-Also... we're hiring! Check out our [jobs](https://zed.dev/jobs) page for open roles.
-
-### Licensing
-
-Zed source code is licensed primarily under GPL-3.0-or-later, with Apache-2.0 components where marked.
-
-License information for third party dependencies must be correctly provided for CI to pass.
-
-We use [`cargo-about`](https://github.com/EmbarkStudios/cargo-about) to automatically comply with open source licenses. If CI is failing, check the following:
-
-- Is it showing a `no license specified` error for a crate you've created? If so, add `publish = false` under `[package]` in your crate's Cargo.toml.
-- Is the error `failed to satisfy license requirements` for a dependency? If so, first determine what license the project has and whether this system is sufficient to comply with this license's requirements. If you're unsure, ask a lawyer. Once you've verified that this system is acceptable add the license's SPDX identifier to the `accepted` array in `script/licenses/zed-licenses.toml`.
-- Is `cargo-about` unable to find the license for a dependency? If so, add a clarification field at the end of `script/licenses/zed-licenses.toml`, as specified in the [cargo-about book](https://embarkstudios.github.io/cargo-about/cli/generate/config.html#crate-configuration).
-
-## Sponsorship
-
-Zed is developed by **Zed Industries, Inc.**, a for-profit company.
-
-If you’d like to financially support the project, you can do so via GitHub Sponsors.
-Sponsorships go directly to Zed Industries and are used as general company revenue.
-There are no perks or entitlements associated with sponsorship.
+1. **A very friendly fork of [Zed](https://zed.dev).** Changes from upstream are synced nightly, and stable releases track upstream's, shipping a day after each Zed stable release.
+2. **Rebases the reading features from [Suzuri](https://suzuri.ai/)**, another fork of Zed.
+3. **First-class support for [opencode](https://opencode.ai/).** It forgoes the ACP layer and talks to the opencode API directly. So, just like the opencode TUI, Endo is a full opencode client, because that's what it takes to provide the best UX.
