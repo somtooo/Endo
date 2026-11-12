@@ -123,14 +123,14 @@ struct Elevation {
 /// opacity, so it works on top of the colors of any theme.
 fn elevation(cx: &App) -> Elevation {
     let is_light = cx.theme().appearance().is_light();
-    let shadow = hsla(0., 0., 0., if is_light { 0.08 } else { 0.3 });
+    let shadow = hsla(0., 0., 0., if is_light { 0.05 } else { 0.18 });
     Elevation {
         ring: if is_light {
-            hsla(0., 0., 0., 0.12)
+            hsla(0., 0., 0., 0.08)
         } else {
-            hsla(0., 0., 1., 0.1)
+            hsla(0., 0., 1., 0.06)
         },
-        highlight: hsla(0., 0., 1., if is_light { 0.5 } else { 0.06 }),
+        highlight: hsla(0., 0., 1., if is_light { 0.3 } else { 0.03 }),
         shadows: [
             BoxShadow::new(px(0.), px(2.), shadow).blur_radius(px(4.)),
             BoxShadow::new(px(0.), px(1.), shadow).blur_radius(px(2.)),
