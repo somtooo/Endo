@@ -174,13 +174,13 @@ jobs:
         run: |
           set -euo pipefail
           # Uncommitted on purpose: .config/nextest.toml is upstream-owned.
-          # The runners are slower than upstream's, so give the two
-          # known-slow tests the same 300s budget upstream grants its own
+          # The runners are slower than upstream's, so give known-slow tests
+          # the same 300s budget upstream grants its own
           # slow ones, and retry flakes once (cargo cache makes retries fast).
           cat >> .config/nextest.toml <<'EOF'
 
           [[profile.default.overrides]]
-          filter = 'test(test_random_columnar_selections) or test(test_completion_without_text_edit) or test(test_random_worktree_changes)'
+          filter = 'test(test_random_columnar_selections) or test(test_completion_without_text_edit) or test(test_random_worktree_changes) or test(test_random_project_collaboration) or test(test_draft_made_in_a_window_that_is_still_restoring_is_kept_without_another_save)'
           slow-timeout = { period = "300s", terminate-after = 1 }
           EOF
           xvfb-run -a cargo nextest run --workspace --no-fail-fast --no-tests=warn --retries 1
