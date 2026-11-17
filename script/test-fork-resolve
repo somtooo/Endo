@@ -40,6 +40,11 @@ class ForkResolveTests(unittest.TestCase):
         mock = self.bin / "opencode"
         mock.write_text('''#!/usr/bin/env bash
 set -eu
+if [ "${1:-}" = --version ]; then
+  printf '%s\\n' "${MOCK_VERSION:-opencode v2.3.0}"
+  exit 0
+fi
+printf '%s\\n' "$@" > "$MOCK_ARGS"
 case "$MOCK_DECISION" in
   resolved) printf 'feature adapted to upstream\\n' > file.txt; git add file.txt; mkdir -p target; printf 'resolved\\n' > target/fork-resolve-decision.txt ;;
   uncertain) mkdir -p target; printf 'needs-human\\n' > target/fork-resolve-decision.txt ;;
@@ -55,12 +60,14 @@ esac
     def run_git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo, text=True, capture_output=True, check=True)
 
-    def run_resolver(self, decision):
+    def run_resolver(self, decision, *args, version="opencode v2.3.0"):
         env = os.environ.copy()
         env["PATH"] = str(self.bin) + os.pathsep + env["PATH"]
         env["MOCK_DECISION"] = decision
+        env["MOCK_VERSION"] = version
+        env["MOCK_ARGS"] = str(self.root / "opencode-args")
         return subprocess.run(
-            ["bash", str(RESOLVER), "--onto", "upstream", "--no-fix-build"],
+            ["bash", str(RESOLVER), "--onto", "upstream", "--no-fix-build", *args],
             cwd=self.repo, env=env, text=True, capture_output=True,
         )
 
@@ -69,6 +76,19 @@ esac
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.repo / "file.txt").read_text(), "feature adapted to upstream\n")
         self.run_git("merge-base", "--is-ancestor", "upstream", "HEAD")
+
+    def test_v2_model_variant_is_combined(self):
+        result = self.run_resolver("resolved", "--model", "opencode/deepseek-v4.1-flash-free", "--variant", "max")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = (self.root / "opencode-args").read_text().splitlines()
+        self.assertEqual(args[:4], ["run", "--auto", "-m", "opencode/deepseek-v4.1-flash-free#max"])
+        self.assertNotIn("--variant", args)
+
+    def test_v1_model_variant_remains_supported(self):
+        result = self.run_resolver("resolved", "--variant", "high", version="1.19.5")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = (self.root / "opencode-args").read_text().splitlines()
+        self.assertEqual(args[:5], ["run", "-m", "github-copilot/claude-sonnet-5.5", "--variant", "high"])
 
     def test_uncertainty_or_missing_decision_aborts(self):
         for decision in ("uncertain", "missing", "invalid", "failure", "partial", "markers"):
