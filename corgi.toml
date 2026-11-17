@@ -260,7 +260,7 @@ agent_skills = ["builtin/**"]
 agent_settings = ["src/prompts/**"]
 json_schema_store = ["src/schemas/**"]
 prettier = ["src/prettier_server.js"]
-zed = ["resources/**"]
+zed = ["resources/**", "RELEASE_CHANNEL"]
 zed_extension_api = ["wit/**"]
 gpui_wgpu = ["src/*.wgsl"]
 # Cross-package reads (and, for gpui_apple, its own metal shader source).
