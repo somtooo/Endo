@@ -130,7 +130,22 @@ if [ "$AI" = true ]; then
         echo "error: opencode CLI not found -- install it first" >&2
         exit 1
     }
+    OPENCODE_VERSION=$(opencode --version)
+    if [[ "$OPENCODE_VERSION" =~ (^|[^0-9])([0-9]+)\. ]]; then
+        OPENCODE_MAJOR=${BASH_REMATCH[2]}
+    else
+        echo "error: cannot determine OpenCode version from '$OPENCODE_VERSION'" >&2
+        exit 1
+    fi
 fi
+
+run_opencode() {
+    if [ "$OPENCODE_MAJOR" -ge 2 ]; then
+        opencode run --auto -m "$MODEL#$VARIANT" "$@"
+    else
+        opencode run -m "$MODEL" --variant "$VARIANT" "$@"
+    fi
+}
 
 # Patch files carry trailing whitespace as content (blank context lines), so
 # they are exempt from `git diff --check`.
@@ -230,7 +245,7 @@ if [ "$REPLAY_ONLY" = false ]; then
         DECISION_FILE="$REPO_ROOT/target/fork-resolve-decision.txt"
         mkdir -p "$(dirname "$DECISION_FILE")"
         rm -f "$DECISION_FILE"
-        if ! opencode run -m "$MODEL" --variant "$VARIANT" "You are resolving a git rebase conflict in this repo. Context: branch $BRANCH (all custom fork commits, kept linear) is having its commits replayed onto '$ONTO'. Replaying commit $STOP_SHA ($STOP_SUBJECT) just conflicted; these files now contain git conflict markers: $CONFLICTS.
+        if ! run_opencode "You are resolving a git rebase conflict in this repo. Context: branch $BRANCH (all custom fork commits, kept linear) is having its commits replayed onto '$ONTO'. Replaying commit $STOP_SHA ($STOP_SUBJECT) just conflicted; these files now contain git conflict markers: $CONFLICTS.
 
     Our fork features you must PRESERVE (never delete to 'resolve' a conflict):
     $FEATURES
@@ -238,7 +253,7 @@ if [ "$REPLAY_ONLY" = false ]; then
     CI tool constraints: this is a non-interactive run. Stay inside the checkout; do not read or write /tmp, /etc, $HOME, or any other path outside it. Keep scratch files under target/. Do not use commands that require confirmation or a terminal prompt; use 'git add -- <file>', never 'git add -p'. If a tool call is rejected, replace it with a checkout-local, non-interactive command and continue rather than retrying the same call.
 
     How to resolve this stop:
-    1. Inspect every conflict hunk (grep -n '^<<<<<<< \|^=======$\|^>>>>>>> ' in each file). Use 'git show :2:<file>' (BASE, upstream) and 'git show :3:<file>' (THEIRS, our commit) to understand what each side intended. For shared APIs, inspect their call sites and tests on both sides before choosing a shape.
+    1. Inspect the full original commit with 'git show REBASE_HEAD' and every conflict hunk (grep -n '^<<<<<<< \|^=======$\|^>>>>>>> ' in each file). Use 'git show :2:<file>' (BASE, upstream) and 'git show :3:<file>' (THEIRS, our commit) to understand what each side intended. Preserve deliberate removals as well as additions, including when upstream renamed a file; if the intent cannot be reconciled confidently, require a human decision. For shared APIs, inspect their call sites and tests on both sides before choosing a shape.
     2. Merge SEMANTICALLY: keep the feature's intent, adapted to the new base's APIs. When upstream refactored code our feature touches, adapt our feature to the new shape -- do not revert the refactor and do not drop our feature. Preserve upstream behavior relied on by other call sites; do not blindly choose one side or keep only the version that compiles. Do NOT pull newer upstream code into an older base; adapt minimally. If you cannot establish with confidence how to preserve the intent and behavior of both sides, STOP. Do not guess, even if tests pass. Explain the ambiguity and the human decision needed in your final summary; do not mark the conflict resolved.
     3. Follow this repo's Rust rules (AGENTS.md): no unwrap()/expect() in new code, propagate errors with ?, handle fallible results explicitly, full-word variable names, and keep diffs minimal -- no drive-by reformatting.
     4. Remove ALL conflict markers. After editing each file, stage it with 'git add <file>'. Do NOT commit and do NOT run 'git rebase --continue' -- the script continues the rebase after verifying.
@@ -296,6 +311,47 @@ else
     echo "Skipping the replay (--no-replay)."
 fi
 
+# A replay can leave Cargo.lock out of step with the manifests even when
+# nothing conflicts: upstream drops a locked version that a fork-only
+# dependency still points at, and git merges the two sides line by line.
+# Cargo quietly repairs the file in every build, so nothing fails and the
+# stale file stays on the branch. Each commit gets its own repair, so it lands
+# in the commit whose manifests need it.
+LOCKFILE_REPAIR='cargo metadata --format-version 1 >/dev/null && { git diff --quiet -- Cargo.lock || git commit --quiet --amend --no-edit -- Cargo.lock; }'
+
+repair_lockfile() {
+    if cargo metadata --locked --format-version 1 >/dev/null 2>&1; then
+        echo "Cargo.lock is up to date."
+        return 0
+    fi
+    echo "Cargo.lock is out of date -- repairing it in the commits that need it ..."
+    git -c rerere.enabled=false rebase --exec "$LOCKFILE_REPAIR" "$ONTO" || true
+    while rebase_in_progress; do
+        local conflicts
+        conflicts=$(git diff --name-only --diff-filter=U || true)
+        if [ "$conflicts" != "Cargo.lock" ]; then
+            git rebase --abort
+            echo "error: repairing Cargo.lock stopped (conflicted files: ${conflicts:-none}) -- repair aborted." >&2
+            return 1
+        fi
+        # An earlier commit's repair can collide with this commit's own lock
+        # change. Its own file is the right start: the exec step after it
+        # adds back whatever the earlier repairs needed.
+        git checkout --theirs -- Cargo.lock
+        git add -- Cargo.lock
+        git -c rerere.enabled=false rebase --continue || true
+    done
+    if ! cargo metadata --locked --format-version 1 >/dev/null; then
+        echo "error: Cargo.lock is still out of date after the repair." >&2
+        return 1
+    fi
+    echo "Cargo.lock repaired."
+}
+
+if [ -f Cargo.lock ]; then
+    repair_lockfile
+fi
+
 COMMITS_BEFORE=$(git rev-list --count "$ONTO"..HEAD)
 if [ "$FIX_BUILD" = true ]; then
     # The replay can leave the fork's code not compiling: upstream renames and
@@ -324,7 +380,7 @@ for attempt in $(seq 1 "$BUILD_ATTEMPTS"); do
     echo "$ERRORS"
     DECISION_FILE="$REPO_ROOT/target/fork-resolve-decision.txt"
     rm -f "$DECISION_FILE"
-    if ! opencode run -m "$MODEL" --variant "$VARIANT" "The replay onto the new upstream base is done, but the fork's code no longer compiles cleanly. Upstream renamed or removed APIs that this fork still uses, and CI denies warnings.
+    if ! run_opencode "The replay onto the new upstream base is done, but the fork's code no longer compiles cleanly. Upstream renamed or removed APIs that this fork still uses, and CI denies warnings.
 
 Fix every error reported by the build. The errors are:
 $ERRORS
@@ -484,7 +540,7 @@ EOF
         fi
         DECISION_FILE="$REPO_ROOT/target/fork-resolve-decision.txt"
         rm -f "$DECISION_FILE"
-        if ! opencode run -m "$MODEL" --variant "$VARIANT" "The full rebase onto '$ONTO' is complete, but focused tests for the changed Rust packages failed. Fix the regression before handing this branch to the full fork-checks gate.
+        if ! run_opencode "The full rebase onto '$ONTO' is complete, but focused tests for the changed Rust packages failed. Fix the regression before handing this branch to the full fork-checks gate.
 
 The affected packages and exact test command are:
 $TEST_PACKAGES
