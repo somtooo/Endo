@@ -2,6 +2,7 @@
 # Local equivalent of the fork-checks CI gate: the same commands upstream's
 # run_tests.yml gates PRs on (Linux leg), run on this machine.
 #
+#   0. cargo metadata --locked                         (Cargo.lock matches the manifests)
 #   1. ./script/clippy                                 (workspace clippy, deny warnings)
 #   2. cargo nextest run --workspace --no-fail-fast    (full unit test suite)
 #   3. cargo test --workspace --doc --no-fail-fast     (doctests)
@@ -48,6 +49,11 @@ while [ "$#" -gt 0 ]; do
             ;;
     esac
 done
+
+# None of the commands below pass --locked, so each would quietly repair a
+# stale Cargo.lock and the stale file would pass the gate.
+echo "=== Cargo.lock (cargo metadata --locked) ==="
+cargo metadata --locked --format-version 1 >/dev/null
 
 if [ "$RUN_CLIPPY" = true ]; then
     echo "=== clippy (./script/clippy) ==="

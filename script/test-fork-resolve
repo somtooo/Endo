@@ -40,6 +40,11 @@ class ForkResolveTests(unittest.TestCase):
         mock = self.bin / "opencode"
         mock.write_text('''#!/usr/bin/env bash
 set -eu
+if [ "${1:-}" = --version ]; then
+  printf '%s\\n' "${MOCK_VERSION:-opencode v2.3.0}"
+  exit 0
+fi
+printf '%s\\n' "$@" > "$MOCK_ARGS"
 case "$MOCK_DECISION" in
   resolved) printf 'feature adapted to upstream\\n' > file.txt; git add file.txt; mkdir -p target; printf 'resolved\\n' > target/fork-resolve-decision.txt ;;
   uncertain) mkdir -p target; printf 'needs-human\\n' > target/fork-resolve-decision.txt ;;
@@ -55,12 +60,14 @@ esac
     def run_git(self, *args):
         return subprocess.run(["git", *args], cwd=self.repo, text=True, capture_output=True, check=True)
 
-    def run_resolver(self, decision):
+    def run_resolver(self, decision, *args, version="opencode v2.3.0"):
         env = os.environ.copy()
         env["PATH"] = str(self.bin) + os.pathsep + env["PATH"]
         env["MOCK_DECISION"] = decision
+        env["MOCK_VERSION"] = version
+        env["MOCK_ARGS"] = str(self.root / "opencode-args")
         return subprocess.run(
-            ["bash", str(RESOLVER), "--onto", "upstream", "--no-fix-build"],
+            ["bash", str(RESOLVER), "--onto", "upstream", "--no-fix-build", *args],
             cwd=self.repo, env=env, text=True, capture_output=True,
         )
 
@@ -69,6 +76,19 @@ esac
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual((self.repo / "file.txt").read_text(), "feature adapted to upstream\n")
         self.run_git("merge-base", "--is-ancestor", "upstream", "HEAD")
+
+    def test_v2_model_variant_is_combined(self):
+        result = self.run_resolver("resolved", "--model", "opencode/deepseek-v4.1-flash-free", "--variant", "max")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = (self.root / "opencode-args").read_text().splitlines()
+        self.assertEqual(args[:4], ["run", "--auto", "-m", "opencode/deepseek-v4.1-flash-free#max"])
+        self.assertNotIn("--variant", args)
+
+    def test_v1_model_variant_remains_supported(self):
+        result = self.run_resolver("resolved", "--variant", "high", version="1.19.5")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        args = (self.root / "opencode-args").read_text().splitlines()
+        self.assertEqual(args[:5], ["run", "-m", "github-copilot/claude-sonnet-5.5", "--variant", "high"])
 
     def test_uncertainty_or_missing_decision_aborts(self):
         for decision in ("uncertain", "missing", "invalid", "failure", "partial", "markers"):
@@ -106,6 +126,46 @@ esac
         self.assertEqual(self.run_git("branch", "--show-current").stdout.strip(), "release/fork-v1.2.3")
         self.run_git("merge-base", "--is-ancestor", "v1.2.3", "HEAD")
         self.assertEqual((self.repo / "file.txt").read_text(), "feature\n")
+
+    def test_stale_lockfile_is_repaired_in_owning_commit(self):
+        cargo = self.bin / "cargo"
+        cargo.write_text('''#!/usr/bin/env bash
+set -eu
+[ "${1:-}" = metadata ] || exit 1
+expected=$(grep '^dep ' Cargo.toml | sort)
+case " $* " in
+  *" --locked "*) [ "$(cat Cargo.lock)" = "$expected" ]; exit ;;
+esac
+printf '%s\\n' "$expected" > Cargo.lock
+''')
+        cargo.chmod(0o755)
+        self.run_git("checkout", "-q", "upstream")
+        self.run_git("reset", "-q", "--hard", "main~1")
+        (self.repo / "Cargo.toml").write_text("dep base\n")
+        (self.repo / "Cargo.lock").write_text("dep base\n")
+        self.run_git("add", "Cargo.toml", "Cargo.lock")
+        self.run_git("commit", "-qm", "upstream adds a lock file")
+        fork_point = self.run_git("rev-parse", "HEAD").stdout.strip()
+        (self.repo / "upstream.txt").write_text("upstream change\n")
+        self.run_git("add", "upstream.txt")
+        self.run_git("commit", "-qm", "upstream moves on")
+        self.run_git("checkout", "-q", "main")
+        self.run_git("reset", "-q", "--hard", fork_point)
+        (self.repo / "Cargo.toml").write_text("dep base\ndep first\n")
+        self.run_git("commit", "-qam", "first feature forgets its lock entry")
+        (self.repo / "Cargo.toml").write_text("dep base\ndep first\ndep second\n")
+        (self.repo / "Cargo.lock").write_text("dep base\ndep second\n")
+        self.run_git("commit", "-qam", "second feature")
+
+        result = self.run_resolver("resolved", "--upstream-point", fork_point)
+
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(self.run_git("rev-list", "--count", "upstream..HEAD").stdout.strip(), "2")
+        first = self.run_git("show", "HEAD~1:Cargo.lock").stdout
+        self.assertEqual(first, "dep base\ndep first\n")
+        self.assertEqual(self.run_git("log", "-1", "--format=%s", "HEAD~1").stdout.strip(), "first feature forgets its lock entry")
+        self.assertEqual((self.repo / "Cargo.lock").read_text(), "dep base\ndep first\ndep second\n")
+        self.assertEqual(self.run_git("status", "--porcelain", "--untracked-files=no").stdout, "")
 
     def test_local_sync_replays_main_onto_upstream(self):
         self.run_git("checkout", "-q", "upstream")
