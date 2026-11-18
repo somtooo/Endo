@@ -202,6 +202,9 @@ impl AgentServer for CustomAgentServer {
         cx: &mut App,
     ) -> Task<Result<Rc<dyn AgentConnection>>> {
         let agent_id = self.agent_id();
+        if let Some(factory) = crate::agent_connection_factory(&agent_id, cx) {
+            return factory(project, cx);
+        }
         let default_mode = self.default_mode(cx);
         let is_registry_agent = is_registry_agent(agent_id.clone(), cx);
         let default_config_options = cx.read_global(|settings: &SettingsStore, _| {

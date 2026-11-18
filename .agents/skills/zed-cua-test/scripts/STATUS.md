@@ -88,8 +88,9 @@ The project stays writable and Zed can use the network.
 `--opencode private` starts `opencode serve --service` with HOME and XDG
 directories under the run, after `opencode service set port` picks a free
 port, so it never collides with the user's service on the default port.
-Zed's wrapper exports only `XDG_STATE_HOME`, which is where Zed finds
-`opencode/service.json`. The service starts with no sessions.
+Zed's wrapper exports `XDG_STATE_HOME`, which is where Zed finds
+`opencode/service.json`, and `XDG_CONFIG_HOME`, so Zed edits the same global
+OpenCode config the private service reads. The service starts with no sessions.
 
 Logins are piped from the user's service (`opencode auth export`) into the
 private one (`opencode auth import`), leaving out GitHub Copilot. Claude Agent

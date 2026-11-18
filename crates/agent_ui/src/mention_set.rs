@@ -640,6 +640,14 @@ impl MentionSet {
         id: acp::SessionId,
         cx: &mut Context<Self>,
     ) -> Task<Result<Mention>> {
+        if let Some(text) = crate::agent_ui_hooks::find_thread_text(&id, cx) {
+            return cx.spawn(async move |_, _| {
+                Ok(Mention::Text {
+                    content: text.await?,
+                    tracked_buffers: Vec::new(),
+                })
+            });
+        }
         let Some(thread_store) = self.thread_store.clone() else {
             return Task::ready(Err(anyhow!(
                 "Thread mentions are only supported for the native agent"

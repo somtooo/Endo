@@ -42,6 +42,7 @@ use markdown::{
 use parking_lot::{Mutex, RwLock};
 use project::{AgentId, AgentServerStore, Project, ProjectEntryId, ProjectPath};
 
+use crate::agent_ui_hooks::find_agent_ui_hooks;
 use crate::conversation_view::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
 };
@@ -1703,6 +1704,10 @@ impl ConversationView {
             .clone()
             .downcast::<agent::NativeAgentConnection>()
             .map(|native_connection| native_available_skills(&native_connection, &session_id, cx))
+            .or_else(|| {
+                let hooks = find_agent_ui_hooks(&connection.agent_id(), cx)?;
+                hooks.skills(&connection, &session_id, cx)
+            })
             .unwrap_or_default();
         let session_capabilities = Arc::new(RwLock::new(SessionCapabilities::new(
             connection.description_format(),
@@ -1832,9 +1837,14 @@ impl ConversationView {
             connection.clone().downcast();
         let profile_selector = profile_selector
             .and_then(|native_connection| native_connection.thread(&session_id, cx))
-            .map(|native_thread| {
+            .map(|native_thread| Arc::new(native_thread) as Arc<dyn ProfileProvider>)
+            .or_else(|| {
+                let hooks = find_agent_ui_hooks(&connection.agent_id(), cx)?;
+                hooks.profiles(&connection, &session_id, cx)
+            })
+            .map(|provider| {
                 cx.new(|cx| {
-                    ProfileSelector::new(Arc::new(native_thread), self.focus_handle(cx), cx)
+                    ProfileSelector::new(provider, self.focus_handle(cx), cx)
                 })
             });
 
@@ -2458,6 +2468,11 @@ impl ConversationView {
                         .downcast::<agent::NativeAgentConnection>()
                         .map(|native_connection| {
                             native_available_skills(&native_connection, &session_id, cx)
+                        })
+                        .or_else(|| {
+                            let connection = thread.read(cx).connection();
+                            let hooks = find_agent_ui_hooks(&connection.agent_id(), cx)?;
+                            hooks.skills(connection, &session_id, cx)
                         })
                         .unwrap_or_default();
 
@@ -5965,7 +5980,7 @@ pub(crate) mod tests {
         assert!(!native_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));
         active_thread(&conversation_view, cx).update(cx, |thread, cx| {
             thread.message_queue.toggle_steer(id);
-            thread.sync_queue_flag_to_native_thread(cx);
+            thread.sync_queue_steering(cx);
         });
         active_thread(&conversation_view, cx).read_with(cx, |thread, _cx| {
             assert!(
@@ -5982,7 +5997,7 @@ pub(crate) mod tests {
                 "_future",
                 Default::default(),
             ))];
-            view.sync_queue_flag_to_native_thread(cx);
+            view.sync_queue_steering(cx);
             assert!(view.message_queue.front_wants_steer());
         });
         assert!(!native_thread.read_with(cx, |thread, _| thread.end_turn_at_next_boundary()));

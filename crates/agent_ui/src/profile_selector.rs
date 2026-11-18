@@ -55,6 +55,36 @@ pub trait ProfileProvider {
     fn profile_downgraded(&self, _cx: &App) -> bool {
         false
     }
+
+    /// The profiles to choose from, with their names.
+    fn available_profiles(&self, cx: &App) -> AvailableProfiles {
+        AgentProfile::available_profiles(cx)
+    }
+
+    /// Built-in profiles are listed before custom ones.
+    fn is_builtin_profile(&self, profile_id: &AgentProfileId) -> bool {
+        builtin_profiles::is_builtin(profile_id)
+    }
+
+    fn profile_description(&self, profile_id: &AgentProfileId, _cx: &App) -> Option<SharedString> {
+        match profile_id.as_str() {
+            builtin_profiles::WRITE => Some("Get help to write anything.".into()),
+            builtin_profiles::ASK => Some("Chat about your codebase.".into()),
+            builtin_profiles::MINIMAL => Some("Chat about anything with no tools.".into()),
+            _ => None,
+        }
+    }
+
+    /// Dispatched by the picker's Configure button.
+    fn configure_action(&self) -> Box<dyn Action> {
+        Box::new(ManageProfiles::default())
+    }
+
+    /// Fires when the available profiles change other than through Zed's
+    /// settings.
+    fn profiles_changed(&self) -> Option<watch::Receiver<()>> {
+        None
+    }
 }
 
 pub struct ProfileSelector {
@@ -65,6 +95,7 @@ pub struct ProfileSelector {
     picker_handle: PopoverMenuHandle<Picker<ProfilePickerDelegate>>,
     focus_handle: FocusHandle,
     _subscriptions: Vec<Subscription>,
+    _profiles_changed: Option<Task<()>>,
 }
 
 impl ProfileSelector {
@@ -77,15 +108,29 @@ impl ProfileSelector {
             this.pending_refresh = true;
             cx.notify();
         });
+        let profiles_changed = provider.profiles_changed().map(|mut changes| {
+            cx.spawn(async move |this, cx| {
+                while changes.recv().await.is_ok() {
+                    let updated = this.update(cx, |this, cx| {
+                        this.pending_refresh = true;
+                        cx.notify();
+                    });
+                    if updated.is_err() {
+                        break;
+                    }
+                }
+            })
+        });
 
         Self {
-            profiles: AgentProfile::available_profiles(cx),
+            profiles: provider.available_profiles(cx),
             pending_refresh: false,
             provider,
             picker: None,
             picker_handle: PopoverMenuHandle::default(),
             focus_handle,
             _subscriptions: vec![settings_subscription],
+            _profiles_changed: profiles_changed,
         }
     }
 
@@ -93,12 +138,16 @@ impl ProfileSelector {
         self.picker_handle.clone()
     }
 
+    pub fn configure_action(&self) -> Box<dyn Action> {
+        self.provider.configure_action()
+    }
+
     pub fn cycle_profile(&mut self, cx: &mut Context<Self>) {
         if !self.provider.profiles_supported(cx) {
             return;
         }
 
-        let profiles = AgentProfile::available_profiles(cx);
+        let profiles = self.provider.available_profiles(cx);
         if profiles.is_empty() {
             return;
         }
@@ -150,7 +199,7 @@ impl ProfileSelector {
         };
 
         if self.pending_refresh {
-            let profiles = AgentProfile::available_profiles(cx);
+            let profiles = self.provider.available_profiles(cx);
             self.profiles = profiles.clone();
             picker.update(cx, |picker, cx| {
                 let query = picker.query(cx);
@@ -208,12 +257,12 @@ impl Render for ProfileSelector {
 
         let picker = self.ensure_picker(window, cx);
 
-        let settings = AgentSettings::get_global(cx);
         let profile_id = self.provider.profile_id(cx);
-        let profile = settings.profiles.get(&profile_id);
-
-        let selected_profile = profile
-            .map(|profile| profile.name.clone())
+        let selected_profile = self
+            .provider
+            .available_profiles(cx)
+            .get(&profile_id)
+            .cloned()
             .unwrap_or_else(|| "Unknown".into());
 
         let icon = if self.picker_handle.is_deployed() {
@@ -281,6 +330,7 @@ struct ProfileCandidate {
     id: AgentProfileId,
     name: SharedString,
     is_builtin: bool,
+    description: Option<SharedString>,
 }
 
 #[derive(Clone)]
@@ -317,7 +367,7 @@ impl ProfilePickerDelegate {
         focus_handle: FocusHandle,
         cx: &mut Context<ProfileSelector>,
     ) -> Self {
-        let candidates = Self::candidates_from(profiles);
+        let candidates = Self::candidates_from(profiles, provider.as_ref(), cx);
         let string_candidates = Arc::new(Self::string_candidates(&candidates));
         let filtered_entries = Self::entries_from_candidates(&candidates);
 
@@ -348,7 +398,7 @@ impl ProfilePickerDelegate {
         query: String,
         cx: &mut Context<Picker<Self>>,
     ) {
-        self.candidates = Self::candidates_from(profiles);
+        self.candidates = Self::candidates_from(profiles, self.provider.as_ref(), cx);
         self.string_candidates = Arc::new(Self::string_candidates(&self.candidates));
         self.query = query;
 
@@ -365,11 +415,16 @@ impl ProfilePickerDelegate {
         cx.notify();
     }
 
-    fn candidates_from(profiles: AvailableProfiles) -> Vec<ProfileCandidate> {
+    fn candidates_from(
+        profiles: AvailableProfiles,
+        provider: &dyn ProfileProvider,
+        cx: &App,
+    ) -> Vec<ProfileCandidate> {
         profiles
             .into_iter()
             .map(|(id, name)| ProfileCandidate {
-                is_builtin: builtin_profiles::is_builtin(&id),
+                is_builtin: provider.is_builtin_profile(&id),
+                description: provider.profile_description(&id, cx),
                 id,
                 name,
             })
@@ -398,15 +453,6 @@ impl ProfilePickerDelegate {
             })
             .map(|(name, _)| SharedString::from(name.to_string()))
             .collect()
-    }
-
-    fn documentation(candidate: &ProfileCandidate) -> Option<&'static str> {
-        match candidate.id.as_str() {
-            builtin_profiles::WRITE => Some("Get help to write anything."),
-            builtin_profiles::ASK => Some("Chat about your codebase."),
-            builtin_profiles::MINIMAL => Some("Chat about anything with no tools."),
-            _ => None,
-        }
     }
 
     fn entries_from_candidates(candidates: &[ProfileCandidate]) -> Vec<ProfilePickerEntry> {
@@ -641,7 +687,7 @@ impl PickerDelegate for ProfilePickerDelegate {
                 let candidate = self.candidates.get(entry.candidate_index)?;
                 let active_id = self.provider.profile_id(cx);
                 let is_active = active_id == candidate.id;
-                let has_documentation = Self::documentation(candidate).is_some();
+                let has_documentation = candidate.description.is_some();
 
                 let has_warning = self.provider.is_restricted(cx)
                     && !Self::restricted_forbidden_tools(&candidate.id, cx).is_empty();
@@ -712,7 +758,7 @@ impl PickerDelegate for ProfilePickerDelegate {
         };
 
         let candidate = self.candidates.get(entry.candidate_index)?;
-        let description = Self::documentation(candidate).map(|docs| docs.to_string());
+        let description = candidate.description.clone();
         let forbidden_tools = if self.provider.is_restricted(cx) {
             Self::restricted_forbidden_tools(&candidate.id, cx)
         } else {
@@ -781,6 +827,7 @@ impl PickerDelegate for ProfilePickerDelegate {
     ) -> Option<gpui::AnyElement> {
         let focus_handle = self.focus_handle.clone();
         let is_restricted = self.provider.is_restricted(cx);
+        let configure_action = self.provider.configure_action();
 
         Some(
             v_flex()
@@ -797,17 +844,14 @@ impl PickerDelegate for ProfilePickerDelegate {
                                 .style(ButtonStyle::Outlined)
                                 .key_binding(
                                     KeyBinding::for_action_in(
-                                        &ManageProfiles::default(),
+                                        configure_action.as_ref(),
                                         &focus_handle,
                                         cx,
                                     )
                                     .map(|kb| kb.size(rems_from_px(12_f32))),
                                 )
-                                .on_click(|_, window, cx| {
-                                    window.dispatch_action(
-                                        ManageProfiles::default().boxed_clone(),
-                                        cx,
-                                    );
+                                .on_click(move |_, window, cx| {
+                                    window.dispatch_action(configure_action.boxed_clone(), cx);
                                 }),
                         ),
                 )
@@ -857,11 +901,13 @@ mod tests {
                 id: AgentProfileId("write".into()),
                 name: SharedString::from("Write"),
                 is_builtin: true,
+                description: None,
             },
             ProfileCandidate {
                 id: AgentProfileId("my-custom".into()),
                 name: SharedString::from("My Custom"),
                 is_builtin: false,
+                description: None,
             },
         ];
 
@@ -884,6 +930,7 @@ mod tests {
             id: AgentProfileId("write".into()),
             name: SharedString::from("Write"),
             is_builtin: true,
+            description: None,
         }];
 
         cx.update(|cx| {
@@ -915,11 +962,13 @@ mod tests {
                 id: AgentProfileId("write".into()),
                 name: SharedString::from("Write"),
                 is_builtin: true,
+                description: None,
             },
             ProfileCandidate {
                 id: AgentProfileId("ask".into()),
                 name: SharedString::from("Ask"),
                 is_builtin: true,
+                description: None,
             },
         ];
 

@@ -360,7 +360,8 @@ def start_private_opencode(run_dir, copy_logins):
             if service.get("url", "").endswith(f":{port}"):
                 started = {"home": str(home), "url": service["url"], "pid": process.pid, "binary": binary,
                            "start_time": process_start_time(process.pid),
-                           "state_home": str(home / ".local/state")}
+                           "state_home": str(home / ".local/state"),
+                           "config_home": str(home / ".config")}
                 if copy_logins:
                     started["logins"] = copy_real_logins(binary, environment)
                 return started
@@ -548,6 +549,10 @@ def up(args):
             meta["opencode"] = real_opencode_state(run_dir)
         if "opencode" in meta:
             environment["XDG_STATE_HOME"] = meta["opencode"]["state_home"]
+        # Zed's own config lives in --user-data-dir, so this only points Zed at
+        # the global OpenCode config the private service reads.
+        if "config_home" in meta.get("opencode", {}):
+            environment["XDG_CONFIG_HOME"] = meta["opencode"]["config_home"]
         wrapper = write_zed_wrapper(run_dir, binary, settings, environment)
 
         cage = tools["cage"]
