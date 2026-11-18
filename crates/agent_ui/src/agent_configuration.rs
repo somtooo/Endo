@@ -4,3 +4,4 @@ mod tool_picker;
 
 pub(crate) use configure_context_server_modal::ConfigureContextServerModal;
 pub(crate) use manage_profiles_modal::ManageProfilesModal;
+pub use manage_profiles_modal::profile_modal_header::ProfileModalHeader;

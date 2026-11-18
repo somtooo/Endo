@@ -29,6 +29,7 @@ use util::{ResultExt as _, paths::PathStyle};
 use workspace::{PathList, SerializedWorkspaceLocation, WorkspaceDb};
 
 use crate::DEFAULT_THREAD_TITLE;
+use crate::agent_ui_hooks::find_agent_ui_hooks;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ThreadId(uuid::Uuid);
@@ -509,6 +510,9 @@ pub struct ThreadMetadataStore {
     conversation_subscriptions: HashMap<gpui::EntityId, Subscription>,
     pending_thread_ops_tx: async_channel::Sender<DbOperation>,
     in_flight_archives: HashMap<ThreadId, (Task<()>, async_channel::Sender<()>)>,
+    /// Sessions a backend reports as running while no panel has them loaded,
+    /// so the sidebar can show them as running too.
+    externally_running: HashSet<acp::SessionId>,
     _db_operations_task: Task<()>,
 }
 
@@ -596,6 +600,28 @@ impl ThreadMetadataStore {
     pub fn entry_by_session(&self, session_id: &acp::SessionId) -> Option<&ThreadMetadata> {
         let thread_id = self.threads_by_session.get(session_id)?;
         self.threads.get(thread_id)
+    }
+
+    /// Marks a session a backend reports as running while no panel has it
+    /// loaded.
+    pub fn set_externally_running(
+        &mut self,
+        session_id: acp::SessionId,
+        running: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let changed = if running {
+            self.externally_running.insert(session_id)
+        } else {
+            self.externally_running.remove(&session_id)
+        };
+        if changed {
+            cx.notify();
+        }
+    }
+
+    pub fn is_externally_running(&self, session_id: &acp::SessionId) -> bool {
+        self.externally_running.contains(session_id)
     }
 
     /// Returns all threads.
@@ -876,6 +902,7 @@ impl ThreadMetadataStore {
         self.update_archived(thread_id, false, cx);
         // Dropping the Sender triggers cancellation in the background task.
         self.in_flight_archives.remove(&thread_id);
+        cx.emit(ThreadMetadataStoreEvent::ThreadUnarchived(thread_id));
     }
 
     pub fn cleanup_completed_archive(&mut self, thread_id: ThreadId) {
@@ -1243,6 +1270,7 @@ impl ThreadMetadataStore {
             conversation_subscriptions: HashMap::default(),
             pending_thread_ops_tx: tx,
             in_flight_archives: HashMap::default(),
+            externally_running: HashSet::default(),
             _db_operations_task,
         };
         let _ = this.reload(cx);
@@ -1314,7 +1342,27 @@ impl ThreadMetadataStore {
                 )
             } else {
                 let project = thread_ref.project().read(cx);
-                let worktree_paths = project.worktree_paths(cx);
+                let mut worktree_paths = project.worktree_paths(cx);
+                // The session may have moved out of the project it's open in.
+                // A session in one of the project's folders, or below one,
+                // keeps the project's folders.
+                if let Some(folders) = find_agent_ui_hooks(&thread_ref.connection().agent_id(), cx)
+                    .and_then(|hooks| {
+                        hooks.session_folders(thread_ref.connection(), thread_ref.session_id(), cx)
+                    })
+                    && !folders.paths().iter().all(|folder| {
+                        worktree_paths
+                            .folder_path_list()
+                            .paths()
+                            .iter()
+                            .any(|project_folder| folder.starts_with(project_folder))
+                    })
+                {
+                    worktree_paths = existing_thread
+                        .map(|thread| thread.worktree_paths.clone())
+                        .filter(|paths| paths.folder_path_list() == &folders)
+                        .unwrap_or_else(|| WorktreePaths::from_folder_paths(&folders));
+                }
                 let remote_connection = project.remote_connection_options(cx).cloned();
 
                 (worktree_paths, remote_connection)
@@ -1359,6 +1407,7 @@ impl Global for ThreadMetadataStore {}
 #[derive(Clone, Debug)]
 pub enum ThreadMetadataStoreEvent {
     ThreadArchived(ThreadId),
+    ThreadUnarchived(ThreadId),
 }
 
 impl gpui::EventEmitter<ThreadMetadataStoreEvent> for ThreadMetadataStore {}
@@ -4072,6 +4121,71 @@ mod tests {
 
         let result = WorktreePaths::from_path_lists(main, folder);
         assert!(result.is_err());
+    }
+
+    struct SessionFoldersHooks(Rc<std::cell::RefCell<PathList>>);
+
+    impl crate::agent_ui_hooks::AgentUiHooks for SessionFoldersHooks {
+        fn session_folders(
+            &self,
+            _connection: &Rc<dyn acp_thread::AgentConnection>,
+            _session_id: &acp::SessionId,
+            _cx: &App,
+        ) -> Option<PathList> {
+            Some(self.0.borrow().clone())
+        }
+    }
+
+    #[gpui::test]
+    async fn test_session_folders_override_project_folders(cx: &mut TestAppContext) {
+        init_test(cx);
+
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree("/project", serde_json::json!({ "sub": {} }))
+            .await;
+        let project = Project::test(fs, [Path::new("/project")], cx).await;
+        let agent_id = AgentId::new("session-folders-agent");
+        let connection = StubAgentConnection::new().with_agent_id(agent_id.clone());
+        let session_folders = Rc::new(std::cell::RefCell::new(PathList::new(&[Path::new(
+            "/project/sub",
+        )])));
+        cx.update(|cx| {
+            crate::agent_ui_hooks::register_agent_ui_hooks(
+                agent_id,
+                Rc::new(SessionFoldersHooks(session_folders.clone())),
+                cx,
+            );
+        });
+
+        let (panel, mut vcx) = setup_panel_with_project(project, cx);
+        crate::test_support::open_thread_with_connection(&panel, connection, &mut vcx);
+        let thread = panel.read_with(&vcx, |panel, cx| panel.active_agent_thread(cx).unwrap());
+        let thread_id = crate::test_support::active_thread_id(&panel, &vcx);
+        let saved_folders = |cx: &mut TestAppContext| {
+            cx.read(|cx| {
+                ThreadMetadataStore::global(cx)
+                    .read(cx)
+                    .entry(thread_id)
+                    .unwrap()
+                    .folder_paths()
+                    .clone()
+            })
+        };
+
+        // A session below one of the project's folders keeps the project's.
+        thread.update_in(&mut vcx, |thread, _window, cx| {
+            thread.push_user_content_block(None, "Hello".into(), cx);
+        });
+        vcx.run_until_parked();
+        assert_eq!(saved_folders(cx), PathList::new(&[Path::new("/project")]));
+
+        // A session that moved out of the project takes its own folders.
+        *session_folders.borrow_mut() = PathList::new(&[Path::new("/elsewhere")]);
+        thread.update_in(&mut vcx, |thread, _window, cx| {
+            thread.set_title("Moved".into(), cx).detach();
+        });
+        vcx.run_until_parked();
+        assert_eq!(saved_folders(cx), PathList::new(&[Path::new("/elsewhere")]));
     }
 
     /// Regression test: archiving a thread created in a git worktree must

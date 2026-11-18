@@ -381,7 +381,11 @@ impl PickerDelegate for ModelPickerDelegate {
             return None;
         }
 
-        Some(ModelSelectorFooter::new(OpenSettings.boxed_clone(), focus_handle).into_any_element())
+        let action = self
+            .selector
+            .footer_action()
+            .unwrap_or_else(|| OpenSettings.boxed_clone());
+        Some(ModelSelectorFooter::new(action, focus_handle).into_any_element())
     }
 }
 

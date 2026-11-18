@@ -1,4 +1,4 @@
-mod profile_modal_header;
+pub(crate) mod profile_modal_header;
 
 use std::sync::Arc;
 
