@@ -28,6 +28,7 @@ use cloud_api_types::{SubmitAgentThreadFeedbackBody, SubmitAgentThreadFeedbackCo
 use editor::actions::OpenExcerpts;
 use sandbox::{SandboxFsPolicy, SandboxNetPolicy, SandboxPolicy};
 
+use crate::agent_ui_hooks::{AgentSteering, AgentThinking, find_agent_ui_hooks};
 use crate::completion_provider::{AvailableSkill, PromptLocalCommand, pluralize};
 use crate::entry_view_state::TerminalCardPresentation;
 use crate::message_editor::SharedSessionCapabilities;
@@ -94,6 +95,16 @@ pub(super) struct ThreadRecovery {
     pub submissions: Vec<SavedSubmission>,
     pub draft: Vec<acp_v2::ContentBlock>,
     queued: Vec<QueuedMessageRecovery>,
+}
+
+/// A queued message an agent with its own steering holds until it adds it
+/// to the thread or gives it back.
+struct SteerHandoff {
+    entry_id: QueueEntryId,
+    content: Vec<acp_v2::ContentBlock>,
+    id: SharedString,
+    cancelling: bool,
+    settled: futures::future::Shared<Task<()>>,
 }
 
 struct QueuedMessageRecovery {
@@ -851,6 +862,8 @@ pub struct ThreadView {
     pub should_be_following: bool,
     pub editing_message: Option<usize>,
     pub message_queue: MessageQueue,
+    /// The queued message an agent with its own steering holds, if any.
+    steer_handoff: Option<SteerHandoff>,
     pub turn_fields: TurnFields,
     pub discarded_partial_edits: HashSet<acp_v2::ToolCallId>,
     pub is_loading_contents: bool,
@@ -1128,6 +1141,9 @@ impl ThreadView {
         subscriptions.push(cx.observe(&thread, |_, _, cx| cx.notify()));
         subscriptions.push(cx.observe(&conversation, |_, _, cx| cx.notify()));
         subscriptions.push(cx.subscribe(&thread, |this, _, event, cx| {
+            if matches!(event, AcpThreadEvent::StatusChanged) {
+                this.sync_agent_steer(cx);
+            }
             if matches!(
                 event,
                 AcpThreadEvent::ToolAuthorizationRequested(_)
@@ -1392,6 +1408,7 @@ impl ThreadView {
             should_be_following: false,
             editing_message: None,
             message_queue: MessageQueue::default(),
+            steer_handoff: None,
             turn_fields: TurnFields::default(),
             discarded_partial_edits: HashSet::default(),
             is_loading_contents: false,
@@ -3118,6 +3135,7 @@ impl ThreadView {
                     entry.content = content;
                     entry.tracked_buffers = tracked_buffers;
                 }
+                this.sync_agent_steer(cx);
                 cx.notify();
             })?;
 
@@ -3144,7 +3162,8 @@ impl ThreadView {
         cx.notify();
     }
 
-    pub fn sync_queue_flag_to_native_thread(&self, cx: &mut Context<Self>) {
+    pub fn sync_queue_flag_to_native_thread(&mut self, cx: &mut Context<Self>) {
+        self.sync_agent_steer(cx);
         if let Some(native_thread) = self.as_native_thread(cx) {
             // By default queued messages wait for the turn to fully complete.
             // Only a "steering" front message ends the turn at the next boundary.
@@ -3181,6 +3200,33 @@ impl ThreadView {
         if self.thread.read(cx).foreground_activity() != ForegroundActivity::Idle
             || self.is_loading_contents
         {
+            return false;
+        }
+        // The agent may still add a steered message to the thread, so the
+        // queue waits until it either does or gives the message back.
+        if let Some(settled) = self
+            .steer_handoff
+            .as_ref()
+            .map(|handoff| handoff.settled.clone())
+        {
+            self.message_queue.absorb_stale_generation_stopped();
+            self.sync_agent_steer(cx);
+            cx.spawn_in(window, async move |this, cx| {
+                settled.await;
+                this.update_in(cx, |this, window, cx| {
+                    let is_first_editor_focused = this
+                        .message_queue
+                        .first()
+                        .is_some_and(|entry| entry.editor.focus_handle(cx).is_focused(window));
+                    this.send_queued_message_after_generation_stopped(
+                        is_first_editor_focused,
+                        window,
+                        cx,
+                    );
+                })
+                .log_err();
+            })
+            .detach();
             return false;
         }
         if let Some(id) = self
@@ -5898,7 +5944,7 @@ impl ThreadView {
 
         let queue_len = self.message_queue.len();
         let can_fast_track = self.message_queue.can_fast_track();
-        let is_native = self.as_native_thread(cx).is_some();
+        let can_steer = self.as_native_thread(cx).is_some() || self.provided_steering(cx).is_some();
 
         v_flex()
             .id("message_queue_list")
@@ -5968,7 +6014,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -6042,7 +6088,7 @@ impl ThreadView {
                                         );
                                     })),
                             )
-                            .when(is_native, |row| {
+                            .when(can_steer, |row| {
                                 row.child(self.render_queue_steer_button(
                                     entry_id, index, is_next, steer_on, cx,
                                 ))
@@ -6534,23 +6580,49 @@ impl ThreadView {
         Some((provider_id, model_id, confirmation))
     }
 
-    fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let thread = self.as_native_thread(cx)?.read(cx);
+    /// The thinking settings of the session's model, read from the native
+    /// thread or from the agent's `thinking` hook.
+    fn thinking_state(&self, cx: &App) -> Option<ThinkingState> {
+        let Some(thread) = self.as_native_thread(cx) else {
+            let thinking = self.provided_thinking(cx)?;
+            let can_turn_off = thinking.can_disable_thinking();
+            return Some(ThinkingState {
+                effort_levels: thinking.effort_levels(cx),
+                selected_effort: thinking.selected_effort(cx),
+                can_turn_off,
+                can_turn_off_at_any_effort: can_turn_off,
+                is_on: thinking.thinking_enabled(cx) || !can_turn_off,
+            });
+        };
+        let thread = thread.read(cx);
         let model = thread.model()?;
-
-        let supports_thinking = model.supports_thinking();
-        if !supports_thinking {
+        if !model.supports_thinking() {
             return None;
         }
-
         let effort_levels = model.supported_effort_levels();
         let selected_effort = thread.thinking_effort().cloned();
-        let supports_disabling_thinking =
-            model.supports_disabling_thinking_at_effort(selected_effort.as_deref());
-        let supports_disabling_thinking_at_any_effort = supports_disabling_thinking
+        let can_turn_off = model.supports_disabling_thinking_at_effort(selected_effort.as_deref());
+        let can_turn_off_at_any_effort = can_turn_off
             || effort_levels.iter().any(|effort_level| {
                 model.supports_disabling_thinking_at_effort(Some(effort_level.value.as_ref()))
             });
+        Some(ThinkingState {
+            effort_levels,
+            selected_effort,
+            can_turn_off,
+            can_turn_off_at_any_effort,
+            is_on: thread.thinking_enabled() || !can_turn_off,
+        })
+    }
+
+    fn render_thinking_control(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let ThinkingState {
+            effort_levels,
+            selected_effort,
+            can_turn_off: supports_disabling_thinking,
+            can_turn_off_at_any_effort: supports_disabling_thinking_at_any_effort,
+            is_on: thinking,
+        } = self.thinking_state(cx)?;
 
         // A toggle would be dishonest for models that always think at every
         // effort level: only offer the effort selector.
@@ -6563,8 +6635,6 @@ impl ThreadView {
                     .into_any_element(),
             );
         }
-
-        let thinking = thread.thinking_enabled() || !supports_disabling_thinking;
 
         let (tooltip_label, icon, color) = if !supports_disabling_thinking {
             (None, IconName::ThinkingMode, Color::Accent)
@@ -6629,6 +6699,8 @@ impl ThreadView {
                             }
                         });
                     });
+                } else if let Some(thinking) = this.provided_thinking(cx) {
+                    thinking.set_thinking_enabled(!thinking.thinking_enabled(cx), cx);
                 }
             }))
         } else {
@@ -6801,6 +6873,8 @@ impl ThreadView {
                                                     }
                                                 });
                                             });
+                                        } else if let Some(thinking) = this.provided_thinking(cx) {
+                                            thinking.set_effort(effort.to_string(), cx);
                                         }
                                     })
                                     .ok();
@@ -14326,30 +14400,19 @@ impl ThreadView {
         });
     }
 
-    fn cycle_native_agent_thinking_effort(&mut self, cx: &mut Context<Self>) {
-        let Some(thread) = self.as_native_thread(cx) else {
+    fn cycle_thinking_effort(&mut self, cx: &mut Context<Self>) {
+        let Some(ThinkingState {
+            effort_levels,
+            selected_effort: current_effort,
+            is_on: true,
+            ..
+        }) = self.thinking_state(cx)
+        else {
             return;
         };
-
-        let (effort_levels, current_effort) = {
-            let thread_ref = thread.read(cx);
-            let Some(model) = thread_ref.model() else {
-                return;
-            };
-            let thinking_enabled = thread_ref.thinking_enabled()
-                || !model.supports_disabling_thinking_at_effort(
-                    thread_ref.thinking_effort().map(String::as_str),
-                );
-            if !model.supports_thinking() || !thinking_enabled {
-                return;
-            }
-            let effort_levels = model.supported_effort_levels();
-            if effort_levels.is_empty() {
-                return;
-            }
-            let current_effort = thread_ref.thinking_effort().cloned();
-            (effort_levels, current_effort)
-        };
+        if effort_levels.is_empty() {
+            return;
+        }
 
         let current_index = current_effort.and_then(|current| {
             effort_levels
@@ -14362,6 +14425,12 @@ impl ThreadView {
         };
         let next_effort = effort_levels[next_index].value.to_string();
 
+        let Some(thread) = self.as_native_thread(cx) else {
+            if let Some(thinking) = self.provided_thinking(cx) {
+                thinking.set_effort(next_effort, cx);
+            }
+            return;
+        };
         thread.update(cx, |thread, cx| {
             thread.set_thinking_effort(Some(next_effort.clone()), cx);
 
@@ -14549,6 +14618,10 @@ impl Render for ThreadView {
                             thread.set_thinking_enabled(!thread.thinking_enabled(), cx);
                         }
                     });
+                } else if let Some(thinking) = this.provided_thinking(cx)
+                    && thinking.can_disable_thinking()
+                {
+                    thinking.set_thinking_enabled(!thinking.thinking_enabled(cx), cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &CycleThinkingEffort, _window, cx| {
@@ -14567,7 +14640,7 @@ impl Render for ThreadView {
                         return;
                     }
                 }
-                this.cycle_native_agent_thinking_effort(cx);
+                this.cycle_thinking_effort(cx);
             }))
             .on_action(
                 cx.listener(|this, _: &ToggleThinkingEffortMenu, window, cx| {
@@ -14610,7 +14683,7 @@ impl Render for ThreadView {
             }))
             .on_action(
                 cx.listener(|this, _: &ToggleSteerFirstQueuedMessage, _, cx| {
-                    if this.as_native_thread(cx).is_none() {
+                    if this.as_native_thread(cx).is_none() && this.provided_steering(cx).is_none() {
                         return;
                     }
                     if let Some(id) = this.message_queue.first_id() {
@@ -14620,6 +14693,17 @@ impl Render for ThreadView {
             )
             .on_action(cx.listener(|this, _: &ClearMessageQueue, _, cx| {
                 this.clear_queue(cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::ManageProfiles, window, cx| {
+                let custom_action = this
+                    .profile_selector
+                    .as_ref()
+                    .map(|selector| selector.read(cx).configure_action())
+                    .filter(|action| !action.partial_eq(&crate::ManageProfiles::default()));
+                match custom_action {
+                    Some(action) => window.dispatch_action(action, cx),
+                    None => cx.propagate(),
+                }
             }))
             .on_action(cx.listener(|this, _: &ToggleProfileSelector, window, cx| {
                 if let Some(config_options_view) = this.config_options_view.clone() {
@@ -15109,6 +15193,97 @@ fn leading_native_command(
                 == Some(acp_thread::CommandCategory::Native)
     });
     is_native.then(|| name.to_string())
+}
+
+/// What the thinking control draws, shared by the native agent and agents
+/// with a `thinking` hook.
+struct ThinkingState {
+    /// The effort levels for when thinking is on. May be empty.
+    effort_levels: Vec<LanguageModelEffortLevel>,
+    selected_effort: Option<String>,
+    /// Whether thinking can be turned off at the selected effort.
+    can_turn_off: bool,
+    can_turn_off_at_any_effort: bool,
+    is_on: bool,
+}
+
+/// Controls for agents that provide them through `agent_ui_hooks`, drawn
+/// like the native agent's: steering and the thinking control.
+impl ThreadView {
+    fn provided_steering(&self, cx: &App) -> Option<Rc<dyn AgentSteering>> {
+        let thread = self.thread.read(cx);
+        let hooks = find_agent_ui_hooks(&thread.connection().agent_id(), cx)?;
+        hooks.steering(thread.connection(), thread.session_id(), cx)
+    }
+
+    /// Hands the front queued message to an agent with its own steering when
+    /// it's marked to steer and a turn is running, and takes it back when
+    /// that stops being true. The agent holds one message at a time.
+    fn sync_agent_steer(&mut self, cx: &mut Context<Self>) {
+        let Some(steering) = self.provided_steering(cx) else {
+            return;
+        };
+        let thread = self.thread.read(cx);
+        let wanted = self
+            .message_queue
+            .first()
+            .filter(|entry| {
+                entry.steer
+                    && thread.status() == ThreadStatus::Generating
+                    && !self.message_queue.is_paused()
+                    && steering.can_steer(&entry.content, cx)
+                    && thread.validate_prompt_content(&entry.content).is_ok()
+            })
+            .map(|entry| (entry.id, entry.content.clone()));
+        if let Some(handoff) = &mut self.steer_handoff {
+            let still_wanted = wanted.as_ref().is_some_and(|(entry_id, content)| {
+                *entry_id == handoff.entry_id && *content == handoff.content
+            });
+            if !still_wanted && !handoff.cancelling {
+                handoff.cancelling = true;
+                steering.cancel_steer(handoff.id.clone(), cx);
+            }
+            return;
+        }
+        let Some((entry_id, content)) = wanted else {
+            return;
+        };
+        let (id, outcome) = steering.steer(content.clone(), cx);
+        let settled = cx.spawn(async move |this, cx| {
+            let result = outcome.await;
+            this.update(cx, |this, cx| {
+                this.steer_handoff = None;
+                match result {
+                    Ok(true) => {
+                        this.message_queue.remove(entry_id);
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        if let Some(entry) = this.message_queue.entry_by_id_mut(entry_id) {
+                            entry.steer = false;
+                        }
+                        this.handle_thread_error(error, cx);
+                    }
+                }
+                this.sync_queue_flag_to_native_thread(cx);
+                cx.notify();
+            })
+            .log_err();
+        });
+        self.steer_handoff = Some(SteerHandoff {
+            entry_id,
+            content,
+            id,
+            cancelling: false,
+            settled: settled.shared(),
+        });
+    }
+
+    fn provided_thinking(&self, cx: &App) -> Option<Rc<dyn AgentThinking>> {
+        let thread = self.thread.read(cx);
+        let hooks = find_agent_ui_hooks(&thread.connection().agent_id(), cx)?;
+        hooks.thinking(thread.connection(), thread.session_id(), cx)
+    }
 }
 
 /// Removes a leading `/command_name` token from `text`, returning the trimmed

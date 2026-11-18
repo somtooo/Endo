@@ -155,6 +155,7 @@ language_extension.workspace = true
 language_model.workspace = true
 language_models.workspace = true
 language_onboarding.workspace = true
+opencode_agent.workspace = true
 language_selector.workspace = true
 language_tools.workspace = true
 languages = { workspace = true, features = ["load-grammars"] }

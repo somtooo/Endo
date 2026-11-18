@@ -110,6 +110,34 @@ impl dyn AgentServer {
     }
 }
 
+pub type AgentConnectionFactory =
+    Rc<dyn Fn(Entity<Project>, &mut App) -> Task<Result<Rc<dyn AgentConnection>>>>;
+
+#[derive(Default)]
+struct AgentConnectionFactories(HashMap<AgentId, AgentConnectionFactory>);
+
+impl gpui::Global for AgentConnectionFactories {}
+
+/// Serves an agent ID with a connection built in-process instead of an ACP
+/// process. The agent keeps going through `CustomAgentServer`, so the picker,
+/// history restore and saved defaults work unchanged.
+pub fn register_agent_connection_factory(
+    agent_id: AgentId,
+    factory: AgentConnectionFactory,
+    cx: &mut App,
+) {
+    cx.default_global::<AgentConnectionFactories>()
+        .0
+        .insert(agent_id, factory);
+}
+
+fn agent_connection_factory(agent_id: &AgentId, cx: &App) -> Option<AgentConnectionFactory> {
+    cx.try_global::<AgentConnectionFactories>()?
+        .0
+        .get(agent_id)
+        .cloned()
+}
+
 /// Load the default proxy environment variables to pass through to the agent
 pub fn load_proxy_env(cx: &mut App) -> HashMap<String, String> {
     let proxy_url = cx

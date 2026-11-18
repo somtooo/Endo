@@ -84,6 +84,10 @@ impl MessageQueue {
         self.entries.iter()
     }
 
+    pub fn is_paused(&self) -> bool {
+        self.processing_state == ProcessingState::Paused
+    }
+
     pub fn can_fast_track(&self) -> bool {
         self.can_fast_track && !self.entries.is_empty()
     }
