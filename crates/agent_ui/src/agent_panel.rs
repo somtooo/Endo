@@ -6261,6 +6261,26 @@ impl AgentPanel {
             ToolbarMode::EmptyThread
         };
 
+        let focus_mode = self
+            .workspace
+            .read_with(cx, |workspace, _| workspace.agent_focus_mode())
+            .unwrap_or(false);
+        let focus_mode_label = if focus_mode {
+            "Disable Focus Mode"
+        } else {
+            "Enable Focus Mode"
+        };
+        let focus_mode_button = IconButton::new("toggle-focus-mode", IconName::MaximizeAlt)
+            .icon_size(IconSize::Small)
+            .aria_label(focus_mode_label)
+            .toggle_state(focus_mode)
+            .tooltip(move |_, cx| {
+                Tooltip::for_action(focus_mode_label, &workspace::ToggleAgentFocusMode, cx)
+            })
+            .on_click(|_, window, cx| {
+                window.dispatch_action(Box::new(workspace::ToggleAgentFocusMode), cx)
+            });
+
         let is_full_screen = self.is_zoomed(window, cx);
         let (icon_name, tooltip_text) = if is_full_screen {
             (IconName::Minimize, "Disable Full Screen")
@@ -6344,6 +6364,7 @@ impl AgentPanel {
                         .gap_1()
                         .children(sandbox_status)
                         .when(can_create_entries, |this| this.child(new_thread_menu))
+                        .child(focus_mode_button)
                         .child(full_screen_button)
                         .child(self.render_panel_options_menu(window, cx)),
                 )
@@ -7349,6 +7370,60 @@ mod tests {
 
         fn into_any(self: Rc<Self>) -> Rc<dyn Any> {
             self
+        }
+    }
+
+    #[gpui::test]
+    async fn test_agent_focus_mode_toolbar_and_threads_sidebar(cx: &mut TestAppContext) {
+        let (panel, mut cx) = setup_visible_panel(cx).await;
+        cx.simulate_resize(size(px(1200.), px(800.)));
+        open_thread_with_connection(&panel, StubAgentConnection::new(), &mut cx);
+        let workspace = panel.read_with(&cx, |panel, _| {
+            panel.workspace.upgrade().expect("agent workspace")
+        });
+        let multi_workspace = cx.update(|window, _| {
+            window
+                .root::<MultiWorkspace>()
+                .flatten()
+                .expect("multi-workspace root")
+        });
+        cx.run_until_parked();
+        for enabled in [true, false] {
+            let button = cx
+                .debug_bounds("ICON-MaximizeAlt")
+                .expect("focus mode toolbar button");
+            cx.simulate_click(button.center(), Modifiers::default());
+            cx.run_until_parked();
+            workspace.read_with(&cx, |workspace, _| {
+                assert_eq!(workspace.agent_focus_mode(), enabled);
+            });
+            assert_eq!(cx.debug_bounds("agent-focus-column").is_some(), enabled);
+        }
+        workspace.update_in(&mut cx, |workspace, window, cx| {
+            workspace.active_pane().focus_handle(cx).focus(window, cx);
+        });
+        cx.run_until_parked();
+        let button = cx
+            .debug_bounds("ICON-MaximizeAlt")
+            .expect("focus mode toolbar button");
+        cx.simulate_click(button.center(), Modifiers::default());
+        cx.run_until_parked();
+        panel.update_in(&mut cx, |panel, window, cx| {
+            assert!(
+                panel.activation_focus_handle(cx).is_focused(window),
+                "focus recovery must use the real agent's active input"
+            );
+        });
+        let initially_open =
+            multi_workspace.read_with(&cx, |workspace, _| workspace.sidebar_open());
+        for sidebar_open in [!initially_open, initially_open] {
+            cx.dispatch_action(ToggleWorkspaceSidebar);
+            cx.run_until_parked();
+            multi_workspace.read_with(&cx, |workspace, _| {
+                assert_eq!(workspace.sidebar_open(), sidebar_open);
+            });
+            assert!(cx.debug_bounds("agent-focus-column").is_some());
+            workspace.read_with(&cx, |workspace, _| assert!(workspace.agent_focus_mode()));
         }
     }
 

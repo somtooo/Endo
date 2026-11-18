@@ -31,6 +31,7 @@ pub struct DomainMigration {
     pub name: &'static str,
     pub migrations: &'static [&'static str],
     pub dependencies: &'static [&'static str],
+    pub prepare_migrations: fn(&sqlez::connection::Connection) -> anyhow::Result<()>,
     pub should_allow_migration_change: fn(usize, &str, &str) -> bool,
 }
 
@@ -50,6 +51,7 @@ impl Migrator for AppMigrator {
         let registrations: Vec<&DomainMigration> = inventory::iter::<DomainMigration>().collect();
         let sorted = topological_sort(&registrations);
         for reg in &sorted {
+            (reg.prepare_migrations)(connection)?;
             let mut should_allow = reg.should_allow_migration_change;
             connection.migrate(reg.name, reg.migrations, &mut should_allow)?;
         }
@@ -278,6 +280,7 @@ macro_rules! static_connection {
                 name: <$t as $crate::sqlez::domain::Domain>::NAME,
                 migrations: <$t as $crate::sqlez::domain::Domain>::MIGRATIONS,
                 dependencies: &[$(<$d as $crate::sqlez::domain::Domain>::NAME),*],
+                prepare_migrations: <$t as $crate::sqlez::domain::Domain>::prepare_migrations,
                 should_allow_migration_change: <$t as $crate::sqlez::domain::Domain>::should_allow_migration_change,
             }
         }

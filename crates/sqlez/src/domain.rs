@@ -4,6 +4,10 @@ pub trait Domain: 'static {
     const NAME: &str;
     const MIGRATIONS: &[&str];
 
+    fn prepare_migrations(_connection: &Connection) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     fn should_allow_migration_change(_index: usize, _old: &str, _new: &str) -> bool {
         false
     }
@@ -21,6 +25,7 @@ impl Migrator for () {
 
 impl<D: Domain> Migrator for D {
     fn migrate(connection: &Connection) -> anyhow::Result<()> {
+        Self::prepare_migrations(connection)?;
         connection.migrate(
             Self::NAME,
             Self::MIGRATIONS,

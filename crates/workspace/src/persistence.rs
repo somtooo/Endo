@@ -1134,7 +1134,68 @@ impl Domain for WorkspaceDb {
             DROP TABLE trusted_worktrees;
             ALTER TABLE trusted_worktrees_2 RENAME TO trusted_worktrees;
         ),
+        sql!(
+            ALTER TABLE workspaces ADD COLUMN agent_focus_mode INTEGER NOT NULL DEFAULT 0;
+        ),
     ];
+
+    fn prepare_migrations(connection: &Connection) -> Result<()> {
+        let migrations_exist = connection.select_row::<i64>(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'migrations'",
+        )?()?
+        .unwrap_or_default()
+            > 0;
+        if !migrations_exist {
+            return Ok(());
+        }
+
+        let focus_index = Self::MIGRATIONS
+            .iter()
+            .position(|migration| migration.contains("agent_focus_mode"))
+            .context("missing agent focus mode migration")?;
+        let upstream_index = Self::MIGRATIONS
+            .iter()
+            .position(|migration| migration.contains("path_style"))
+            .context("missing workspace path style migration")?;
+        let completed = connection.select_bound::<&str, (usize, String)>(
+            "SELECT step, migration FROM migrations WHERE domain = ? ORDER BY step",
+        )?(Self::NAME)?;
+        let normalize = |migration: &str| {
+            migration
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .flat_map(char::to_lowercase)
+                .collect::<String>()
+        };
+        let Some((step, migration)) = completed.last() else {
+            return Ok(());
+        };
+        if *step != upstream_index
+            || normalize(migration) != normalize(Self::MIGRATIONS[focus_index])
+        {
+            return Ok(());
+        }
+
+        // Earlier focus-mode builds recorded this migration before the upstream
+        // workspace migrations; preserve its column while applying those steps.
+        connection.with_savepoint("repair_agent_focus_migration", || {
+            let column_exists = connection
+                .select_row::<i64>("SELECT COUNT(*) FROM pragma_table_info('workspaces') WHERE name = 'agent_focus_mode'")?()?
+                .unwrap_or_default()
+                > 0;
+            if !column_exists {
+                bail!("recorded agent focus mode migration is missing its column");
+            }
+            connection.exec_bound("DELETE FROM migrations WHERE domain = ? AND step = ?")?((Self::NAME, *step))?;
+            connection.migrate(
+                Self::NAME,
+                &Self::MIGRATIONS[..focus_index],
+                &mut Self::should_allow_migration_change,
+            )?;
+            connection.exec_bound("INSERT INTO migrations (domain, step, migration) VALUES (?, ?, ?)")?((Self::NAME, focus_index, migration.as_str()))?;
+            Ok(())
+        })
+    }
 
     // Allow recovering from bad migration that was initially shipped to nightly
     // when introducing the ssh_connections table.
@@ -1192,7 +1253,7 @@ impl WorkspaceDb {
             identity_paths_list,
             window_bounds,
             display,
-            centered_layout,
+            (centered_layout, agent_focus_mode),
             docks,
             window_id,
             path_style,
@@ -1202,7 +1263,7 @@ impl WorkspaceDb {
             Option<PathListColumns>,
             Option<SerializedWindowBounds>,
             Option<Uuid>,
-            Option<bool>,
+            (Option<bool>, bool),
             DockStructure,
             Option<u64>,
             Option<String>,
@@ -1221,6 +1282,7 @@ impl WorkspaceDb {
                     window_height,
                     display,
                     centered_layout,
+                    agent_focus_mode,
                     left_dock_visible,
                     left_dock_active_panel,
                     left_dock_zoom,
@@ -1277,6 +1339,7 @@ impl WorkspaceDb {
                 .log_err()?,
             window_bounds,
             centered_layout: centered_layout.unwrap_or(false),
+            agent_focus_mode,
             display,
             docks,
             session_id: None,
@@ -1299,7 +1362,7 @@ impl WorkspaceDb {
             identity_paths_list,
             window_bounds,
             display,
-            centered_layout,
+            (centered_layout, agent_focus_mode),
             docks,
             window_id,
             remote_connection_id,
@@ -1309,7 +1372,7 @@ impl WorkspaceDb {
             Option<PathListColumns>,
             Option<SerializedWindowBounds>,
             Option<Uuid>,
-            Option<bool>,
+            (Option<bool>, bool),
             DockStructure,
             Option<u64>,
             Option<i32>,
@@ -1328,6 +1391,7 @@ impl WorkspaceDb {
                     window_height,
                     display,
                     centered_layout,
+                    agent_focus_mode,
                     left_dock_visible,
                     left_dock_active_panel,
                     left_dock_zoom,
@@ -1378,6 +1442,7 @@ impl WorkspaceDb {
                 .log_err()?,
             window_bounds,
             centered_layout: centered_layout.unwrap_or(false),
+            agent_focus_mode,
             display,
             docks,
             session_id: None,
@@ -1691,9 +1756,10 @@ impl WorkspaceDb {
                         session_id,
                         window_id,
                         path_style,
+                        agent_focus_mode,
                         timestamp
                     )
-                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, CURRENT_TIMESTAMP)
+                    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, CURRENT_TIMESTAMP)
                     ON CONFLICT DO
                     UPDATE SET
                         paths = ?2,
@@ -1713,6 +1779,7 @@ impl WorkspaceDb {
                         session_id = ?16,
                         window_id = ?17,
                         path_style = ?18,
+                        agent_focus_mode = ?19,
                         timestamp = CURRENT_TIMESTAMP
                 );
                 let mut prepared_query = conn.exec_bound(query)?;
@@ -1726,7 +1793,7 @@ impl WorkspaceDb {
                     workspace.docks,
                     workspace.session_id,
                     workspace.window_id,
-                    path_style
+                    (path_style, workspace.agent_focus_mode),
                 );
 
                 prepared_query(args).context("Updating workspace")?;
@@ -3175,6 +3242,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: {
                 let mut map = collections::BTreeMap::default();
@@ -3334,6 +3402,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: {
                 let mut map = collections::BTreeMap::default();
@@ -3386,6 +3455,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: collections::BTreeMap::default(),
             session_id: None,
@@ -3525,6 +3595,145 @@ mod tests {
             .unwrap(),
             Some(0)
         );
+    }
+
+    fn populate_previous_focus_mode_database(connection: &Connection) {
+        let upstream_migration = WorkspaceDb::MIGRATIONS
+            .iter()
+            .position(|migration| migration.contains("path_style"))
+            .expect("upstream path style migration");
+        let focus_migration = WorkspaceDb::MIGRATIONS
+            .iter()
+            .find(|migration| migration.contains("agent_focus_mode"))
+            .expect("focus mode migration");
+        let mut previous_migrations = WorkspaceDb::MIGRATIONS[..upstream_migration].to_vec();
+        previous_migrations.push(*focus_migration);
+        connection
+            .migrate(WorkspaceDb::NAME, &previous_migrations, &mut |_, _, _| {
+                false
+            })
+            .expect("create previous database");
+        connection
+            .exec("INSERT INTO workspaces (workspace_id, paths, paths_order, agent_focus_mode) VALUES (91, '[]', '[]', 1)")
+            .expect("prepare workspace")()
+            .expect("insert workspace");
+    }
+
+    #[test]
+    fn test_upgrade_previous_focus_mode_database() {
+        for (name, use_app_migrator) in [
+            ("previous_focus_mode_database", false),
+            ("previous_focus_mode_app_database", true),
+        ] {
+            let connection = Connection::open_memory(Some(name));
+            populate_previous_focus_mode_database(&connection);
+            if use_app_migrator {
+                <db::AppMigrator as sqlez::domain::Migrator>::migrate(&connection)
+                    .expect("upgrade through app migrator");
+            } else {
+                <WorkspaceDb as sqlez::domain::Migrator>::migrate(&connection)
+                    .expect("upgrade workspace database");
+            }
+            <WorkspaceDb as sqlez::domain::Migrator>::migrate(&connection)
+                .expect("reopen upgraded database");
+            let values = connection
+                .select_row::<(bool, Option<String>)>(
+                    "SELECT agent_focus_mode, path_style FROM workspaces WHERE workspace_id = 91",
+                )
+                .expect("prepare upgraded query")()
+            .expect("read upgraded workspace")
+            .expect("workspace preserved");
+            assert_eq!(values, (true, None));
+        }
+    }
+
+    #[gpui::test]
+    async fn test_upgrade_previous_focus_mode_database_on_disk(cx: &mut gpui::TestAppContext) {
+        cx.executor().allow_parking();
+        let directory = tempfile::tempdir().expect("temporary database directory");
+        let database_path = db::db_path(directory.path(), release_channel::ReleaseChannel::Dev);
+        std::fs::create_dir_all(database_path.parent().expect("database parent"))
+            .expect("create database directory");
+        {
+            let connection = Connection::open_file(database_path.to_str().expect("database path"));
+            populate_previous_focus_mode_database(&connection);
+        }
+        let database =
+            db::open_db::<db::AppMigrator>(directory.path(), release_channel::ReleaseChannel::Dev)
+                .await;
+        assert!(
+            database.persistent(),
+            "upgrade should not fall back to an in-memory database"
+        );
+        let value = database
+            .select_row::<(bool, Option<String>)>(
+                "SELECT agent_focus_mode, path_style FROM workspaces WHERE workspace_id = 91",
+            )
+            .expect("prepare upgraded query")()
+        .expect("read upgraded workspace");
+        assert_eq!(value, Some((true, None)));
+        drop(database);
+        let reopened =
+            db::open_db::<db::AppMigrator>(directory.path(), release_channel::ReleaseChannel::Dev)
+                .await;
+        assert!(reopened.persistent());
+        let value = reopened
+            .select_row::<bool>("SELECT agent_focus_mode FROM workspaces WHERE workspace_id = 91")
+            .expect("prepare reopened query")()
+        .expect("read reopened workspace");
+        assert_eq!(value, Some(true));
+    }
+
+    #[test]
+    fn test_upgrade_upstream_workspace_database() {
+        let connection = Connection::open_memory(Some("upstream_workspace_database"));
+        let focus_index = WorkspaceDb::MIGRATIONS
+            .iter()
+            .position(|migration| migration.contains("agent_focus_mode"))
+            .expect("focus mode migration");
+        connection
+            .migrate(
+                WorkspaceDb::NAME,
+                &WorkspaceDb::MIGRATIONS[..focus_index],
+                &mut |_, _, _| false,
+            )
+            .expect("create upstream database");
+        connection
+            .exec("INSERT INTO workspaces (workspace_id, paths, paths_order, path_style) VALUES (92, '[]', '[]', 'windows')")
+            .expect("prepare workspace")()
+            .expect("insert workspace");
+        <db::AppMigrator as sqlez::domain::Migrator>::migrate(&connection)
+            .expect("upgrade upstream database");
+        let values = connection
+            .select_row::<(bool, String)>(
+                "SELECT agent_focus_mode, path_style FROM workspaces WHERE workspace_id = 92",
+            )
+            .expect("prepare workspace query")()
+        .expect("read workspace")
+        .expect("workspace preserved");
+        assert_eq!(values, (false, "windows".to_owned()));
+    }
+
+    #[test]
+    fn test_focus_mode_migration_repair_rolls_back_on_failure() {
+        let connection = Connection::open_memory(Some("previous_focus_mode_failed_upgrade"));
+        populate_previous_focus_mode_database(&connection);
+        connection
+            .exec("ALTER TABLE workspaces ADD COLUMN path_style TEXT")
+            .expect("prepare conflicting schema")()
+        .expect("create conflicting schema");
+        assert!(<WorkspaceDb as sqlez::domain::Migrator>::migrate(&connection).is_err());
+        let focus_enabled = connection
+            .select_row::<bool>("SELECT agent_focus_mode FROM workspaces WHERE workspace_id = 91")
+            .expect("prepare workspace query")()
+        .expect("read workspace");
+        assert_eq!(focus_enabled, Some(true));
+        let last_migration = connection
+            .select_row::<String>("SELECT migration FROM migrations WHERE domain = 'WorkspaceDb' ORDER BY step DESC LIMIT 1")
+            .expect("prepare migration query")()
+            .expect("read migration")
+            .expect("legacy migration preserved");
+        assert!(last_migration.contains("agent_focus_mode"));
     }
 
     #[test]
@@ -3750,6 +3959,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: None,
             user_toolchains: Default::default(),
@@ -3831,6 +4041,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: None,
@@ -3850,6 +4061,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: None,
@@ -3963,6 +4175,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: Some(999),
             user_toolchains: Default::default(),
@@ -4142,6 +4355,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: Some(1),
             user_toolchains: Default::default(),
@@ -4159,6 +4373,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: None,
@@ -4207,6 +4422,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: Some(3),
             user_toolchains: Default::default(),
@@ -4247,6 +4463,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: Some("session-id-1".to_owned()),
@@ -4266,6 +4483,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: Some("session-id-1".to_owned()),
@@ -4285,6 +4503,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: Some("session-id-2".to_owned()),
@@ -4304,6 +4523,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: None,
@@ -4334,6 +4554,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: Some("session-id-2".to_owned()),
@@ -4355,6 +4576,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some("session-id-3".to_owned()),
             window_id: Some(60),
             user_toolchains: Default::default(),
@@ -4400,6 +4622,57 @@ mod tests {
         assert_eq!(locations[0].2, Some(60));
     }
 
+    #[gpui::test]
+    async fn test_agent_focus_mode_persistence() {
+        let db = WorkspaceDb::open_test_db("agent_focus_mode_persistence").await;
+        let mut first = default_workspace(&["/first"], &SerializedPaneGroup::default());
+        first.id = WorkspaceId(10);
+        first.agent_focus_mode = true;
+        first.path_style = PathStyle::Windows;
+        first.docks.left.visible = false;
+        first.docks.left.active_panel = Some("AgentPanel".into());
+        let mut second = default_workspace(&["/second"], &SerializedPaneGroup::default());
+        second.id = WorkspaceId(11);
+        db.save_workspace(first.clone()).await;
+        db.save_workspace(second.clone()).await;
+
+        let restored = db
+            .workspace_for_roots(&["/first"])
+            .expect("first workspace");
+        assert!(restored.agent_focus_mode);
+        assert_eq!(restored.path_style, PathStyle::Windows);
+        assert!(!restored.docks.left.visible);
+        assert_eq!(
+            restored.docks.left.active_panel.as_deref(),
+            Some("AgentPanel")
+        );
+        assert!(
+            db.workspace_for_id(first.id)
+                .expect("first workspace by id")
+                .agent_focus_mode
+        );
+        assert!(
+            !db.workspace_for_roots(&["/second"])
+                .expect("second workspace")
+                .agent_focus_mode
+        );
+
+        first.agent_focus_mode = false;
+        second.agent_focus_mode = true;
+        db.save_workspace(first.clone()).await;
+        db.save_workspace(second.clone()).await;
+        assert!(
+            !db.workspace_for_id(first.id)
+                .expect("first workspace by id")
+                .agent_focus_mode
+        );
+        assert!(
+            db.workspace_for_id(second.id)
+                .expect("second workspace by id")
+                .agent_focus_mode
+        );
+    }
+
     fn default_workspace<P: AsRef<Path>>(
         paths: &[P],
         center_group: &SerializedPaneGroup,
@@ -4416,6 +4689,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: None,
             user_toolchains: Default::default(),
@@ -4459,6 +4733,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some("one-session".to_owned()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -4562,6 +4837,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: session_id.map(|s| s.to_owned()),
             window_id: Some(id),
             user_toolchains: Default::default(),
@@ -4588,6 +4864,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: Some(id),
             user_toolchains: Default::default(),
@@ -4847,6 +5124,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some("one-session".to_owned()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -5214,6 +5492,7 @@ mod tests {
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: None,
             window_id: None,
             user_toolchains: Default::default(),
@@ -5292,6 +5571,7 @@ mod tests {
                 display: Default::default(),
                 docks: Default::default(),
                 centered_layout: false,
+                agent_focus_mode: false,
                 session_id: Some("test-session".to_owned()),
                 bookmarks: Default::default(),
                 breakpoints: Default::default(),
@@ -5576,6 +5856,7 @@ mod tests {
             display: Default::default(),
             docks: saved_docks.clone(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: BTreeMap::from_iter([(saved_path.clone(), vec![bookmark(0)])]),
             breakpoints: BTreeMap::from_iter([(
                 saved_path.clone(),
@@ -5729,6 +6010,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: saved_breakpoints.clone(),
             session_id: None,
@@ -5823,6 +6105,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             bookmarks: Default::default(),
             breakpoints: Default::default(),
             session_id: None,
@@ -6000,6 +6283,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some(session_id.clone()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -6099,6 +6383,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some(session_id.to_owned()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -6119,6 +6404,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some(session_id.to_owned()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
@@ -6201,6 +6487,7 @@ mod tests {
             display: Default::default(),
             docks: Default::default(),
             centered_layout: false,
+            agent_focus_mode: false,
             session_id: Some(session_id.clone()),
             bookmarks: Default::default(),
             breakpoints: Default::default(),
