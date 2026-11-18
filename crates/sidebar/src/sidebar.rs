@@ -1799,6 +1799,9 @@ impl Sidebar {
                             let thread_id = thread.metadata.thread_id;
                             Arc::make_mut(thread).apply_active_info(info);
                             new_live_statuses.insert(session_id, (status, thread_id));
+                        } else if thread_store.read(cx).is_externally_running(&session_id) {
+                            Arc::make_mut(thread).status = AgentThreadStatus::Running;
+                            has_running_threads = true;
                         }
                     }
 
