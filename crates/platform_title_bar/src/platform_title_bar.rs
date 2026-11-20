@@ -111,7 +111,10 @@ impl PlatformTitleBar {
     }
 
     pub fn title_bar_color(&self, window: &mut Window, cx: &mut Context<Self>) -> Hsla {
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        if workspace::floating_panes::enabled(cx) {
+            // Like the gaps, the bar is part of what the surfaces float on.
+            workspace::floating_panes::gap_color(cx)
+        } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if window.is_window_active() && !self.should_move {
                 cx.theme().colors().title_bar_background
             } else {

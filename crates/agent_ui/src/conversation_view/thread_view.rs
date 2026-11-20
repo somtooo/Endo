@@ -60,7 +60,7 @@ use ui::{
 };
 use url::Url;
 use util::markdown::source_position_from_fragment;
-use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
+use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME, floating_panes};
 
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
@@ -5671,6 +5671,9 @@ impl ThreadView {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.has_visible_conversation(cx);
         let fills_container = !has_messages || editor_expanded;
+        // Below a conversation, the composer is a raised block in the floating
+        // surface that holds the thread instead of a strip across its bottom.
+        let raised = floating_panes::enabled(cx) && !fills_container;
         let composer_is_read_only = self.message_editor.read(cx).editor().read(cx).read_only(cx);
         let discard_draft_button = composer_is_read_only.then(|| {
             div()
@@ -5691,13 +5694,19 @@ impl ThreadView {
 
         h_flex()
             .py_2()
-            .bg(editor_bg_color)
+            .map(|this| {
+                if raised {
+                    this.px_2()
+                } else {
+                    this.bg(editor_bg_color)
+                }
+            })
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
             .map(|this| {
                 if has_messages {
                     this.on_action(cx.listener(Self::expand_message_editor))
-                        .border_t_1()
+                        .when(!raised, |this| this.border_t_1())
                         .border_color(cx.theme().colors().border)
                         .when(editor_expanded, |this| this.h(vh(0.8, window)))
                 } else {
@@ -5711,6 +5720,9 @@ impl ThreadView {
                     .min_w_0()
                     .when(fills_container, |this| this.h_full())
                     .px_2()
+                    .when(raised, |this| {
+                        floating_panes::raised(this.py_1p5().bg(editor_bg_color), cx)
+                    })
                     .flex_shrink_1()
                     .flex_grow_0()
                     .justify_between()

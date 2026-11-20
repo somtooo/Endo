@@ -1,7 +1,7 @@
 use crate::focus_follows_mouse::FocusFollowsMouse as _;
 use crate::persistence::model::DockData;
 use crate::status_bar::HideStatusItem;
-use crate::{DraggedDock, Event, ModalLayer, Pane, WorkspaceSettings};
+use crate::{DraggedDock, Event, ModalLayer, Pane, WorkspaceSettings, floating_panes};
 use crate::{Workspace, status_bar::StatusItemView};
 use anyhow::Context as _;
 use client::proto;
@@ -1278,6 +1278,14 @@ impl Render for Dock {
         let dispatch_context = Self::dispatch_context(cx);
         if let Some(entry) = self.visible_entry() {
             let position = self.position;
+            let floating_panes = floating_panes::enabled(cx);
+            // Floating panes are separated by a gap. The handle sits in the
+            // middle of it, where the edge of the dock would otherwise be.
+            let handle_offset = if floating_panes {
+                -(floating_panes::GAP + RESIZE_HANDLE_SIZE) / 2.
+            } else {
+                -RESIZE_HANDLE_SIZE / 2.
+            };
             let create_resize_handle = || {
                 let handle = div()
                     .id("resize-handle")
@@ -1310,7 +1318,7 @@ impl Render for Dock {
                     DockPosition::Left => deferred(
                         handle
                             .absolute()
-                            .right(-RESIZE_HANDLE_SIZE / 2.)
+                            .right(handle_offset)
                             .top(px(0.))
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
@@ -1319,7 +1327,7 @@ impl Render for Dock {
                     DockPosition::Bottom => deferred(
                         handle
                             .absolute()
-                            .top(-RESIZE_HANDLE_SIZE / 2.)
+                            .top(handle_offset)
                             .left(px(0.))
                             .w_full()
                             .h(RESIZE_HANDLE_SIZE)
@@ -1329,7 +1337,7 @@ impl Render for Dock {
                         handle
                             .absolute()
                             .top(px(0.))
-                            .left(-RESIZE_HANDLE_SIZE / 2.)
+                            .left(handle_offset)
                             .h_full()
                             .w(RESIZE_HANDLE_SIZE)
                             .cursor_col_resize(),
@@ -1352,10 +1360,15 @@ impl Render for Dock {
                     Axis::Horizontal => this.w_full().h_full().flex_row(),
                     Axis::Vertical => this.h_full().w_full().flex_col(),
                 })
-                .map(|this| match self.position() {
-                    DockPosition::Left => this.border_r_1(),
-                    DockPosition::Right => this.border_l_1(),
-                    DockPosition::Bottom => this.border_t_1(),
+                .map(|this| {
+                    if floating_panes {
+                        return floating_panes::surface(this);
+                    }
+                    match self.position() {
+                        DockPosition::Left => this.border_r_1(),
+                        DockPosition::Right => this.border_l_1(),
+                        DockPosition::Bottom => this.border_t_1(),
+                    }
                 })
                 .child(
                     div()

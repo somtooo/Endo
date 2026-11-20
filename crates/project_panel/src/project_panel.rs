@@ -6269,10 +6269,16 @@ impl ProjectPanel {
                 },
             )
             .cursor_pointer()
-            .rounded_none()
+            .map(|this| {
+                // A row that runs into the rounded edge of a floating surface
+                // looks cut off, so it becomes a rounded row inside of it.
+                if WorkspaceSettings::get_global(cx).floating_panes {
+                    this.mx_1().rounded_sm().border_1()
+                } else {
+                    this.rounded_none().border_1().border_r_2()
+                }
+            })
             .bg(bg_color)
-            .border_1()
-            .border_r_2()
             .border_color(border_color)
             .hover(|style| style.bg(bg_hover_color).border_color(border_hover_color))
             .when(is_sticky, |this| this.block_mouse_except_scroll())
