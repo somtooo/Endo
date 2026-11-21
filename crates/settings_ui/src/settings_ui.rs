@@ -2858,7 +2858,8 @@ impl SettingsWindow {
 
         let file_button =
             |ix, file: &SettingsUiFile, focus_handle, cx: &mut Context<SettingsWindow>| {
-                Button::new(
+                let is_current_file = file == &self.current_file;
+                let button = Button::new(
                     ix,
                     self.display_name(&file)
                         .expect("Files should always have a name"),
@@ -2872,7 +2873,8 @@ impl SettingsWindow {
                         this.change_file(ix, window, cx);
                         focus_handle.focus(window, cx);
                     }
-                }))
+                }));
+                render_file_tab(button, is_current_file, cx)
             };
 
         let this = cx.entity();
@@ -3228,6 +3230,13 @@ impl SettingsWindow {
             .border_r_1()
             .border_color(cx.theme().colors().border)
             .bg(cx.theme().colors().panel_background)
+            // While panes float, the navigation sits on the backdrop of the
+            // window, without a frame of its own.
+            .when(floating_panes_style::is_enabled(cx), |this| {
+                this.border_r_0()
+                    .bg(gpui::transparent_black())
+                    .p(floating_panes_style::GAP)
+            })
             .child(self.render_search(window, cx))
             .child(
                 v_flex()
@@ -3642,8 +3651,16 @@ impl SettingsWindow {
                         .px_8()
                         .when(settings_window.sub_page_stack.is_empty(), |element| {
                             element.when_some(root_nav_label, |element, title| {
-                                element
-                                    .child(Label::new(title).size(LabelSize::Large).mt_2().mb_3())
+                                element.child(
+                                    Label::new(title).size(LabelSize::Large).mt_2().mb_3().when(
+                                        floating_panes_style::is_enabled(cx),
+                                        |label| {
+                                            label.color(Color::Custom(
+                                                floating_panes_style::emphasized_text_color(cx),
+                                            ))
+                                        },
+                                    ),
+                                )
                             })
                         })
                         .into_any_element();
@@ -3799,7 +3816,14 @@ impl SettingsWindow {
             page_content
                 .when(self.sub_page_stack.is_empty(), |this| {
                     this.when_some(root_nav_label, |this, title| {
-                        this.child(Label::new(title).size(LabelSize::Large).mt_2().mb_3())
+                        this.child(Label::new(title).size(LabelSize::Large).mt_2().mb_3().when(
+                            floating_panes_style::is_enabled(cx),
+                            |label| {
+                                label.color(Color::Custom(
+                                    floating_panes_style::emphasized_text_color(cx),
+                                ))
+                            },
+                        ))
                     })
                 })
                 .children(items.clone().into_iter().enumerate().map(
@@ -4147,6 +4171,13 @@ impl SettingsWindow {
             .flex_1()
             .min_w_0()
             .bg(cx.theme().colors().editor_background)
+            // While panes float, the page is a floating card on the backdrop.
+            .when(floating_panes_style::is_enabled(cx), |this| {
+                floating_panes_style::style_card(this, cx)
+                    .m(floating_panes_style::GAP)
+                    .ml_0()
+                    .overflow_hidden()
+            })
             .child(
                 v_flex()
                     .px_8()
@@ -4747,6 +4778,9 @@ impl Render for SettingsWindow {
                         .text_color(cx.theme().colors().text)
                         .when(!cfg!(target_os = "macos"), |this| {
                             this.border_t_1().border_color(cx.theme().colors().border)
+                        })
+                        .when(floating_panes_style::is_enabled(cx), |this| {
+                            this.bg(floating_panes_style::gap_color(cx)).border_t_0()
                         })
                         .child(self.render_nav(window, cx))
                         .child(self.render_page(window, cx)),
@@ -8027,4 +8061,23 @@ mod project_settings_update_tests {
             text
         );
     }
+}
+
+/// While panes float, the settings file tabs are pills, like the tabs of a
+/// pane, instead of accent-tinted buttons.
+fn render_file_tab(button: Button, is_current_file: bool, cx: &App) -> AnyElement {
+    if !floating_panes_style::is_enabled(cx) {
+        return button.into_any_element();
+    }
+    div()
+        .rounded(floating_panes_style::ROW_CORNER_RADIUS)
+        .when(is_current_file, |this| {
+            this.bg(cx.theme().colors().ghost_element_selected)
+        })
+        .child(
+            button
+                .selected_style(ButtonStyle::Subtle)
+                .selected_label_color(Color::Default),
+        )
+        .into_any_element()
 }

@@ -16,6 +16,7 @@ path = "src/ui.rs"
 chrono.workspace = true
 component.workspace = true
 documented.workspace = true
+floating_panes_style.workspace = true
 gpui.workspace = true
 gpui_macros.workspace = true
 icons.workspace = true

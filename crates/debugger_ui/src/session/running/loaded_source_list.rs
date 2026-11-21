@@ -48,7 +48,12 @@ impl LoadedSourceList {
             .w_full()
             .group("")
             .p_1()
-            .hover(|s| s.bg(cx.theme().colors().element_hover))
+            .hover(|s| {
+                s.bg(floating_panes_style::row_hover_background(
+                    cx.theme().colors().element_hover,
+                    cx,
+                ))
+            })
             .child(
                 h_flex()
                     .gap_0p5()

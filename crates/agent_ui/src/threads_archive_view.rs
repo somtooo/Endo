@@ -41,7 +41,7 @@ use util::ResultExt;
 use util::paths::PathExt;
 use workspace::{
     CloseWindow, ModalView, PathList, RecentWorkspace, SerializedWorkspaceLocation, Workspace,
-    WorkspaceDb, WorkspaceId,
+    WorkspaceDb, WorkspaceId, floating_panes,
 };
 
 use zed_actions::agents_sidebar::FocusSidebarFilter;
@@ -592,6 +592,23 @@ impl ThreadsArchiveView {
         self.unarchive_thread(thread.clone(), window, cx);
     }
 
+    /// While panes float, thread rows are rounded rows inset from the edges of
+    /// the sidebar, like the rows of the thread list.
+    fn render_inset_list_entry(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let is_thread = matches!(self.items.get(ix), Some(ArchiveListItem::Entry { .. }));
+        let entry = self.render_list_entry(ix, window, cx);
+        if is_thread && floating_panes::enabled(cx) {
+            div().w_full().px_1().child(entry).into_any_element()
+        } else {
+            entry
+        }
+    }
+
     fn render_list_entry(
         &mut self,
         ix: usize,
@@ -662,8 +679,17 @@ impl ThreadsArchiveView {
 
                 let archived_color = Color::Custom(cx.theme().colors().icon_muted.opacity(0.6));
 
+                // The title fade paints this color over the row's edge, so it must match
+                // the sidebar behind the row, which is the gap color when floating panes are on.
+                let row_base_bg = if floating_panes::enabled(cx) {
+                    floating_panes::gap_color(cx)
+                } else {
+                    cx.theme().colors().panel_background
+                };
+
                 let base = ThreadItem::new(id, thread.display_title())
-                    .base_bg(cx.theme().colors().panel_background)
+                    .base_bg(row_base_bg)
+                    .rounded(floating_panes::enabled(cx))
                     .icon(icon)
                     .when(is_archived, |this| {
                         this.archived(true)
@@ -1093,7 +1119,7 @@ impl Render for ThreadsArchiveView {
                 .child(
                     list(
                         self.list_state.clone(),
-                        cx.processor(Self::render_list_entry),
+                        cx.processor(Self::render_inset_list_entry),
                     )
                     .flex_1()
                     .size_full(),

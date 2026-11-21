@@ -375,6 +375,9 @@ impl Render for RemoteConnectionModal {
             .w(rems(34.))
             .border_1()
             .border_color(theme.colors().border)
+            .when(floating_panes_style::is_enabled(cx), |this| {
+                this.border_color(floating_panes_style::popup_elevation(cx).ring)
+            })
             .key_context("SshConnectionModal")
             .track_focus(&self.focus_handle(cx))
             .on_action(cx.listener(Self::dismiss))

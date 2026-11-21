@@ -7803,11 +7803,28 @@ impl GitPanel {
                 .gap_1()
                 .flex_1()
                 .justify_center()
-                .hover(|s| s.bg(cx.theme().colors().element_hover))
+                .hover(|s| {
+                    s.bg(floating_panes_style::row_hover_background(
+                        cx.theme().colors().element_hover,
+                        cx,
+                    ))
+                })
                 .border_b_1()
                 .when(!active, |s| {
                     s.bg(cx.theme().colors().editor_background.opacity(0.6))
                         .border_color(cx.theme().colors().border.opacity(0.6))
+                })
+                // While panes float, the tabs are pills, like the tabs of a pane.
+                .when(floating_panes_style::is_enabled(cx), |this| {
+                    let colors = cx.theme().colors();
+                    this.h(Tab::container_height(cx) - floating_panes_style::ROW_INSET * 2.)
+                        .rounded(floating_panes_style::ROW_CORNER_RADIUS)
+                        .border_b_0()
+                        .bg(if active {
+                            colors.ghost_element_selected
+                        } else {
+                            gpui::transparent_black()
+                        })
                 })
                 .child(Label::new(label.clone()).when(!active, |this| this.color(Color::Muted)))
                 .when(show_changes && changes_count > 0, |this| {
@@ -7831,6 +7848,10 @@ impl GitPanel {
             .relative()
             .h(Tab::container_height(cx))
             .w_full()
+            .when(floating_panes_style::is_enabled(cx), |this| {
+                this.px(floating_panes_style::ROW_INSET)
+                    .gap(floating_panes_style::ROW_INSET)
+            })
             .child(tab(
                 ElementId::Name("changes-tab".into()),
                 active_tab == GitPanelTab::Changes,
@@ -7842,7 +7863,10 @@ impl GitPanel {
             .child(
                 Divider::vertical()
                     .color(ui::DividerColor::BorderFaded)
-                    .h_full(),
+                    .h_full()
+                    .when(floating_panes_style::is_enabled(cx), |this| {
+                        this.invisible()
+                    }),
             )
             .child(tab(
                 ElementId::Name("history-tab".into()),
@@ -8305,14 +8329,28 @@ impl GitPanel {
                                             is_active,
                                             |this| this.bg(cx.theme().colors().element_selected),
                                             |this| {
-                                                this.hover(|s| {
-                                                    s.bg(cx.theme().colors().element_hover)
-                                                })
-                                                .when(is_context_menu_target, |this| {
-                                                    this.bg(cx.theme().colors().element_hover)
-                                                })
+                                                let hover_background =
+                                                    floating_panes_style::row_hover_background(
+                                                        cx.theme().colors().element_hover,
+                                                        cx,
+                                                    );
+                                                this.hover(|s| s.bg(hover_background))
+                                                    .when(is_context_menu_target, |this| {
+                                                        this.bg(hover_background)
+                                                    })
                                             },
                                         )
+                                        .when(floating_panes_style::is_enabled(cx), |this| {
+                                            floating_panes_style::style_inset_row(this).when(
+                                                is_active,
+                                                |this| {
+                                                    this.bg(cx
+                                                        .theme()
+                                                        .colors()
+                                                        .ghost_element_selected)
+                                                },
+                                            )
+                                        })
                                         .child(
                                             h_flex()
                                                 .gap_1()
@@ -8886,6 +8924,10 @@ impl GitPanel {
             .hover(|style| style.bg(cx.theme().colors().ghost_element_hover))
             .border_1()
             .border_r_2()
+            .when(
+                floating_panes_style::is_enabled(cx),
+                floating_panes_style::style_inset_row,
+            )
             .child(
                 h_flex()
                     .flex_1()
@@ -9394,6 +9436,10 @@ impl GitPanel {
             .gap_1p5()
             .border_1()
             .border_r_2()
+            .when(
+                floating_panes_style::is_enabled(cx),
+                floating_panes_style::style_inset_row,
+            )
             .when(selected && self.focus_handle.is_focused(window), |el| {
                 el.border_color(cx.theme().colors().panel_focused_border)
             })
@@ -9639,6 +9685,10 @@ impl GitPanel {
             .justify_between()
             .border_1()
             .border_r_2()
+            .when(
+                floating_panes_style::is_enabled(cx),
+                floating_panes_style::style_inset_row,
+            )
             .when(selected && self.focus_handle.is_focused(window), |el| {
                 el.border_color(cx.theme().colors().panel_focused_border)
             })

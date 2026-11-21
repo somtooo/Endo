@@ -179,7 +179,12 @@ fn configured_theme(cx: &mut App) -> Arc<Theme> {
                 .unwrap_or_else(|_| themes.get(DEFAULT_DARK_THEME).unwrap())
         }
     };
-    theme_settings.apply_theme_overrides(theme)
+    let theme = theme_settings.apply_theme_overrides(theme);
+    if floating_panes_style::is_enabled(cx) {
+        floating_panes_style::lift_ink(theme)
+    } else {
+        theme
+    }
 }
 
 fn configured_icon_theme(cx: &mut App) -> Arc<theme::IconTheme> {

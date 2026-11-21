@@ -1722,6 +1722,11 @@ impl DiagnosticPopover {
             .id("diagnostic")
             .occlude()
             .elevation_2_borderless(cx)
+            // While panes float, the popover has the edge of every other
+            // pop-up, and the severity colors are a block inside of it.
+            .when(floating_panes_style::is_enabled(cx), |this| {
+                floating_panes_style::style_popup(this, cx).p(floating_panes_style::BLOCK_INSET)
+            })
             .child(
                 canvas(
                     {
@@ -1770,6 +1775,9 @@ impl DiagnosticPopover {
                     .border_1()
                     .border_color(self.border_color)
                     .rounded_lg()
+                    .when(floating_panes_style::is_enabled(cx), |this| {
+                        this.rounded(floating_panes_style::BLOCK_CORNER_RADIUS)
+                    })
                     .child(
                         div()
                             .id("diagnostic-content-container")

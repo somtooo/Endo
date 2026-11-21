@@ -4,6 +4,12 @@ use crate::ElevationIndex;
 use crate::prelude::*;
 
 fn elevated<E: Styled>(this: E, cx: &App, index: ElevationIndex) -> E {
+    if floating_panes_style::is_enabled(cx) {
+        return floating_panes_style::style_popup(
+            this.bg(cx.theme().colors().elevated_surface_background),
+            cx,
+        );
+    }
     this.bg(cx.theme().colors().elevated_surface_background)
         .rounded_lg()
         .border_1()
@@ -12,6 +18,12 @@ fn elevated<E: Styled>(this: E, cx: &App, index: ElevationIndex) -> E {
 }
 
 fn elevated_borderless<E: Styled>(this: E, cx: &mut App, index: ElevationIndex) -> E {
+    if floating_panes_style::is_enabled(cx) {
+        return floating_panes_style::style_borderless_popup(
+            this.bg(cx.theme().colors().elevated_surface_background),
+            cx,
+        );
+    }
     this.bg(cx.theme().colors().elevated_surface_background)
         .rounded_lg()
         .shadow(index.shadow(cx))

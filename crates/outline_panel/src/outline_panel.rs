@@ -3086,6 +3086,11 @@ impl OutlinePanel {
             .border_1()
             .border_r_2()
             .rounded_none()
+            .when(floating_panes_style::is_enabled(cx), |this| {
+                this.mx_1()
+                    .border_1()
+                    .rounded(floating_panes_style::ROW_CORNER_RADIUS)
+            })
             .hover(|style| {
                 if is_active {
                     style

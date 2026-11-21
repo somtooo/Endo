@@ -11,6 +11,7 @@ pub struct GradientFade {
     width: Pixels,
     width_hovered: Option<Pixels>,
     right: Pixels,
+    right_corner_radius: Pixels,
     gradient_stop: f32,
     group_name: Option<SharedString>,
 }
@@ -23,6 +24,7 @@ impl GradientFade {
             active_bg,
             width: px(48.0),
             right: px(0.0),
+            right_corner_radius: px(0.0),
             gradient_stop: 0.6,
             group_name: None,
             width_hovered: None,
@@ -41,6 +43,12 @@ impl GradientFade {
 
     pub fn right(mut self, right: Pixels) -> Self {
         self.right = right;
+        self
+    }
+
+    /// Rounds the right corners, for a fade at the end of a rounded row.
+    pub fn rounded_r(mut self, radius: Pixels) -> Self {
+        self.right_corner_radius = radius;
         self
     }
 
@@ -72,6 +80,7 @@ impl RenderOnce for GradientFade {
             .right(self.right)
             .w(self.width)
             .h_full()
+            .rounded_r(self.right_corner_radius)
             .bg(linear_gradient(
                 90.,
                 linear_color_stop(base_bg, stop),

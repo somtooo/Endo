@@ -1249,6 +1249,9 @@ impl Editor {
                             .elevation_2(cx)
                             .border(BORDER_WIDTH)
                             .border_color(cx.theme().colors().border)
+                            .when(floating_panes_style::is_enabled(cx), |el| {
+                                el.border_color(floating_panes_style::popup_elevation(cx).ring)
+                            })
                             .when(keybind_display.missing_accept_keystroke, |el| {
                                 el.border_color(cx.theme().status().error)
                             })
@@ -1372,6 +1375,9 @@ impl Editor {
                 .flex_1()
                 .elevation_2(cx)
                 .border_color(cx.theme().colors().border)
+                .when(floating_panes_style::is_enabled(cx), |el| {
+                    el.border_color(floating_panes_style::popup_elevation(cx).ring)
+                })
                 .child(
                     div()
                         .flex_1()

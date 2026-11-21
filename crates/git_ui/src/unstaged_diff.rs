@@ -68,6 +68,9 @@ impl DiffHunkRenderer for UnstagedDiffHunkRenderer {
             .bg(cx.theme().colors().editor_background)
             .block_mouse_except_scroll()
             .shadow_md()
+            .when(floating_panes_style::is_enabled(cx), |el| {
+                floating_panes_style::style_hanging_tab(el, cx)
+            })
             .child(
                 Button::new(("stage", row as u64), "Stage")
                     .alpha(if status.is_pending() { 0.66 } else { 1.0 })

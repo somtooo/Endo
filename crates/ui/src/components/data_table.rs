@@ -650,7 +650,19 @@ pub fn render_table_row(
         .size_full()
         .when_some(bg, |row, bg| row.bg(bg))
         .when(table_context.show_row_hover, |row| {
-            row.hover(|s| s.bg(cx.theme().colors().element_hover.opacity(0.6)))
+            row.hover(|s| {
+                let colors = cx.theme().colors();
+                s.bg(if floating_panes_style::is_enabled(cx) {
+                    colors.ghost_element_hover
+                } else {
+                    colors.element_hover.opacity(0.6)
+                })
+            })
+        })
+        // While panes float, rows and their stripes are rounded like every
+        // other row.
+        .when(floating_panes_style::is_enabled(cx), |row| {
+            row.rounded(floating_panes_style::ROW_CORNER_RADIUS)
         });
 
     let pinned_cols = table_context.pinned_cols;

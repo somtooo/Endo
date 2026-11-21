@@ -502,6 +502,7 @@ dependencies = [
  "extension_host",
  "feature_flags",
  "file_icons",
+ "floating_panes_style",
  "fs",
  "futures 0.3.34",
  "fuzzy",
@@ -3381,6 +3382,7 @@ dependencies = [
  "collections",
  "db",
  "editor",
+ "floating_panes_style",
  "futures 0.3.34",
  "fuzzy",
  "gpui",
@@ -4773,6 +4775,7 @@ dependencies = [
  "editor",
  "feature_flags",
  "file_icons",
+ "floating_panes_style",
  "futures 0.3.34",
  "fuzzy",
  "gpui",
@@ -5522,6 +5525,7 @@ dependencies = [
  "emojis",
  "feature_flags",
  "file_icons",
+ "floating_panes_style",
  "fs",
  "futures 0.3.34",
  "futures-lite 2.6.1",
@@ -6502,6 +6506,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ce81f49ae8a0482e4c55ea62ebbd7e5a686af544c00b9d090bba3ff9be97b3d"
 
 [[package]]
+name = "floating_panes_style"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "theme",
+]
+
+[[package]]
 name = "fluent-uri"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7183,6 +7195,7 @@ dependencies = [
  "db",
  "editor",
  "file_icons",
+ "floating_panes_style",
  "fs",
  "futures 0.3.34",
  "futures-lite 2.6.1",
@@ -12901,6 +12914,7 @@ dependencies = [
  "db",
  "editor",
  "file_icons",
+ "floating_panes_style",
  "futures 0.3.34",
  "fuzzy",
  "git",
@@ -14593,6 +14607,7 @@ dependencies = [
  "criterion",
  "editor",
  "file_icons",
+ "floating_panes_style",
  "fs",
  "futures 0.3.34",
  "git",
@@ -15713,6 +15728,7 @@ dependencies = [
  "askpass",
  "auto_update",
  "editor",
+ "floating_panes_style",
  "futures 0.3.34",
  "gpui",
  "log",
@@ -17155,6 +17171,7 @@ dependencies = [
  "extension",
  "extension_host",
  "feature_flags",
+ "floating_panes_style",
  "fs",
  "futures 0.3.34",
  "fuzzy",
@@ -17305,6 +17322,7 @@ dependencies = [
  "editor",
  "extension",
  "feature_flags",
+ "floating_panes_style",
  "fs",
  "git",
  "git_ui_core",
@@ -18913,6 +18931,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "collections",
+ "floating_panes_style",
  "gpui",
  "gpui_util",
  "log",
@@ -19960,6 +19979,7 @@ dependencies = [
  "chrono",
  "component",
  "documented",
+ "floating_panes_style",
  "gpui",
  "gpui_macros",
  "gpui_util",
@@ -22779,6 +22799,7 @@ dependencies = [
  "component",
  "db",
  "dirs",
+ "floating_panes_style",
  "fs",
  "futures 0.3.34",
  "futures-lite 2.6.1",

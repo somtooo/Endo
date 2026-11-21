@@ -148,10 +148,19 @@ impl ModuleList {
                 })
             })
             .p_1()
-            .hover(|s| s.bg(cx.theme().colors().element_hover))
+            .hover(|s| {
+                s.bg(floating_panes_style::row_hover_background(
+                    cx.theme().colors().element_hover,
+                    cx,
+                ))
+            })
             .when(Some(ix) == self.selected_ix, |s| {
                 s.bg(cx.theme().colors().element_hover)
             })
+            .when(
+                Some(ix) == self.selected_ix && floating_panes_style::is_enabled(cx),
+                |s| s.bg(cx.theme().colors().ghost_element_selected),
+            )
             .child(h_flex().gap_0p5().text_ui_sm(cx).child(module.name.clone()))
             .child(
                 h_flex()

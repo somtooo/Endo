@@ -741,6 +741,14 @@ pub(crate) fn render_buffer_header(
                     border.border_color(border_color)
                 })
                 .when(is_sticky && opaque_window, |s| s.shadow_md())
+                // Nests inside the floating card: its radius plus the header's
+                // padding is the card's radius.
+                .when(floating_panes_style::is_enabled(cx), |s| {
+                    s.rounded(floating_panes_style::BLOCK_CORNER_RADIUS)
+                        .when(is_sticky && opaque_window, |s| {
+                            s.shadow(floating_panes_style::card_elevation(cx).shadows)
+                        })
+                })
                 .when(show_header_background, |s| {
                     s.bg(colors.editor_subheader_background)
                 })

@@ -5361,7 +5361,7 @@ fn window_and_layout_page() -> SettingsPage {
         ]
     }
 
-    fn pane_modifiers_section() -> [SettingsPageItem; 5] {
+    fn pane_modifiers_section() -> [SettingsPageItem; 6] {
         [
             SettingsPageItem::SectionHeader("Pane Modifiers"),
             SettingsPageItem::SettingItem(SettingItem {
@@ -5423,6 +5423,20 @@ fn window_and_layout_page() -> SettingsPage {
                     pick: |settings_content| settings_content.workspace.zoomed_padding.as_ref(),
                     write: |settings_content, value, _| {
                         settings_content.workspace.zoomed_padding = value;
+                    },
+                }),
+                metadata: None,
+                files: USER,
+            }),
+            SettingsPageItem::SettingItem(SettingItem {
+                title: "Floating Panes",
+                description: "Render the docks and the editor area as separate floating surfaces with rounded corners and a soft shadow. The status bar is hidden until toggled.",
+                field: Box::new(SettingField {
+                    organization_override: None,
+                    json_path: Some("floating_panes"),
+                    pick: |settings_content| settings_content.workspace.floating_panes.as_ref(),
+                    write: |settings_content, value, _| {
+                        settings_content.workspace.floating_panes = value;
                     },
                 }),
                 metadata: None,

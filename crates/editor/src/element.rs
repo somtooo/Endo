@@ -5272,7 +5272,14 @@ impl EditorElement {
                                 origin: point(range.start, layout.hitbox.origin.y + start_y),
                                 size: size(range.end - range.start, end_y - start_y),
                             };
-                            window.paint_quad(fill(bounds, active_line_bg));
+                            if floating_panes_style::is_enabled(cx) {
+                                window.paint_quad(
+                                    fill(inset_row_bounds(bounds), active_line_bg)
+                                        .corner_radii(floating_panes_style::ROW_CORNER_RADIUS),
+                                );
+                            } else {
+                                window.paint_quad(fill(bounds, active_line_bg));
+                            }
                         }
                     }
                 }
@@ -5300,6 +5307,25 @@ impl EditorElement {
                     if let Some(border_color) = highlight.border {
                         quad.border_color = border_color;
                         quad.border_widths = edges
+                    }
+                    // A run that continues into the next one, such as the deleted
+                    // lines above the added lines of a hunk, only rounds the
+                    // corners on the outside of the pair.
+                    if floating_panes_style::is_enabled(cx) {
+                        let radius = |edge: Pixels| {
+                            if edge > Pixels::ZERO {
+                                floating_panes_style::ROW_CORNER_RADIUS
+                            } else {
+                                Pixels::ZERO
+                            }
+                        };
+                        quad.bounds = inset_row_bounds(quad.bounds);
+                        quad.corner_radii = Corners {
+                            top_left: radius(edges.top),
+                            top_right: radius(edges.top),
+                            bottom_right: radius(edges.bottom),
+                            bottom_left: radius(edges.bottom),
+                        };
                     }
                     window.paint_quad(quad);
                 };
@@ -5572,6 +5598,16 @@ impl EditorElement {
                                 Corners::all(1. * line_height),
                                 *status,
                             ),
+                            _ if floating_panes_style::is_enabled(cx) => {
+                                // Marks of neighboring hunks would touch and
+                                // read as one, so each becomes a capsule with
+                                // a gap above and below it.
+                                let mut bounds = hunk_hitbox.bounds;
+                                bounds.origin.y += px(1.);
+                                bounds.size.height = (bounds.size.height - px(2.)).max(px(0.));
+                                let radius = bounds.size.width / 2.;
+                                (bounds, color, Corners::all(radius), *status)
+                            }
                             _ => (hunk_hitbox.bounds, color, Corners::all(px(0.)), *status),
                         }
                     }),
@@ -6096,12 +6132,19 @@ impl EditorElement {
         window.paint_layer(|window| {
             let mut invisible_display_ranges = SmallVec::<[Range<DisplayPoint>; 32]>::new();
             let line_end_overshoot = 0.15 * layout.position_map.line_height;
+            let highlight_corner_radius = if floating_panes_style::is_enabled(cx)
+                && EditorSettings::get_global(cx).rounded_selection
+            {
+                0.15 * layout.position_map.line_height
+            } else {
+                Pixels::ZERO
+            };
             for (range, color) in &layout.highlighted_ranges {
                 self.paint_highlighted_range(
                     range.clone(),
                     true,
                     *color,
-                    Pixels::ZERO,
+                    highlight_corner_radius,
                     line_end_overshoot,
                     layout,
                     window,
@@ -6291,6 +6334,16 @@ impl EditorElement {
                     },
                 };
 
+                // While panes float, the scrollbar is a thin rounded thumb
+                // inside the card, like the scrollbars of the panels, without
+                // the line along its track.
+                let floating = floating_panes_style::is_enabled(cx);
+                let scrollbar_edges = if floating {
+                    Edges::default()
+                } else {
+                    scrollbar_edges
+                };
+
                 window.paint_layer(|window| {
                     window.paint_quad(quad(
                         hitbox.bounds,
@@ -6328,9 +6381,14 @@ impl EditorElement {
                                 cx.theme().colors().scrollbar_thumb_background
                             }
                         };
+                        let (thumb_bounds, thumb_corners) = if floating {
+                            floating_scrollbar_thumb(thumb_bounds, hitbox.bounds, axis)
+                        } else {
+                            (thumb_bounds, Corners::default())
+                        };
                         window.paint_quad(quad(
                             thumb_bounds,
-                            Corners::default(),
+                            thumb_corners,
                             scrollbar_thumb_color,
                             scrollbar_edges,
                             cx.theme().colors().scrollbar_thumb_border,
@@ -7303,6 +7361,14 @@ pub fn render_breadcrumb_text(
         text_style.color = Color::Muted.color(cx);
 
         if index == 0
+            && floating_panes_style::is_enabled(cx)
+            && let Some(styled_element) =
+                apply_floating_filename_style(&segment, &text_style, active_item.is_dirty(cx), cx)
+        {
+            return styled_element;
+        }
+
+        if index == 0
             && !workspace::TabBarSettings::get_global(cx).show
             && active_item.is_dirty(cx)
             && let Some(styled_element) = apply_dirty_filename_style(&segment, &text_style, cx)
@@ -7459,6 +7525,34 @@ fn apply_dirty_filename_style(
     Some(
         StyledText::new(text)
             .with_default_highlights(text_style, highlight)
+            .into_any(),
+    )
+}
+
+/// While panes float, the folders of the path recede and the file name reads
+/// like the text around it, bold only while it has unsaved changes.
+fn apply_floating_filename_style(
+    segment: &HighlightedText,
+    text_style: &gpui::TextStyle,
+    is_dirty: bool,
+    cx: &App,
+) -> Option<gpui::AnyElement> {
+    let text = segment.text.replace('\n', " ");
+    let filename_position = std::path::Path::new(segment.text.as_ref())
+        .file_name()
+        .and_then(|file_name| segment.text.rfind(file_name.to_string_lossy().as_ref()))?;
+
+    let mut folder_style = text_style.clone();
+    folder_style.color = Color::Placeholder.color(cx);
+    let filename_highlight = gpui::HighlightStyle {
+        font_weight: is_dirty.then_some(FontWeight::BOLD),
+        color: Some(Color::Default.color(cx)),
+        ..Default::default()
+    };
+    let filename_range = filename_position..text.len();
+    Some(
+        StyledText::new(text)
+            .with_default_highlights(&folder_style, [(filename_range, filename_highlight)])
             .into_any(),
     )
 }
@@ -14499,5 +14593,46 @@ mod tests {
         expected.sort_by_key(|(row, x, _)| (*row, *x));
 
         assert_eq!(actual, expected, "scale: {scale}, x offset: {x_offset:?}");
+    }
+}
+
+/// The thin thumb of an editor scrollbar while panes float: as wide as the
+/// thumbs of the panels' scrollbars and as far from the card's edge.
+fn floating_scrollbar_thumb(
+    thumb_bounds: Bounds<Pixels>,
+    track_bounds: Bounds<Pixels>,
+    axis: ScrollbarAxis,
+) -> (Bounds<Pixels>, Corners<Pixels>) {
+    const THICKNESS: Pixels = px(6.);
+    let edge_distance = floating_panes_style::ROW_INSET;
+    let bounds = match axis {
+        ScrollbarAxis::Vertical => Bounds {
+            origin: point(
+                track_bounds.right() - edge_distance - THICKNESS,
+                thumb_bounds.origin.y,
+            ),
+            size: size(THICKNESS, thumb_bounds.size.height),
+        },
+        ScrollbarAxis::Horizontal => Bounds {
+            origin: point(
+                thumb_bounds.origin.x,
+                track_bounds.bottom() - edge_distance - THICKNESS,
+            ),
+            size: size(thumb_bounds.size.width, THICKNESS),
+        },
+    };
+    (bounds, Corners::all(THICKNESS / 2.))
+}
+
+/// Insets a full-width row highlight from the edges of the floating surface the
+/// editor is in, so it becomes a rounded row inside of it.
+fn inset_row_bounds(bounds: Bounds<Pixels>) -> Bounds<Pixels> {
+    let inset = floating_panes_style::ROW_INSET;
+    Bounds {
+        origin: point(bounds.origin.x + inset, bounds.origin.y),
+        size: size(
+            (bounds.size.width - inset * 2.).max(Pixels::ZERO),
+            bounds.size.height,
+        ),
     }
 }

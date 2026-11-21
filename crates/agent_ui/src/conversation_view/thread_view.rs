@@ -61,7 +61,7 @@ use ui::{
 };
 use url::Url;
 use util::markdown::source_position_from_fragment;
-use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME};
+use workspace::{OpenOptions, SERIALIZATION_THROTTLE_TIME, floating_panes};
 
 use super::elicitation::{
     ElicitationCard, ElicitationCardHandlers, ElicitationFormState, should_render_elicitation,
@@ -4387,6 +4387,13 @@ impl ThreadView {
                             .when(index < changed_buffers.len() - 1, |parent| {
                                 parent.border_color(cx.theme().colors().border).border_b_1()
                             })
+                            // While panes float, each file is a rounded row
+                            // instead of a strip between two lines.
+                            .when(floating_panes::enabled(cx), |parent| {
+                                floating_panes_style::style_inset_row(parent)
+                                    .border_color(gpui::transparent_black())
+                                    .hover(|s| s.bg(cx.theme().colors().ghost_element_hover))
+                            })
                             .child(
                                 h_flex()
                                     .id(("file-name-path", index))
@@ -4405,7 +4412,15 @@ impl ThreadView {
                                         )
                                         .label_size(LabelSize::XSmall),
                                     )
-                                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                                    .hover(|s| {
+                                        s.bg(floating_panes_style::row_hover_background(
+                                            cx.theme().colors().element_hover,
+                                            cx,
+                                        ))
+                                    })
+                                    .when(floating_panes::enabled(cx), |this| {
+                                        this.rounded(floating_panes_style::CONTROL_CORNER_RADIUS)
+                                    })
                                     .tooltip({
                                         move |_, cx| {
                                             Tooltip::with_meta(
@@ -5743,6 +5758,9 @@ impl ThreadView {
         let max_content_width = AgentSettings::get_global(cx).max_content_width;
         let has_messages = self.has_visible_conversation(cx);
         let fills_container = !has_messages || editor_expanded;
+        // Below a conversation, the composer is a raised block in the floating
+        // surface that holds the thread instead of a strip across its bottom.
+        let raised = floating_panes::enabled(cx) && !fills_container;
         let composer_is_read_only = self.message_editor.read(cx).editor().read(cx).read_only(cx);
         let discard_draft_button = composer_is_read_only.then(|| {
             div()
@@ -5763,13 +5781,21 @@ impl ThreadView {
 
         h_flex()
             .py_2()
-            .bg(editor_bg_color)
+            .map(|this| {
+                if raised {
+                    this.px(floating_panes_style::BLOCK_INSET)
+                        .pt_0()
+                        .pb(floating_panes_style::BLOCK_INSET)
+                } else {
+                    this.bg(editor_bg_color)
+                }
+            })
             .justify_center()
             .on_action(cx.listener(Self::handle_message_editor_move_up))
             .map(|this| {
                 if has_messages {
                     this.on_action(cx.listener(Self::expand_message_editor))
-                        .border_t_1()
+                        .when(!raised, |this| this.border_t_1())
                         .border_color(cx.theme().colors().border)
                         .when(editor_expanded, |this| this.h(vh(0.8, window)))
                 } else {
@@ -5783,6 +5809,19 @@ impl ThreadView {
                     .min_w_0()
                     .when(fills_container, |this| this.h_full())
                     .px_2()
+                    .when(raised, |this| {
+                        // Only the composer that is being typed in is marked,
+                        // so that one place has the focus.
+                        let composer_focused = self
+                            .message_editor
+                            .focus_handle(cx)
+                            .contains_focused(window, cx);
+                        floating_panes::raised(
+                            this.py_1p5().bg(editor_bg_color),
+                            composer_focused,
+                            cx,
+                        )
+                    })
                     .flex_shrink_1()
                     .flex_grow_0()
                     .justify_between()
@@ -7742,6 +7781,9 @@ impl ThreadView {
                     })
                     .pb_3()
                     .px_2()
+                    .when(floating_panes::enabled(cx), |this| {
+                        this.px(floating_panes_style::BLOCK_INSET)
+                    })
                     .gap_1p5()
                     .w_full()
                     .child(
@@ -14484,12 +14526,28 @@ impl ThreadView {
     }
 }
 
+impl ThreadView {
+    /// While panes float, the thread title uses the emphasized text color. It
+    /// is set on every render so that it follows theme and setting changes.
+    fn sync_title_color(&mut self, cx: &mut Context<Self>) {
+        let color =
+            floating_panes::enabled(cx).then(|| floating_panes_style::emphasized_text_color(cx));
+        self.title_editor.update(cx, |editor, _| {
+            editor.set_text_style_refinement(gpui::TextStyleRefinement {
+                color,
+                ..Default::default()
+            });
+        });
+    }
+}
+
 impl Render for ThreadView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Keep the message editor's local slash commands in sync with the
         // current availability of feedback/sharing, which can change between
         // renders (settings, connection state, feature flags).
         self.sync_local_commands(cx);
+        self.sync_title_color(cx);
 
         let has_messages = self.has_visible_conversation(cx);
         let scroll_handle = self.conversation_scroll_handle();

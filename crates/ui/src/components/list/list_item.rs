@@ -297,6 +297,8 @@ impl ParentElement for ListItem {
 
 impl RenderOnce for ListItem {
     fn render(self, _window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let floating = floating_panes_style::is_enabled(cx);
+        let focus_visible = self.focused == Some(true) && !self.disabled;
         h_flex()
             .id(self.id)
             .when_some(self.group_name, |this, group| this.group(group))
@@ -327,6 +329,16 @@ impl RenderOnce for ListItem {
                             this.bg(cx.theme().colors().ghost_element_selected)
                         })
                 })
+            })
+            // While panes float, focus is one ring all around, without the bar
+            // on the side that faces the editor.
+            .when(floating && !self.inset && self.focused.is_some(), |this| {
+                this.border_1().when(focus_visible, |this| {
+                    this.border_color(cx.theme().colors().panel_focused_border)
+                })
+            })
+            .when(floating && self.inset, |this| {
+                this.px(floating_panes_style::ROW_INSET)
             })
             .when(self.rounded, |this| this.rounded_sm())
             .when_some(self.on_hover, |this, on_hover| this.on_hover(on_hover))
@@ -407,6 +419,12 @@ impl RenderOnce for ListItem {
                             // When an item is not inset draw the indent spacing inside of the item
                             this.ml(self.indent_level as f32 * self.indent_step_size)
                         }
+                    })
+                    .when(floating && self.inset, |this| {
+                        this.rounded(floating_panes_style::ROW_CORNER_RADIUS)
+                            .when(focus_visible, |this| {
+                                this.border_color(cx.theme().colors().panel_focused_border)
+                            })
                     })
                     .children(self.toggle.map(|is_open| {
                         div()

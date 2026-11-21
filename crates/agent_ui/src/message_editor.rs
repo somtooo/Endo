@@ -220,6 +220,9 @@ pub struct MessageEditor {
     local_commands: SharedLocalCommands,
     agent_id: AgentId,
     thread_store: Option<Entity<ThreadStore>>,
+    /// Whether this editor shows a message the user has sent, rather than
+    /// one they are composing.
+    is_sent_message: bool,
     _subscriptions: Vec<Subscription>,
     _parse_slash_command_task: Task<()>,
 }
@@ -649,6 +652,7 @@ impl MessageEditor {
             agent_id,
             thread_store,
             _subscriptions: subscriptions,
+            is_sent_message: false,
             _parse_slash_command_task: Task::ready(()),
         }
     }
@@ -1722,6 +1726,12 @@ impl MessageEditor {
             .detach_and_log_err(cx);
     }
 
+    /// Marks this editor as showing a message the user has sent, which is
+    /// emphasized while panes float.
+    pub fn mark_as_sent_message(&mut self) {
+        self.is_sent_message = true;
+    }
+
     pub fn set_read_only(&mut self, read_only: bool, cx: &mut Context<Self>) {
         self.editor.update(cx, |message_editor, cx| {
             message_editor.set_read_only(read_only);
@@ -2105,8 +2115,13 @@ impl Render for MessageEditor {
             .child({
                 let settings = ThemeSettings::get_global(cx);
 
+                let text_color = if self.is_sent_message && floating_panes_style::is_enabled(cx) {
+                    floating_panes_style::emphasized_text_color(cx)
+                } else {
+                    cx.theme().colors().text
+                };
                 let text_style = TextStyle {
-                    color: cx.theme().colors().text,
+                    color: text_color,
                     font_family: settings.agent_buffer_font_family().clone(),
                     font_fallbacks: settings.buffer_font.fallbacks.clone(),
                     font_features: settings.buffer_font.features.clone(),

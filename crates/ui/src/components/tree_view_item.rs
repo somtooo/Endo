@@ -155,6 +155,10 @@ impl RenderOnce for TreeViewItem {
         let root_item = self.root_item;
         let expanded = self.expanded;
         let selected = self.selected;
+        let floating = floating_panes_style::is_enabled(cx);
+        // While panes float, the selected item's label stands out like a title.
+        let selected_label_color =
+            floating.then(|| Color::Custom(floating_panes_style::emphasized_text_color(cx)));
 
         h_flex()
             .id(self.id)
@@ -185,7 +189,24 @@ impl RenderOnce for TreeViewItem {
                     .when(self.selected, |this| {
                         this.border_color(selected_border).bg(selected_bg)
                     })
-                    .hover(|s| s.bg(cx.theme().colors().element_hover))
+                    .hover(|s| {
+                        let colors = cx.theme().colors();
+                        s.bg(if floating {
+                            colors.ghost_element_hover
+                        } else {
+                            colors.element_hover
+                        })
+                    })
+                    .when(floating, |this| {
+                        let colors = cx.theme().colors();
+                        this.rounded(floating_panes_style::ROW_CORNER_RADIUS).when(
+                            self.selected,
+                            |this| {
+                                this.border_color(transparent_border)
+                                    .bg(colors.ghost_element_selected)
+                            },
+                        )
+                    })
                     .map(|this| {
                         let label = self.label;
 
@@ -200,7 +221,11 @@ impl RenderOnce for TreeViewItem {
                             )
                             .child(
                                 Label::new(label)
-                                    .when(!self.selected, |this| this.color(Color::Muted)),
+                                    .when(!self.selected, |this| this.color(Color::Muted))
+                                    .when_some(
+                                        selected_label_color.filter(|_| self.selected),
+                                        |this, color| this.color(color),
+                                    ),
                             )
                         } else {
                             this.child(indentation_line).child(
@@ -210,7 +235,11 @@ impl RenderOnce for TreeViewItem {
                                     .flex_grow_1()
                                     .child(
                                         Label::new(label)
-                                            .when(!self.selected, |this| this.color(Color::Muted)),
+                                            .when(!self.selected, |this| this.color(Color::Muted))
+                                            .when_some(
+                                                selected_label_color.filter(|_| self.selected),
+                                                |this, color| this.color(color),
+                                            ),
                                     ),
                             )
                         }

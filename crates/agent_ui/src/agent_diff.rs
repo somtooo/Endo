@@ -814,6 +814,9 @@ fn render_diff_hunk_controls(
         .gap_1()
         .block_mouse_except_scroll()
         .when(opaque_window, |this| this.shadow_md())
+        .when(floating_panes_style::is_enabled(cx), |this| {
+            floating_panes_style::style_hanging_tab(this, cx)
+        })
         .children(vec![
             Button::new(("reject", row as u64), "Reject")
                 .disabled(is_created_file)

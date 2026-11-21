@@ -111,7 +111,10 @@ impl PlatformTitleBar {
     }
 
     pub fn title_bar_color(&self, window: &mut Window, cx: &mut Context<Self>) -> Hsla {
-        if cfg!(any(target_os = "linux", target_os = "freebsd")) {
+        if workspace::floating_panes::enabled(cx) {
+            // Like the gaps, the bar is part of what the surfaces float on.
+            workspace::floating_panes::gap_color(cx)
+        } else if cfg!(any(target_os = "linux", target_os = "freebsd")) {
             if window.is_window_active() && !self.should_move {
                 cx.theme().colors().title_bar_background
             } else {
@@ -320,12 +323,12 @@ impl Render for PlatformTitleBar {
                     .when(
                         !(tiling.top || tiling.right)
                             && !(sidebar.open && sidebar.side == SidebarSide::Right),
-                        |el| el.rounded_tr(theme::CLIENT_SIDE_DECORATION_ROUNDING),
+                        |el| el.rounded_tr(workspace::floating_panes::window_corner_radius(cx)),
                     )
                     .when(
                         !(tiling.top || tiling.left)
                             && !(sidebar.open && sidebar.side == SidebarSide::Left),
-                        |el| el.rounded_tl(theme::CLIENT_SIDE_DECORATION_ROUNDING),
+                        |el| el.rounded_tl(workspace::floating_panes::window_corner_radius(cx)),
                     )
                     // Keep in sync with `apply_title_bar_insets`.
                     .mt(-theme::CLIENT_SIDE_DECORATION_BORDER)

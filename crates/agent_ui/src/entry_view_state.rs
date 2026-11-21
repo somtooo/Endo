@@ -440,6 +440,7 @@ impl EntryViewState {
                             window,
                             cx,
                         );
+                        editor.mark_as_sent_message();
                         if !is_editable {
                             editor.set_read_only(true, cx);
                         }

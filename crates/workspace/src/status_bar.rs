@@ -1,5 +1,5 @@
 use crate::{
-    ItemHandle, MultiWorkspace, Pane, SidebarSide, ToggleWorkspaceSidebar,
+    ItemHandle, MultiWorkspace, Pane, SidebarSide, ToggleWorkspaceSidebar, floating_panes,
     sidebar_side_context_menu,
 };
 use gpui::{
@@ -8,7 +8,6 @@ use gpui::{
 };
 use settings::{SettingsContent, update_settings_file};
 use std::{any::TypeId, sync::Arc};
-use theme::CLIENT_SIDE_DECORATION_ROUNDING;
 use ui::{ContextMenu, Divider, IconPosition, Indicator, Tooltip, prelude::*, right_click_menu};
 
 /// Describes how a status-bar item can be hidden by the user.
@@ -115,6 +114,12 @@ impl Focusable for StatusBar {
 impl Render for StatusBar {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let sidebar = SidebarStatus::query(&self.multi_workspace, cx);
+        let background = if floating_panes::enabled(cx) {
+            // Like the gaps, the bar is part of what the surfaces float on.
+            floating_panes::gap_color(cx)
+        } else {
+            cx.theme().colors().status_bar_background
+        };
 
         h_flex()
             .id("status-bar")
@@ -151,19 +156,19 @@ impl Render for StatusBar {
             .justify_between()
             .gap(DynamicSpacing::Base08.rems(cx))
             .p(DynamicSpacing::Base04.rems(cx))
-            .bg(cx.theme().colors().status_bar_background)
+            .bg(background)
             .map(|el| match window.window_decorations() {
                 Decorations::Server => el,
                 Decorations::Client { tiling, .. } => el
                     .when(
                         !(tiling.bottom || tiling.right)
                             && !(sidebar.open && sidebar.side == SidebarSide::Right),
-                        |el| el.rounded_br(CLIENT_SIDE_DECORATION_ROUNDING),
+                        |el| el.rounded_br(floating_panes::window_corner_radius(cx)),
                     )
                     .when(
                         !(tiling.bottom || tiling.left)
                             && !(sidebar.open && sidebar.side == SidebarSide::Left),
-                        |el| el.rounded_bl(CLIENT_SIDE_DECORATION_ROUNDING),
+                        |el| el.rounded_bl(floating_panes::window_corner_radius(cx)),
                     )
                     // This border is to avoid a transparent gap in the rounded corners
                     .mb(px(-1.))
@@ -179,7 +184,7 @@ impl Render for StatusBar {
                         if needs_gap_fix { px(-1.) } else { px(0.) }
                     })
                     .border_b(px(1.0))
-                    .border_color(cx.theme().colors().status_bar_background),
+                    .border_color(background),
             })
             .child(self.render_left_tools(&sidebar, cx))
             .child(self.render_right_tools(&sidebar, cx))

@@ -54,6 +54,7 @@ futures-lite.workspace = true
 fuzzy.workspace = true
 fs.workspace = true
 git.workspace = true
+floating_panes_style.workspace = true
 gpui.workspace = true
 indoc = { workspace = true, optional = true }
 edit_prediction_types.workspace = true

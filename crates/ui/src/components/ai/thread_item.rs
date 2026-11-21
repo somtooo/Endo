@@ -356,6 +356,11 @@ impl RenderOnce for ThreadItem {
 
         let title = self.title;
         let highlight_positions = self.highlight_positions;
+        // While panes float, titles stand out from the rest of the row.
+        let title_label_color = self.title_label_color.or_else(|| {
+            floating_panes_style::is_enabled(cx)
+                .then(|| Color::Custom(floating_panes_style::emphasized_text_color(cx)))
+        });
 
         let title_label = if let Some(title_slot) = self.title_slot {
             title_slot
@@ -373,12 +378,12 @@ impl RenderOnce for ThreadItem {
                 .into_any_element()
         } else if highlight_positions.is_empty() {
             Label::new(title)
-                .when_some(self.title_label_color, |label, color| label.color(color))
+                .when_some(title_label_color, |label, color| label.color(color))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         } else {
             HighlightedLabel::new(title, highlight_positions)
-                .when_some(self.title_label_color, |label, color| label.color(color))
+                .when_some(title_label_color, |label, color| label.color(color))
                 .when(!opaque_window, |label| label.truncate())
                 .into_any_element()
         };
@@ -443,6 +448,12 @@ impl RenderOnce for ThreadItem {
             .border_color(gpui::transparent_black())
             .when(self.focused, |s| s.border_color(color.panel_focused_border))
             .when(self.rounded, |s| s.rounded_sm())
+            // While panes float, focus is one ring around a rounded row.
+            .when(floating_panes_style::is_enabled(cx), |s| {
+                s.border_1().when(self.rounded, |s| {
+                    s.rounded(floating_panes_style::ROW_CORNER_RADIUS)
+                })
+            })
             .hover(|s| s.bg(color.ghost_element_hover))
             .active(|s| s.bg(color.ghost_element_active))
             .on_hover(self.on_hover)

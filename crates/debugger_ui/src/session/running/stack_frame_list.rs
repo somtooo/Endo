@@ -615,7 +615,18 @@ impl StackFrameList {
                 this.selected_ix = Some(ix);
                 this.activate_selected_entry(window, cx);
             }))
-            .hover(|style| style.bg(cx.theme().colors().element_hover).cursor_pointer())
+            .hover(|style| {
+                style
+                    .bg(floating_panes_style::row_hover_background(
+                        cx.theme().colors().element_hover,
+                        cx,
+                    ))
+                    .cursor_pointer()
+            })
+            .when(
+                is_selected_frame && floating_panes_style::is_enabled(cx),
+                |this| this.bg(cx.theme().colors().ghost_element_selected),
+            )
             .overflow_x_scroll()
             .child(
                 v_flex()
@@ -718,7 +729,18 @@ impl StackFrameList {
                 this.selected_ix = Some(ix);
                 this.activate_selected_entry(window, cx);
             }))
-            .hover(|style| style.bg(cx.theme().colors().element_hover).cursor_pointer())
+            .hover(|style| {
+                style
+                    .bg(floating_panes_style::row_hover_background(
+                        cx.theme().colors().element_hover,
+                        cx,
+                    ))
+                    .cursor_pointer()
+            })
+            .when(
+                is_selected && floating_panes_style::is_enabled(cx),
+                |this| this.bg(cx.theme().colors().ghost_element_selected),
+            )
             .child(
                 v_flex()
                     .text_ui_sm(cx)

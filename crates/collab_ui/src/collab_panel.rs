@@ -1212,6 +1212,7 @@ impl CollabPanel {
         };
 
         ListItem::new(user.username.clone())
+            .inset(floating_panes_style::is_enabled(cx))
             .start_slot(Avatar::new(user.avatar_uri.clone()))
             .child(render_participant_name_and_handle(user))
             .focused(is_selected)
@@ -1262,6 +1263,7 @@ impl CollabPanel {
         .into();
 
         ListItem::new(project_id as usize)
+            .inset(floating_panes_style::is_enabled(cx))
             .height(panel_row_height())
             .focused(is_selected)
             .dock(self.dock_side(cx))
@@ -1304,6 +1306,7 @@ impl CollabPanel {
         let id = peer_id.map_or(usize::MAX, |id| id.as_u64() as usize);
 
         ListItem::new(("screen", id))
+            .inset(floating_panes_style::is_enabled(cx))
             .height(panel_row_height())
             .focused(is_selected)
             .dock(self.dock_side(cx))
@@ -1352,6 +1355,7 @@ impl CollabPanel {
         let has_channel_buffer_changed = channel_store.has_channel_buffer_changed(channel_id);
 
         ListItem::new("channel-notes")
+            .inset(floating_panes_style::is_enabled(cx))
             .height(panel_row_height())
             .focused(is_selected)
             .dock(self.dock_side(cx))
@@ -3140,6 +3144,7 @@ impl CollabPanel {
             open_context_menu.is_some_and(|menu| !menu.via_ellipsis_button);
 
         let item = ListItem::new(username.clone())
+            .inset(floating_panes_style::is_enabled(cx))
             .indent_level(1)
             .indent_step_size(px(20.))
             .toggle_state(context_menu_open_via_row)
@@ -3280,6 +3285,7 @@ impl CollabPanel {
         };
 
         ListItem::new(username.clone())
+            .inset(floating_panes_style::is_enabled(cx))
             .indent_level(1)
             .indent_step_size(px(20.))
             .focused(is_selected)
@@ -3327,6 +3333,7 @@ impl CollabPanel {
         ];
 
         ListItem::new(("channel-invite", channel.id.0 as usize))
+            .inset(floating_panes_style::is_enabled(cx))
             .focused(is_selected)
             .dock(self.dock_side(cx))
             .child(
@@ -3345,6 +3352,7 @@ impl CollabPanel {
 
     fn render_contact_placeholder(&self, is_selected: bool, cx: &mut Context<Self>) -> ListItem {
         ListItem::new("contact-placeholder")
+            .inset(floating_panes_style::is_enabled(cx))
             .child(Icon::new(IconName::Plus))
             .child(Label::new("Add a Contact"))
             .focused(is_selected)
@@ -3527,6 +3535,7 @@ impl CollabPanel {
             )
             .child(
                 ListItem::new(ix)
+                    .inset(floating_panes_style::is_enabled(cx))
                     .height(height)
                     .indent_level(depth)
                     .indent_step_size(px(20.))

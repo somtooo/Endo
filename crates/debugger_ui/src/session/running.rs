@@ -462,7 +462,13 @@ fn render_debugger_tab(
                 .p_1()
                 .rounded_sm()
                 .map(|s| {
-                    if selected {
+                    // While panes float, the tabs are pills, like the tabs of
+                    // a pane.
+                    if floating_panes_style::is_enabled(cx) {
+                        s.rounded(floating_panes_style::ROW_CORNER_RADIUS)
+                            .when(selected, |s| s.bg(colors.ghost_element_selected))
+                            .hover(|s| s.bg(colors.ghost_element_hover))
+                    } else if selected {
                         s.bg(colors.text_accent.opacity(0.08))
                             .hover(|s| s.bg(colors.text_accent.opacity(0.25)))
                             .text_color(colors.text_accent)

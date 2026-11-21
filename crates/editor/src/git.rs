@@ -3079,6 +3079,9 @@ pub fn render_diff_hunk_controls(
         .gap_1()
         .block_mouse_except_scroll()
         .shadow_md()
+        .when(floating_panes_style::is_enabled(cx), |el| {
+            floating_panes_style::style_hanging_tab(el, cx)
+        })
         .when(show_stage_or_unstage, |el| {
             el.child(if status.has_secondary_hunk() {
                 Button::new(("stage", row as u64), "Stage")

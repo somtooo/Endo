@@ -11,6 +11,7 @@ pub struct TabBar {
     children: SmallVec<[AnyElement; 2]>,
     end_children: SmallVec<[AnyElement; 2]>,
     scroll_handle: Option<ScrollHandle>,
+    pills: bool,
 }
 
 impl TabBar {
@@ -21,11 +22,19 @@ impl TabBar {
             children: SmallVec::new(),
             end_children: SmallVec::new(),
             scroll_handle: None,
+            pills: false,
         }
     }
 
     pub fn track_scroll(mut self, scroll_handle: &ScrollHandle) -> Self {
         self.scroll_handle = Some(scroll_handle.clone());
+        self
+    }
+
+    /// Drops the borders that attach tabs to the content below the bar, for a
+    /// bar that holds tabs rendered with [`Tab::pill`].
+    pub fn pills(mut self, pills: bool) -> Self {
+        self.pills = pills;
         self
     }
 
@@ -91,6 +100,7 @@ impl ParentElement for TabBar {
 
 impl RenderOnce for TabBar {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+        let pills = self.pills;
         div()
             .id(self.id)
             .group("tab_bar")
@@ -98,15 +108,18 @@ impl RenderOnce for TabBar {
             .flex_none()
             .w_full()
             .h(Tab::container_height(cx))
-            .bg(cx.theme().colors().tab_bar_background)
+            // Pills sit directly on the surface that holds the bar. A band of
+            // its own would read as a second frame inside that surface.
+            .when(!pills, |this| {
+                this.bg(cx.theme().colors().tab_bar_background)
+            })
             .when(!self.start_children.is_empty(), |this| {
                 this.child(
                     h_flex()
                         .flex_none()
                         .gap(DynamicSpacing::Base04.rems(cx))
                         .px(DynamicSpacing::Base06.rems(cx))
-                        .border_b_1()
-                        .border_r_1()
+                        .when(!pills, |this| this.border_b_1().border_r_1())
                         .border_color(cx.theme().colors().border)
                         .children(self.start_children),
                 )
@@ -117,15 +130,17 @@ impl RenderOnce for TabBar {
                     .flex_1()
                     .h_full()
                     .overflow_x_hidden()
-                    .child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full()
-                            .border_b_1()
-                            .border_color(cx.theme().colors().border),
-                    )
+                    .when(!pills, |this| {
+                        this.child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .size_full()
+                                .border_b_1()
+                                .border_color(cx.theme().colors().border),
+                        )
+                    })
                     .child(
                         h_flex()
                             .id("tabs")
@@ -144,8 +159,7 @@ impl RenderOnce for TabBar {
                         .gap(DynamicSpacing::Base04.rems(cx))
                         .px(DynamicSpacing::Base06.rems(cx))
                         .border_color(cx.theme().colors().border)
-                        .border_b_1()
-                        .border_l_1()
+                        .when(!pills, |this| this.border_b_1().border_l_1())
                         .children(self.end_children),
                 )
             })
